@@ -2,6 +2,7 @@ use rovr_config::Config;
 use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
 use thiserror::Error;
 
+use crate::layout_state::Layouts;
 use crate::{
     layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
     ObservedState,
@@ -31,6 +32,7 @@ pub struct Engine {
     pub observed: ObservedState,
     pub desired: DesiredState,
     pub flight_recorder: FlightRecorder,
+    pub layouts: Layouts,
 }
 
 impl Engine {
@@ -43,6 +45,15 @@ impl Engine {
 }
 
 impl Engine {
+    pub fn rotate_layout(&mut self, space: SpaceId) {
+        let state = self.layouts.entry(space).or_default();
+        state.orientation = state.orientation.rotate();
+    }
+
+    pub fn mirror_layout(&mut self, space: SpaceId) {
+        let state = self.layouts.entry(space).or_default();
+        state.orientation = state.orientation.mirror();
+    }
     pub fn apply_event(&mut self, event: Event) -> Vec<Action> {
         self.flight_recorder.record("event", format!("{event:?}"));
 
@@ -70,7 +81,12 @@ impl Engine {
             }
         }
 
-        apply_layout(&self.config, &self.observed, &mut self.desired);
+        apply_layout(
+            &self.config,
+            &self.observed,
+            &mut self.desired,
+            &self.layouts,
+        );
 
         let actions = reconcile(&self.observed, &self.desired);
         for action in &actions {
@@ -330,6 +346,9 @@ mod tests {
     };
 
     use super::*;
+    use crate::layout::apply_layout;
+    use crate::layout_state::{Axis, Orientation};
+    use rovr_types::LayoutKind;
 
     fn snapshot(windows: Vec<WindowSnapshot>) -> PlatformSnapshot {
         PlatformSnapshot {
@@ -481,5 +500,140 @@ mod tests {
             .filter(|a| matches!(a, Action::SetWindowFrame { .. }))
             .count();
         assert_eq!(set_frame_count, 5, "expected 5 SetWindowFrame actions");
+    }
+    /// M3b: a BSP layout starts in the default vertical split; one rotate flips
+    /// the axis to horizontal (top/bottom). Verified via the pure layout engine
+    /// fed the engine's own per-Space orientation state.
+    #[test]
+    fn m3b_rotate_flips_axis() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.general.padding = 0;
+        config.general.gap = 0;
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        let mk = |id: u32| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: true,
+            generation: 0,
+        };
+        observed.windows.insert(WindowId(1), mk(1));
+        observed.windows.insert(WindowId(2), mk(2));
+
+        let mut engine = Engine::new(config);
+
+        // Default orientation => vertical split => side by side (different x, same y).
+        let mut desired = DesiredState::default();
+        apply_layout(&engine.config, &observed, &mut desired, &engine.layouts);
+        let f1 = desired.windows[&WindowId(1)].frame.unwrap();
+        let f2 = desired.windows[&WindowId(2)].frame.unwrap();
+        assert!(
+            (f1.y - f2.y).abs() < 1.0,
+            "default must be side-by-side (same y)"
+        );
+        assert!(
+            (f1.x - f2.x).abs() > 1.0,
+            "default must be side-by-side (different x)"
+        );
+
+        // One rotate => horizontal axis => top/bottom (same x, different y).
+        engine.rotate_layout(SpaceId(11));
+        let mut desired2 = DesiredState::default();
+        apply_layout(&engine.config, &observed, &mut desired2, &engine.layouts);
+        let g1 = desired2.windows[&WindowId(1)].frame.unwrap();
+        let g2 = desired2.windows[&WindowId(2)].frame.unwrap();
+        assert!(
+            (g1.x - g2.x).abs() < 1.0,
+            "after rotate must be top/bottom (same x)"
+        );
+        assert!(
+            (g1.y - g2.y).abs() > 1.0,
+            "after rotate must be top/bottom (different y)"
+        );
+    }
+
+    /// M3b: four rotations return to the starting orientation; the per-Space
+    /// entry is created on first mutation.
+    #[test]
+    fn m3b_four_rotations_restore() {
+        let mut engine = Engine::new(Config::default());
+        assert!(
+            !engine.layouts.contains_key(&SpaceId(11)),
+            "no entry before rotation"
+        );
+
+        engine.rotate_layout(SpaceId(11));
+        engine.rotate_layout(SpaceId(11));
+        engine.rotate_layout(SpaceId(11));
+        engine.rotate_layout(SpaceId(11));
+
+        let state = engine
+            .layouts
+            .get(&SpaceId(11))
+            .expect("entry exists after rotations");
+        assert_eq!(
+            state.orientation,
+            Orientation::default(),
+            "4 rotations restore start"
+        );
+        assert_eq!(state.orientation.axis, Axis::Vertical);
+        assert!(!state.orientation.reversed);
+    }
+
+    /// M3b: rotating one Space must not affect another Space's orientation.
+    #[test]
+    fn m3b_per_space_independent() {
+        let mut engine = Engine::new(Config::default());
+        engine.rotate_layout(SpaceId(11));
+
+        let a = engine.layouts.get(&SpaceId(11)).expect("space 11 mutated");
+        let b = engine.layouts.get(&SpaceId(22));
+        assert_eq!(
+            a.orientation.axis,
+            Axis::Horizontal,
+            "space 11 rotated to horizontal"
+        );
+        assert!(b.is_none(), "space 22 untouched (no entry)");
     }
 }

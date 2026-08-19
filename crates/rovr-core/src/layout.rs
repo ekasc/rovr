@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use rovr_config::Config;
 use rovr_layout::{compute, LayoutRequest};
-use rovr_types::{DisplayId, LayoutKind, WindowId, WindowSnapshot};
+use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
+use crate::layout_state::{Axis, Layouts, Orientation};
 use crate::{DesiredState, ObservedState};
 
 /// A window is tileable when the WM manages it and it is not fullscreen.
@@ -19,7 +20,17 @@ fn is_tileable(w: &WindowSnapshot) -> bool {
 ///
 /// `area` is the raw display frame; `rovr_layout::compute` insets it by `padding`
 /// internally (lib.rs:34), so we must NOT pre-inset here (that would double-inset).
-pub fn apply_layout(config: &Config, observed: &ObservedState, desired: &mut DesiredState) {
+///
+/// Layout is computed per Space (each macOS Space tiles independently within its
+/// display's area). For BSP, `layouts` supplies a per-Space orientation: `reversed`
+/// reorders windows and `axis == Horizontal` is applied as an area transpose so
+/// `compute` (kept pure) still yields the right frames.
+pub fn apply_layout(
+    config: &Config,
+    observed: &ObservedState,
+    desired: &mut DesiredState,
+    layouts: &Layouts,
+) {
     let kind: LayoutKind = config.general.layout;
     let gap = config.general.gap as f64;
     let padding = config.general.padding as f64;
@@ -31,7 +42,7 @@ pub fn apply_layout(config: &Config, observed: &ObservedState, desired: &mut Des
         desired.windows.entry(*id).or_default();
     }
 
-    let mut by_display: HashMap<DisplayId, Vec<WindowId>> = HashMap::new();
+    let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
         if !is_tileable(w) {
             if let Some(t) = desired.windows.get_mut(&w.id) {
@@ -39,34 +50,75 @@ pub fn apply_layout(config: &Config, observed: &ObservedState, desired: &mut Des
             }
             continue;
         }
-        match (w.space_id, w.space_id.and_then(|s| observed.spaces.get(&s))) {
-            (Some(_), Some(space)) => {
-                by_display.entry(space.display_id).or_default().push(w.id);
+        let Some(space) = w.space_id.and_then(|s| observed.spaces.get(&s)) else {
+            if let Some(t) = desired.windows.get_mut(&w.id) {
+                t.frame = None;
             }
-            _ => {
-                if let Some(t) = desired.windows.get_mut(&w.id) {
-                    t.frame = None;
-                }
-            }
-        }
-    }
-
-    for (display_id, window_ids) in by_display {
-        let Some(display) = observed.displays.get(&display_id) else {
             continue;
         };
-        let area = display.frame; // compute() insets this by padding ONCE
+        let Some(display) = observed.displays.get(&space.display_id) else {
+            if let Some(t) = desired.windows.get_mut(&w.id) {
+                t.frame = None;
+            }
+            continue;
+        };
+        by_space
+            .entry(space.id)
+            .or_insert((space.display_id, display.frame, Vec::new()))
+            .2
+            .push(w.id);
+    }
+
+    for (space_id, (_display_id, area, window_ids)) in by_space {
+        // Orientation only affects BSP; other layouts ignore it.
+        let orientation = if kind == LayoutKind::Bsp {
+            layouts
+                .get(&space_id)
+                .map(|l| l.orientation)
+                .unwrap_or_default()
+        } else {
+            Orientation::default()
+        };
+        let mut wids = window_ids;
+        if kind == LayoutKind::Bsp && orientation.reversed {
+            wids.reverse();
+        }
+        // Horizontal axis: transpose the area so the pure vertical split in
+        // compute becomes a top/bottom split, then transpose frames back.
+        let (area2, swap) = if kind == LayoutKind::Bsp && orientation.axis == Axis::Horizontal {
+            (
+                Rect {
+                    x: area.y,
+                    y: area.x,
+                    width: area.height,
+                    height: area.width,
+                },
+                true,
+            )
+        } else {
+            (area, false)
+        };
         let request = LayoutRequest {
-            area,
-            windows: &window_ids,
+            area: area2,
+            windows: &wids,
             gap,
             padding,
             split_ratio: 0.5,
         };
         if let Ok(placements) = compute(kind, request) {
             for p in placements {
+                let frame = if swap {
+                    Rect {
+                        x: p.frame.y,
+                        y: p.frame.x,
+                        width: p.frame.height,
+                        height: p.frame.width,
+                    }
+                } else {
+                    p.frame
+                };
                 if let Some(t) = desired.windows.get_mut(&p.window) {
-                    t.frame = Some(p.frame);
+                    t.frame = Some(frame);
                 }
             }
         }
@@ -76,6 +128,7 @@ pub fn apply_layout(config: &Config, observed: &ObservedState, desired: &mut Des
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout_state::Layouts;
     use rovr_config::Config;
     use rovr_types::{
         DisplayId, DisplaySnapshot, LayoutKind, ProcessId, Rect, SpaceId, SpaceSnapshot, WindowId,
@@ -148,7 +201,7 @@ mod tests {
         observed.windows.insert(WindowId(9), mk(9, true)); // fullscreen
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired);
+        apply_layout(&config, &observed, &mut desired, &Layouts::new());
 
         // Managed windows are tiled.
         for id in [WindowId(1), WindowId(2), WindowId(3)] {
@@ -203,7 +256,12 @@ mod tests {
             DisplayId(1),
             DisplaySnapshot {
                 id: DisplayId(1),
-                frame: Rect { x: 0.0, y: 0.0, width: 1440.0, height: 900.0 },
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
                 label: None,
                 focused: false,
                 generation: 0,
@@ -227,7 +285,12 @@ mod tests {
             app: String::new(),
             bundle_id: None,
             title: String::new(),
-            frame: Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
@@ -240,10 +303,14 @@ mod tests {
         observed.windows.insert(WindowId(7), mk(false)); // floating
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired);
+        apply_layout(&config, &observed, &mut desired, &Layouts::new());
 
         assert!(
-            desired.windows.get(&WindowId(1)).and_then(|t| t.frame).is_some(),
+            desired
+                .windows
+                .get(&WindowId(1))
+                .and_then(|t| t.frame)
+                .is_some(),
             "managed window must be tiled"
         );
         assert_eq!(
