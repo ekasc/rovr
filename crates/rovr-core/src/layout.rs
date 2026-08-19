@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rovr_config::Config;
+use rovr_config::{Config, RuleConfig};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
@@ -13,6 +13,35 @@ use crate::{DesiredState, ObservedState};
 /// only differentiates once the bridge reports them truthfully.
 fn is_tileable(w: &WindowSnapshot) -> bool {
     w.managed && !w.fullscreen
+}
+/// A window floats when some `floating == Some(true)` rule matches it on every
+/// field it specifies (app / title / workspace). Used to exclude windows from
+/// tiling without relying on the bridge's hardcoded `managed` flag.
+fn matches_float_rule(w: &WindowSnapshot, rules: &[RuleConfig], observed: &ObservedState) -> bool {
+    for rule in rules {
+        let Some(true) = rule.floating else { continue };
+        let app_ok = match &rule.app {
+            Some(app) => w.bundle_id.as_deref() == Some(app.as_str()),
+            None => true,
+        };
+        let title_ok = match &rule.title {
+            Some(title) => w.title.contains(title),
+            None => true,
+        };
+        let workspace_ok = match &rule.workspace {
+            Some(ws) => {
+                w.space_id
+                    .and_then(|sid| observed.spaces.get(&sid))
+                    .and_then(|s| s.label.as_deref())
+                    == Some(ws.as_str())
+            }
+            None => true,
+        };
+        if app_ok && title_ok && workspace_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Recompute tiling targets for every observed managed window and write them
@@ -44,7 +73,7 @@ pub fn apply_layout(
 
     let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
-        if !is_tileable(w) {
+        if !is_tileable(w) || matches_float_rule(w, &config.rules, observed) {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
             }
@@ -317,6 +346,252 @@ mod tests {
             desired.windows.get(&WindowId(7)).and_then(|t| t.frame),
             None,
             "floating (managed = false) window must not be tiled"
+        );
+    }
+    /// M3c: a window whose bundle id matches a `float = true` rule is skipped
+    /// even though the bridge reports it as managed.
+    #[test]
+    fn m3c_app_rule_floats() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                app: Some("com.apple.Safari".into()),
+                floating: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        let mk = |id: u32, bundle: &str| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: Some(bundle.to_string()),
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: true,
+            generation: 0,
+        };
+        observed
+            .windows
+            .insert(WindowId(1), mk(1, "com.apple.Safari")); // matches rule
+        observed
+            .windows
+            .insert(WindowId(2), mk(2, "com.apple.Mail")); // no match
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "Safari matches float rule -> must not be tiled"
+        );
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(2))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "Mail does not match -> must be tiled"
+        );
+    }
+
+    /// M3c: a title-substring match floats the window.
+    #[test]
+    fn m3c_title_rule_floats() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                title: Some("Modal".into()),
+                floating: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        let mk = |id: u32, title: &str| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: title.to_string(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: true,
+            generation: 0,
+        };
+        observed.windows.insert(WindowId(1), mk(1, "Login Modal")); // matches
+        observed.windows.insert(WindowId(2), mk(2, "Editor")); // no match
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "title contains 'Modal' -> must not be tiled"
+        );
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(2))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "title without 'Modal' -> must be tiled"
+        );
+    }
+
+    /// M3c: empty rules leave managed non-fullscreen windows tiling as before.
+    #[test]
+    fn m3c_no_rule_tiles() {
+        let config = Config {
+            rules: vec![],
+            ..Default::default()
+        };
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        let mk = |id: u32| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: true,
+            generation: 0,
+        };
+        observed.windows.insert(WindowId(1), mk(1));
+        observed.windows.insert(WindowId(2), mk(2));
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(1))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "no rules -> managed window must be tiled"
+        );
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(2))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "no rules -> managed window must be tiled"
         );
     }
 }
