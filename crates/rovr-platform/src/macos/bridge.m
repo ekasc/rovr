@@ -165,7 +165,6 @@ static int rovr_mission_control_index(int cid, uint64_t sid) {
     CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
     if (!display_spaces) return 0;
     int desktop_cnt = 1;
-    uint64_t result = 0;
     CFIndex display_count = CFArrayGetCount(display_spaces);
     for (CFIndex d = 0; d < display_count; d++) {
         CFDictionaryRef display_ref = (CFDictionaryRef)CFArrayGetValueAtIndex(display_spaces, d);
@@ -175,10 +174,13 @@ static int rovr_mission_control_index(int cid, uint64_t sid) {
         for (CFIndex s = 0; s < space_count; s++) {
             CFDictionaryRef space_ref = (CFDictionaryRef)CFArrayGetValueAtIndex(spaces_ref, s);
             CFNumberRef sid_ref = (CFNumberRef)CFDictionaryGetValue(space_ref, CFSTR("id64"));
-            if (sid_ref) CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &result);
-            if (sid == result) {
-                CFRelease(display_spaces);
-                return desktop_cnt;
+            if (sid_ref) {
+                uint64_t candidate = 0;
+                CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &candidate);
+                if (sid == candidate) {
+                    CFRelease(display_spaces);
+                    return desktop_cnt;
+                }
             }
             desktop_cnt++;
         }
@@ -433,6 +435,7 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
             display_id = CGDisplayGetDisplayIDFromUUID(parsed);
             CFRelease(parsed);
         }
+        if (display_id == 0) continue;
         bool display_focused = false;
         for (uint32_t i = 0; i < active_display_count; i++) {
             if (active_displays[i] == display_id) {
@@ -465,35 +468,6 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
 
     CFRelease(display_spaces);
     return 0;
-}
-
-uint64_t rovr_bridge_active_space_id(uint32_t display_id) {
-    if (!g_sls_copy_managed_display_spaces || !g_sls_managed_display_get_current_space ||
-        !g_sls_main_connection) {
-        return 0;
-    }
-
-    int cid = g_sls_main_connection();
-    CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
-    if (!display_spaces) return 0;
-
-    uint64_t result = 0;
-    CFIndex display_count = CFArrayGetCount(display_spaces);
-    for (CFIndex d = 0; d < display_count; d++) {
-        CFDictionaryRef display_ref = (CFDictionaryRef)CFArrayGetValueAtIndex(display_spaces, d);
-        CFStringRef uuid = (CFStringRef)CFDictionaryGetValue(display_ref, CFSTR("Display Identifier"));
-        if (!uuid) continue;
-        CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
-        if (!parsed) continue;
-        uint32_t did = CGDisplayGetDisplayIDFromUUID(parsed);
-        CFRelease(parsed);
-        if (did != display_id) continue;
-        result = g_sls_managed_display_get_current_space(cid, uuid);
-        break;
-    }
-
-    CFRelease(display_spaces);
-    return result;
 }
 
 // macOS 12.7+/13.6+/14.5+/15+ silently ignore SLSMoveWindowsToManagedSpace.
@@ -551,6 +525,15 @@ int rovr_bridge_move_window_to_space(uint32_t window_id, uint64_t space_id) {
 
     return 1;
 }
+
+// Space focus via high-velocity dock-swipe gesture synthesis. Adapted from
+// yabai's space_manager_focus_space_using_gesture (MIT, copyright Asmund
+// Vikane).
+// :Attribution
+// https://github.com/jurplel/InstantSpaceSwitcher
+// https://github.com/thenickdude/wacom-driver-fix/blob/bdfda9a788934c88d09d31ea6a42664b9ba1471e/Readme.md
+// Technique first observed in practice, and reverse-engineered from,
+// BetterTouchTool.
 
 int rovr_bridge_focus_space(uint64_t space_id) {
     if (!g_sls_copy_managed_display_for_space || !g_sls_managed_display_get_current_space ||

@@ -58,6 +58,5 @@ int rovr_bridge_set_window_frame(uint32_t window_id, double x, double y, double 
 int rovr_bridge_focus_window(uint32_t window_id);
 int rovr_bridge_needs_refresh(void);
 int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context);
-uint64_t rovr_bridge_active_space_id(uint32_t display_id);
 int rovr_bridge_move_window_to_space(uint32_t window_id, uint64_t space_id);
 int rovr_bridge_focus_space(uint64_t space_id);
