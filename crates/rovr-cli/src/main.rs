@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, SpaceCommand,
-    WindowCommand,
+    Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
+    SpaceCommand, WindowCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
@@ -31,6 +31,7 @@ enum TopCommand {
     Query(QueryArgs),
     Window(WindowArgs),
     Space(SpaceArgs),
+    Layout(LayoutArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
 }
@@ -156,6 +157,17 @@ struct DebugArgs {
 enum DebugSubcommand {
     Events,
 }
+#[derive(Debug, Args)]
+struct LayoutArgs {
+    #[command(subcommand)]
+    command: LayoutSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LayoutSubcommand {
+    Rotate { space: u64 },
+    Mirror { space: u64 },
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -252,6 +264,14 @@ fn map_command(command: TopCommand) -> Command {
         }),
         TopCommand::Debug(args) => Command::Debug(match args.command {
             DebugSubcommand::Events => DebugCommand::Events,
+        }),
+        TopCommand::Layout(args) => Command::Layout(match args.command {
+            LayoutSubcommand::Rotate { space } => LayoutCommand::Rotate {
+                space: SpaceId(space),
+            },
+            LayoutSubcommand::Mirror { space } => LayoutCommand::Mirror {
+                space: SpaceId(space),
+            },
         }),
     }
 }

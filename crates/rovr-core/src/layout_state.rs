@@ -1,0 +1,64 @@
+use rovr_types::SpaceId;
+use std::collections::HashMap;
+
+/// Primary split axis for a Space's BSP tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Axis {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+/// Orientation of a Space's BSP tree. `reversed` flips the window order
+/// (180°/270° rotations); `axis` is the root split direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Orientation {
+    pub axis: Axis,
+    pub reversed: bool,
+}
+
+impl Orientation {
+    /// Cycle through four 90° rotations:
+    /// (V,false) -> (H,false) -> (V,true) -> (H,true) -> (V,false).
+    pub fn rotate(self) -> Self {
+        match (self.axis, self.reversed) {
+            (Axis::Vertical, false) => Orientation {
+                axis: Axis::Horizontal,
+                reversed: false,
+            },
+            (Axis::Horizontal, false) => Orientation {
+                axis: Axis::Vertical,
+                reversed: true,
+            },
+            (Axis::Vertical, true) => Orientation {
+                axis: Axis::Horizontal,
+                reversed: true,
+            },
+            (Axis::Horizontal, true) => Orientation {
+                axis: Axis::Vertical,
+                reversed: false,
+            },
+        }
+    }
+
+    /// Flip the primary axis, keeping the reversal.
+    pub fn mirror(self) -> Self {
+        Orientation {
+            axis: match self.axis {
+                Axis::Vertical => Axis::Horizontal,
+                Axis::Horizontal => Axis::Vertical,
+            },
+            reversed: self.reversed,
+        }
+    }
+}
+
+/// Per-Space layout state. Currently just orientation; window order is derived
+/// from the observed snapshot each cycle (M3a recomputes), so order is not
+/// stored.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutState {
+    pub orientation: Orientation,
+}
+
+pub type Layouts = HashMap<SpaceId, LayoutState>;

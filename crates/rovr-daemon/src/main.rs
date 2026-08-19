@@ -18,8 +18,8 @@ use rovr_platform::MacPlatform;
 use rovr_platform::MockPlatform;
 use rovr_platform::Platform;
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, SpaceCommand,
-    WindowCommand, PROTOCOL_VERSION,
+    Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
+    SpaceCommand, WindowCommand, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -271,6 +271,22 @@ impl Daemon {
                         Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
                     },
                     Err(err) => Response::error(id, "ENGINE_ERROR", err.to_string()),
+                }
+            }
+            Command::Layout(command) => {
+                match command {
+                    LayoutCommand::Rotate { space } => self.engine.rotate_layout(space),
+                    LayoutCommand::Mirror { space } => self.engine.mirror_layout(space),
+                }
+                match self.platform.snapshot() {
+                    Ok(snapshot) => {
+                        let actions = self.engine.apply_event(Event::Snapshot(snapshot));
+                        match self.execute_and_refresh(actions) {
+                            Ok(()) => Response::ok(id, json!({ "accepted": true })),
+                            Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                        }
+                    }
+                    Err(err) => Response::error(id, "SNAPSHOT_ERROR", err.to_string()),
                 }
             }
             Command::Space(command) => {

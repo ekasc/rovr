@@ -29,6 +29,7 @@ pub enum Command {
     Query(QueryCommand),
     Window(WindowCommand),
     Space(SpaceCommand),
+    Layout(LayoutCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
 }
@@ -91,6 +92,12 @@ pub enum SpaceCommand {
     Create { anchor: Option<SpaceId> },
     Destroy { space: SpaceId },
     Move { space: SpaceId, after: SpaceId },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LayoutCommand {
+    Rotate { space: SpaceId },
+    Mirror { space: SpaceId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
