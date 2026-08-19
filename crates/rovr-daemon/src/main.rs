@@ -261,6 +261,8 @@ impl Daemon {
             Command::Space(command) => {
                 let result = match command {
                     SpaceCommand::Focus { space } => self.engine.focus_space(space),
+                    SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
+                    SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {

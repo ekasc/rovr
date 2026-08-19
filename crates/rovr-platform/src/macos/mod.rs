@@ -1,3 +1,5 @@
+mod sa;
+
 use std::ffi::{c_char, c_void, CStr};
 
 use rovr_core::Action;
@@ -8,6 +10,8 @@ use rovr_types::{
 
 use crate::{Platform, PlatformError};
 
+use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_REM_SPACE};
+
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
 const ROVR_BUNDLE_MAX: usize = 256;
@@ -17,8 +21,6 @@ const ROVR_CAP_FOCUS_WINDOW: u64 = 1 << 2;
 const ROVR_CAP_OBSERVE_SPACES: u64 = 1 << 3;
 const ROVR_CAP_MOVE_WINDOW_TO_SPACE: u64 = 1 << 4;
 const ROVR_CAP_FOCUS_SPACE: u64 = 1 << 5;
-const ROVR_CAP_CREATE_SPACE: u64 = 1 << 6;
-const ROVR_CAP_DESTROY_SPACE: u64 = 1 << 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -77,6 +79,8 @@ extern "C" {
 
 pub struct MacPlatform {
     bridge_capabilities: u64,
+    sa: SaClient,
+    sa_info: Option<SaInfo>,
 }
 
 impl MacPlatform {
@@ -88,25 +92,60 @@ impl MacPlatform {
             )));
         }
         let bridge_capabilities = unsafe { rovr_bridge_capabilities() };
+        let sa = SaClient::new();
+        let sa_info = sa.probe();
         Ok(Self {
             bridge_capabilities,
+            sa,
+            sa_info,
         })
+    }
+
+    fn sa_attribs(&self) -> u32 {
+        self.sa_info.as_ref().map(|info| info.attribs).unwrap_or(0)
+    }
+
+    fn execute_sa(
+        &self,
+        op: impl Fn(&SaClient) -> Result<(), sa::SaError>,
+    ) -> Result<(), PlatformError> {
+        if self.sa_info.is_none() {
+            return Err(PlatformError::Unsupported("scripting_addition"));
+        }
+        op(&self.sa).map_err(|err| PlatformError::Operation(err.to_string()))
+    }
+
+    fn execute_focus_space(&self, space: &SpaceId) -> Result<(), PlatformError> {
+        // Prefer the SA's clean focus (no gesture, no animation) when the
+        // payload is live; fall back to gesture synthesis otherwise.
+        if self.sa_info.is_some() && self.sa.focus_space(space.0).is_ok() {
+            return Ok(());
+        }
+        let status = unsafe { rovr_bridge_focus_space(space.0) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::Operation(format!(
+                "focus space failed with status {status}"
+            )))
+        }
     }
 }
 
 impl Platform for MacPlatform {
     fn capabilities(&self) -> Capabilities {
+        let sa_attribs = self.sa_attribs();
         Capabilities {
             observe_windows: self.bridge_capabilities & ROVR_CAP_OBSERVE_WINDOWS != 0,
             set_window_frame: self.bridge_capabilities & ROVR_CAP_SET_WINDOW_FRAME != 0,
             focus_window: self.bridge_capabilities & ROVR_CAP_FOCUS_WINDOW != 0,
             move_window_to_space: self.bridge_capabilities & ROVR_CAP_MOVE_WINDOW_TO_SPACE != 0,
-            create_space: self.bridge_capabilities & ROVR_CAP_CREATE_SPACE != 0,
-            destroy_space: self.bridge_capabilities & ROVR_CAP_DESTROY_SPACE != 0,
+            create_space: sa_attribs & OSAX_ATTRIB_ADD_SPACE != 0,
+            destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
             focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
             set_window_layer: false,
             set_window_opacity: false,
-            scripting_addition: false,
+            scripting_addition: self.sa_info.is_some(),
         }
     }
 
@@ -225,9 +264,17 @@ impl Platform for MacPlatform {
             Action::MoveWindowToSpace { window, space } => unsafe {
                 rovr_bridge_move_window_to_space(window.0, space.0)
             },
-            Action::FocusSpace { space } => unsafe { rovr_bridge_focus_space(space.0) },
             Action::FocusDirection { .. } => {
                 return Err(PlatformError::Unsupported("focus_direction"))
+            }
+            Action::FocusSpace { space } => {
+                return self.execute_focus_space(space);
+            }
+            Action::CreateSpace { anchor } => {
+                return self.execute_sa(|sa| sa.create_space(anchor.0));
+            }
+            Action::DestroySpace { space } => {
+                return self.execute_sa(|sa| sa.destroy_space(space.0));
             }
         };
 

@@ -12,8 +12,6 @@
 #define ROVR_CAP_OBSERVE_SPACES (1ULL << 3)
 #define ROVR_CAP_MOVE_WINDOW_TO_SPACE (1ULL << 4)
 #define ROVR_CAP_FOCUS_SPACE (1ULL << 5)
-#define ROVR_CAP_CREATE_SPACE (1ULL << 6)
-#define ROVR_CAP_DESTROY_SPACE (1ULL << 7)
 
 typedef struct rovr_bridge_window {
     uint32_t id;
