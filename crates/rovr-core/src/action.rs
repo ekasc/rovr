@@ -53,4 +53,11 @@ pub enum Action {
         opacity: f64,
         duration_ms: u64,
     },
+    SetWindowScale {
+        window: WindowId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 }

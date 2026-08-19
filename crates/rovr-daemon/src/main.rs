@@ -263,6 +263,7 @@ impl Daemon {
                         opacity,
                         duration_ms,
                     } => self.engine.set_window_opacity(window, opacity, duration_ms),
+                    WindowCommand::Pip { window } => self.engine.toggle_window_pip(window),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {

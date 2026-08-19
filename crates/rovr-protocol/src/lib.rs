@@ -79,6 +79,9 @@ pub enum WindowCommand {
         opacity: f64,
         duration_ms: u64,
     },
+    Pip {
+        window: WindowId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

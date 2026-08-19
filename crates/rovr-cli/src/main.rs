@@ -96,6 +96,9 @@ enum WindowSubcommand {
         opacity: f64,
         duration_ms: u64,
     },
+    Pip {
+        window: u32,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +226,9 @@ fn map_command(command: TopCommand) -> Command {
                 window: WindowId(window),
                 opacity,
                 duration_ms,
+            },
+            WindowSubcommand::Pip { window } => WindowCommand::Pip {
+                window: WindowId(window),
             },
         }),
         TopCommand::Space(args) => Command::Space(match args.command {
