@@ -135,5 +135,6 @@ pub struct Capabilities {
     pub set_window_sticky: bool,
     pub set_window_shadow: bool,
     pub set_window_opacity: bool,
+    pub set_window_scale: bool,
     pub scripting_addition: bool,
 }

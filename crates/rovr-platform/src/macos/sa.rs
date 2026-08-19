@@ -35,6 +35,7 @@ const SA_OPCODE_WINDOW_OPACITY_FADE: u8 = 0x08;
 const SA_OPCODE_WINDOW_LAYER: u8 = 0x09;
 const SA_OPCODE_WINDOW_STICKY: u8 = 0x0A;
 const SA_OPCODE_WINDOW_SHADOW: u8 = 0x0B;
+const SA_OPCODE_WINDOW_SCALE: u8 = 0x0D;
 
 pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
@@ -186,6 +187,15 @@ impl SaClient {
         payload.extend_from_slice(&wid.to_le_bytes());
         payload.push(u8::from(shadow));
         self.send_op(SA_OPCODE_WINDOW_SHADOW, &payload)
+    }
+    pub fn scale_window(&self, wid: u32, x: f32, y: f32, w: f32, h: f32) -> Result<(), SaError> {
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&wid.to_le_bytes());
+        payload.extend_from_slice(&x.to_le_bytes());
+        payload.extend_from_slice(&y.to_le_bytes());
+        payload.extend_from_slice(&w.to_le_bytes());
+        payload.extend_from_slice(&h.to_le_bytes());
+        self.send_op(SA_OPCODE_WINDOW_SCALE, &payload)
     }
 
     pub fn destroy_space(&self, sid: u64) -> Result<(), SaError> {
