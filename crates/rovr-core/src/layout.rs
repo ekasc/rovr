@@ -6,8 +6,12 @@ use rovr_types::{DisplayId, LayoutKind, WindowId, WindowSnapshot};
 
 use crate::{DesiredState, ObservedState};
 
-fn is_managed(w: &WindowSnapshot) -> bool {
-    !w.fullscreen
+/// A window is tileable when the WM manages it and it is not fullscreen.
+/// `managed` is false for floating windows (yabai semantics). The snapshot
+/// bridge currently hardcodes `managed: true` and `fullscreen: false`, so this
+/// only differentiates once the bridge reports them truthfully.
+fn is_tileable(w: &WindowSnapshot) -> bool {
+    w.managed && !w.fullscreen
 }
 
 /// Recompute tiling targets for every observed managed window and write them
@@ -29,7 +33,7 @@ pub fn apply_layout(config: &Config, observed: &ObservedState, desired: &mut Des
 
     let mut by_display: HashMap<DisplayId, Vec<WindowId>> = HashMap::new();
     for w in observed.windows.values() {
-        if !is_managed(w) {
+        if !is_tileable(w) {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
             }
@@ -182,5 +186,70 @@ mod tests {
         assert!((max_x - 1428.0).abs() <= eps, "max_x={max_x} expected 1428");
         assert!((min_y - 12.0).abs() <= eps, "min_y={min_y} expected 12");
         assert!((max_y - 888.0).abs() <= eps, "max_y={max_y} expected 888");
+    }
+
+    /// M3a-2b: a floating window (managed = false, not fullscreen) is skipped.
+    /// Guards `is_tileable` from tiling floating windows once the snapshot
+    /// bridge reports `managed` truthfully (currently hardcoded true).
+    #[test]
+    fn m3a2b_floating_window_skipped() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.general.padding = 10;
+        config.general.gap = 8;
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect { x: 0.0, y: 0.0, width: 1440.0, height: 900.0 },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        let mk = |use_managed: bool| WindowSnapshot {
+            id: WindowId(if use_managed { 1 } else { 7 }),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: use_managed,
+            generation: 0,
+        };
+        observed.windows.insert(WindowId(1), mk(true)); // managed, non-fullscreen
+        observed.windows.insert(WindowId(7), mk(false)); // floating
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired);
+
+        assert!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame).is_some(),
+            "managed window must be tiled"
+        );
+        assert_eq!(
+            desired.windows.get(&WindowId(7)).and_then(|t| t.frame),
+            None,
+            "floating (managed = false) window must not be tiled"
+        );
     }
 }
