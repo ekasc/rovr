@@ -29,6 +29,11 @@ const SA_OPCODE_HANDSHAKE: u8 = 0x01;
 const SA_OPCODE_SPACE_FOCUS: u8 = 0x02;
 const SA_OPCODE_SPACE_CREATE: u8 = 0x03;
 const SA_OPCODE_SPACE_DESTROY: u8 = 0x04;
+const SA_OPCODE_WINDOW_OPACITY: u8 = 0x07;
+const SA_OPCODE_WINDOW_OPACITY_FADE: u8 = 0x08;
+const SA_OPCODE_WINDOW_LAYER: u8 = 0x09;
+const SA_OPCODE_WINDOW_STICKY: u8 = 0x0A;
+const SA_OPCODE_WINDOW_SHADOW: u8 = 0x0B;
 
 pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
@@ -145,6 +150,40 @@ impl SaClient {
 
     pub fn create_space(&self, sid: u64) -> Result<(), SaError> {
         self.send_op(SA_OPCODE_SPACE_CREATE, &sid.to_le_bytes())
+    }
+
+    pub fn set_opacity(&self, wid: u32, alpha: f32, duration: f32) -> Result<(), SaError> {
+        let opcode = if duration > 0.0 {
+            SA_OPCODE_WINDOW_OPACITY_FADE
+        } else {
+            SA_OPCODE_WINDOW_OPACITY
+        };
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&wid.to_le_bytes());
+        payload.extend_from_slice(&alpha.to_le_bytes());
+        payload.extend_from_slice(&duration.to_le_bytes());
+        self.send_op(opcode, &payload)
+    }
+
+    pub fn set_layer(&self, wid: u32, layer: i32) -> Result<(), SaError> {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&wid.to_le_bytes());
+        payload.extend_from_slice(&layer.to_le_bytes());
+        self.send_op(SA_OPCODE_WINDOW_LAYER, &payload)
+    }
+
+    pub fn set_sticky(&self, wid: u32, sticky: bool) -> Result<(), SaError> {
+        let mut payload = Vec::with_capacity(5);
+        payload.extend_from_slice(&wid.to_le_bytes());
+        payload.push(u8::from(sticky));
+        self.send_op(SA_OPCODE_WINDOW_STICKY, &payload)
+    }
+
+    pub fn set_shadow(&self, wid: u32, shadow: bool) -> Result<(), SaError> {
+        let mut payload = Vec::with_capacity(5);
+        payload.extend_from_slice(&wid.to_le_bytes());
+        payload.push(u8::from(shadow));
+        self.send_op(SA_OPCODE_WINDOW_SHADOW, &payload)
     }
 
     pub fn destroy_space(&self, sid: u64) -> Result<(), SaError> {

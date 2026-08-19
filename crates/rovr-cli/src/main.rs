@@ -77,6 +77,25 @@ enum WindowSubcommand {
         window: u32,
         space: u64,
     },
+    SetLayer {
+        window: u32,
+        layer: i32,
+    },
+    SetSticky {
+        window: u32,
+        #[arg(action = clap::ArgAction::Set)]
+        sticky: bool,
+    },
+    SetShadow {
+        window: u32,
+        #[arg(action = clap::ArgAction::Set)]
+        shadow: bool,
+    },
+    SetOpacity {
+        window: u32,
+        opacity: f64,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -182,6 +201,27 @@ fn map_command(command: TopCommand) -> Command {
             WindowSubcommand::MoveToSpace { window, space } => WindowCommand::MoveToSpace {
                 window: WindowId(window),
                 space: SpaceId(space),
+            },
+            WindowSubcommand::SetLayer { window, layer } => WindowCommand::SetLayer {
+                window: WindowId(window),
+                layer,
+            },
+            WindowSubcommand::SetSticky { window, sticky } => WindowCommand::SetSticky {
+                window: WindowId(window),
+                sticky,
+            },
+            WindowSubcommand::SetShadow { window, shadow } => WindowCommand::SetShadow {
+                window: WindowId(window),
+                shadow,
+            },
+            WindowSubcommand::SetOpacity {
+                window,
+                opacity,
+                duration_ms,
+            } => WindowCommand::SetOpacity {
+                window: WindowId(window),
+                opacity,
+                duration_ms,
             },
         }),
         TopCommand::Space(args) => Command::Space(match args.command {
