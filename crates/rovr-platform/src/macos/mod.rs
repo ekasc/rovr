@@ -149,6 +149,7 @@ impl Platform for MacPlatform {
             set_window_sticky: self.sa_info.is_some(),
             set_window_shadow: self.sa_info.is_some(),
             set_window_opacity: self.sa_info.is_some(),
+            set_window_scale: self.sa_info.is_some(),
             scripting_addition: self.sa_info.is_some(),
         }
     }
@@ -301,6 +302,9 @@ impl Platform for MacPlatform {
                 return self.execute_sa(|sa| {
                     sa.set_opacity(window.0, *opacity as f32, *duration_ms as f32 / 1000.0)
                 });
+            }
+            Action::SetWindowScale { window, x, y, w, h } => {
+                return self.execute_sa(|sa| sa.scale_window(window.0, *x, *y, *w, *h));
             }
         };
 

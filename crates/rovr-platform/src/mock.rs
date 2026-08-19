@@ -33,6 +33,7 @@ impl Platform for MockPlatform {
             set_window_sticky: true,
             set_window_shadow: true,
             set_window_opacity: true,
+            set_window_scale: true,
             scripting_addition: false,
         }
     }

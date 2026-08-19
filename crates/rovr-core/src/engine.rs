@@ -18,6 +18,8 @@ pub enum EngineError {
         from: WindowId,
         direction: Direction,
     },
+    #[error("window {0:?} is not on an observed display")]
+    WindowNotOnDisplay(WindowId),
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +141,31 @@ impl Engine {
             window,
             opacity,
             duration_ms,
+        }])
+    }
+    /// Toggle Picture-in-Picture for a Window. Mirrors yabai's toggle_window_pip:
+    /// the target rect is the window's observed display bounds; the SA decides
+    /// scale-in vs scale-out by comparing the window transform to identity.
+    pub fn toggle_window_pip(&self, window: WindowId) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        let display_id = self
+            .observed
+            .windows
+            .get(&window)
+            .and_then(|w| w.display_id)
+            .ok_or(EngineError::WindowNotOnDisplay(window))?;
+        let frame = self
+            .observed
+            .displays
+            .get(&display_id)
+            .map(|d| d.frame)
+            .ok_or(EngineError::WindowNotOnDisplay(window))?;
+        Ok(vec![Action::SetWindowScale {
+            window,
+            x: frame.x as f32,
+            y: frame.y as f32,
+            w: frame.width as f32,
+            h: frame.height as f32,
         }])
     }
 
