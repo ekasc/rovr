@@ -42,3 +42,4 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context);
 int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context);
 int rovr_bridge_set_window_frame(uint32_t window_id, double x, double y, double width, double height);
 int rovr_bridge_focus_window(uint32_t window_id);
+int rovr_bridge_needs_refresh(void);

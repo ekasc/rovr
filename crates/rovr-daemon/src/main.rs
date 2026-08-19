@@ -216,6 +216,26 @@ impl Daemon {
                         "desired": &self.engine.desired,
                     }),
                 ),
+                QueryCommand::Focused => {
+                    let focused = self
+                        .engine
+                        .observed
+                        .windows
+                        .values()
+                        .find(|w| w.focused)
+                        .cloned();
+                    Response::ok(id, focused)
+                }
+                QueryCommand::Current => {
+                    let id_val = self
+                        .engine
+                        .observed
+                        .windows
+                        .values()
+                        .find(|w| w.focused)
+                        .map(|w| w.id.0);
+                    Response::ok(id, json!({ "id": id_val }))
+                }
             },
             Command::Window(command) => {
                 let result = match command {
@@ -264,6 +284,14 @@ impl Daemon {
     }
 
     fn refresh_observation(&mut self) {
+        // Event-driven: display topology callback sets the flag on reconfiguration.
+        if self.platform.needs_refresh() {
+            self.engine.observed.bump_generation();
+            self.engine
+                .flight_recorder
+                .record("display.topology_changed", "callback-triggered refresh");
+        }
+
         match self.platform.snapshot() {
             Ok(snapshot) => {
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
@@ -285,11 +313,15 @@ impl Daemon {
 
     fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
         execute_actions_result(&mut *self.platform, actions)?;
+        // Re-snapshot to verify mutations landed, then reconcile any residual drift.
         let snapshot = self.platform.snapshot()?;
         let followup = self.engine.apply_event(Event::Snapshot(snapshot));
-        // Exactly one verification pass in the bootstrap. A future scheduler owns
-        // retries/backoff so the state thread never busy-loops on a broken API.
-        execute_actions_result(&mut *self.platform, followup)?;
+        if !followup.is_empty() {
+            execute_actions_result(&mut *self.platform, followup)?;
+            self.engine
+                .flight_recorder
+                .record("reconcile.verification", "followup actions executed");
+        }
         Ok(())
     }
 }

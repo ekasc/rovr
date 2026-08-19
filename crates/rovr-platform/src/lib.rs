@@ -22,4 +22,7 @@ pub trait Platform: Send {
     fn capabilities(&self) -> Capabilities;
     fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError>;
     fn execute(&mut self, action: &Action) -> Result<(), PlatformError>;
+    fn needs_refresh(&self) -> bool {
+        false
+    }
 }

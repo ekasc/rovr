@@ -3,12 +3,25 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <dlfcn.h>
+#import <stdatomic.h>
 
 // _AXUIElementGetWindow is private. Resolve it dynamically so the bridge still
 // links if the symbol disappears. The private capability layer will eventually
 // isolate this further behind explicit capability probing.
 typedef AXError (*rovr_ax_get_window_fn)(AXUIElementRef element, CGWindowID *window_id);
 static rovr_ax_get_window_fn g_ax_get_window = NULL;
+
+static _Atomic int g_needs_refresh = 0;
+
+static void rovr_display_reconfiguration_callback(
+    CGDirectDisplayID display,
+    CGDisplayChangeSummaryFlags flags,
+    void *userinfo) {
+    (void)display;
+    (void)flags;
+    (void)userinfo;
+    atomic_store(&g_needs_refresh, 1);
+}
 
 static void rovr_copy_cf_string(CFStringRef value, char *buffer, size_t capacity) {
     if (!buffer || capacity == 0) return;
@@ -95,6 +108,7 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
 
 int rovr_bridge_init(void) {
     g_ax_get_window = (rovr_ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
+    CGDisplayRegisterReconfigurationCallback(rovr_display_reconfiguration_callback, NULL);
     return 0;
 }
 
@@ -228,4 +242,8 @@ int rovr_bridge_focus_window(uint32_t window_id) {
     AXError error = AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
     CFRelease(window);
     return error == kAXErrorSuccess ? 0 : 2;
+}
+
+int rovr_bridge_needs_refresh(void) {
+    return atomic_exchange(&g_needs_refresh, 0);
 }

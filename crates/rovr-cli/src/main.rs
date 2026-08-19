@@ -45,6 +45,8 @@ enum QuerySubcommand {
     Spaces,
     Displays,
     State,
+    Focused,
+    Current,
 }
 
 #[derive(Debug, Args)]
@@ -136,6 +138,8 @@ fn map_command(command: TopCommand) -> Command {
             QuerySubcommand::Spaces => QueryCommand::Spaces,
             QuerySubcommand::Displays => QueryCommand::Displays,
             QuerySubcommand::State => QueryCommand::State,
+            QuerySubcommand::Focused => QueryCommand::Focused,
+            QuerySubcommand::Current => QueryCommand::Current,
         }),
         TopCommand::Window(args) => Command::Window(match args.command {
             WindowSubcommand::Focus { window } => WindowCommand::Focus {

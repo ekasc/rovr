@@ -39,6 +39,8 @@ pub enum QueryCommand {
     Spaces,
     Displays,
     State,
+    Focused,
+    Current,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

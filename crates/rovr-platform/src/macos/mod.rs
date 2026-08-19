@@ -53,6 +53,7 @@ extern "C" {
     fn rovr_bridge_set_window_frame(window_id: u32, x: f64, y: f64, width: f64, height: f64)
         -> i32;
     fn rovr_bridge_focus_window(window_id: u32) -> i32;
+    fn rovr_bridge_needs_refresh() -> i32;
 }
 
 pub struct MacPlatform {
@@ -190,6 +191,10 @@ impl Platform for MacPlatform {
                 "bridge operation failed with status {status}"
             )))
         }
+    }
+
+    fn needs_refresh(&self) -> bool {
+        unsafe { rovr_bridge_needs_refresh() != 0 }
     }
 }
 
