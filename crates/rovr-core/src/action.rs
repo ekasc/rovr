@@ -26,4 +26,10 @@ pub enum Action {
     FocusSpace {
         space: SpaceId,
     },
+    CreateSpace {
+        anchor: SpaceId,
+    },
+    DestroySpace {
+        space: SpaceId,
+    },
 }

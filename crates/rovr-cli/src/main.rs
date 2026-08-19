@@ -88,6 +88,8 @@ struct SpaceArgs {
 #[derive(Debug, Subcommand)]
 enum SpaceSubcommand {
     Focus { space: u64 },
+    Create { anchor: Option<u64> },
+    Destroy { space: u64 },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -184,6 +186,12 @@ fn map_command(command: TopCommand) -> Command {
         }),
         TopCommand::Space(args) => Command::Space(match args.command {
             SpaceSubcommand::Focus { space } => SpaceCommand::Focus {
+                space: SpaceId(space),
+            },
+            SpaceSubcommand::Create { anchor } => SpaceCommand::Create {
+                anchor: anchor.map(SpaceId),
+            },
+            SpaceSubcommand::Destroy { space } => SpaceCommand::Destroy {
                 space: SpaceId(space),
             },
         }),
