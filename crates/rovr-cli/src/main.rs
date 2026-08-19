@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, WindowCommand,
+    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, SpaceCommand,
+    WindowCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
@@ -29,6 +30,7 @@ enum TopCommand {
     Doctor,
     Query(QueryArgs),
     Window(WindowArgs),
+    Space(SpaceArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
 }
@@ -75,6 +77,17 @@ enum WindowSubcommand {
         window: u32,
         space: u64,
     },
+}
+
+#[derive(Debug, Args)]
+struct SpaceArgs {
+    #[command(subcommand)]
+    command: SpaceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SpaceSubcommand {
+    Focus { space: u64 },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -166,6 +179,11 @@ fn map_command(command: TopCommand) -> Command {
             },
             WindowSubcommand::MoveToSpace { window, space } => WindowCommand::MoveToSpace {
                 window: WindowId(window),
+                space: SpaceId(space),
+            },
+        }),
+        TopCommand::Space(args) => Command::Space(match args.command {
+            SpaceSubcommand::Focus { space } => SpaceCommand::Focus {
                 space: SpaceId(space),
             },
         }),

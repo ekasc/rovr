@@ -68,6 +68,23 @@ Never hide failing checks.
 
 If something could not be verified, state exactly what was not verified and why.
 
+## Git Boundaries (critical)
+
+- Git operations are only performed when the user explicitly issues them:
+  `git commit`, `git push`, branch creation/deletion, PR creation/merging,
+  remote or tag mutations, and any deployment promotion.
+- Editing a file in the working tree is not a git operation and needs no
+  permission. Committing or pushing that edit does.
+- When in doubt, make the file change, show what changed, and ask before
+  running any git command.
+
+## PR Communication (critical)
+
+- PRs are authored by the user's account. Write PR titles and bodies as clean,
+  professional release notes from the account owner: what changed and why.
+- No meta-commentary, no instructions to the operator, no first/second-person
+  notes about deployment process or review flow.
+
 ## Rovr-Specific
 
 - `../yabai/` is read-only.

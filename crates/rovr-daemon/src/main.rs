@@ -18,8 +18,8 @@ use rovr_platform::MacPlatform;
 use rovr_platform::MockPlatform;
 use rovr_platform::Platform;
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, WindowCommand,
-    PROTOCOL_VERSION,
+    Command, ConfigCommand, DebugCommand, QueryCommand, Request, Response, SpaceCommand,
+    WindowCommand, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -249,6 +249,18 @@ impl Daemon {
                     WindowCommand::MoveToSpace { window, space } => {
                         self.engine.move_window_to_space(window, space)
                     }
+                };
+                match result {
+                    Ok(actions) => match self.execute_and_refresh(actions) {
+                        Ok(()) => Response::ok(id, json!({ "accepted": true })),
+                        Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                    },
+                    Err(err) => Response::error(id, "ENGINE_ERROR", err.to_string()),
+                }
+            }
+            Command::Space(command) => {
+                let result = match command {
+                    SpaceCommand::Focus { space } => self.engine.focus_space(space),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
