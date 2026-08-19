@@ -91,6 +91,55 @@ impl Engine {
         Ok(vec![Action::FocusWindow { window }])
     }
 
+    /// Request a one-shot layer mutation. Persistent stacking policy belongs in
+    /// `DesiredState` later.
+    pub fn set_window_layer(
+        &self,
+        window: WindowId,
+        layer: i32,
+    ) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        Ok(vec![Action::SetWindowLayer { window, layer }])
+    }
+
+    /// Request a one-shot sticky mutation. Persistent pin policy belongs in
+    /// `DesiredState` later.
+    pub fn set_window_sticky(
+        &self,
+        window: WindowId,
+        sticky: bool,
+    ) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        Ok(vec![Action::SetWindowSticky { window, sticky }])
+    }
+
+    /// Request a one-shot shadow mutation. Persistent policy belongs in
+    /// `DesiredState` later.
+    pub fn set_window_shadow(
+        &self,
+        window: WindowId,
+        shadow: bool,
+    ) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        Ok(vec![Action::SetWindowShadow { window, shadow }])
+    }
+
+    /// Request a one-shot opacity mutation. Persistent policy belongs in
+    /// `DesiredState` later.
+    pub fn set_window_opacity(
+        &self,
+        window: WindowId,
+        opacity: f64,
+        duration_ms: u64,
+    ) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        Ok(vec![Action::SetWindowOpacity {
+            window,
+            opacity,
+            duration_ms,
+        }])
+    }
+
     /// Focus a Space. Like window focus this is transient: reconciliation must
     /// never re-steal focus, so the target is never stored in desired state.
     pub fn focus_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {

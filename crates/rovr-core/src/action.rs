@@ -32,4 +32,21 @@ pub enum Action {
     DestroySpace {
         space: SpaceId,
     },
+    SetWindowLayer {
+        window: WindowId,
+        layer: i32,
+    },
+    SetWindowSticky {
+        window: WindowId,
+        sticky: bool,
+    },
+    SetWindowShadow {
+        window: WindowId,
+        shadow: bool,
+    },
+    SetWindowOpacity {
+        window: WindowId,
+        opacity: f64,
+        duration_ms: u64,
+    },
 }

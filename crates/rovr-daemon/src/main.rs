@@ -249,6 +249,20 @@ impl Daemon {
                     WindowCommand::MoveToSpace { window, space } => {
                         self.engine.move_window_to_space(window, space)
                     }
+                    WindowCommand::SetLayer { window, layer } => {
+                        self.engine.set_window_layer(window, layer)
+                    }
+                    WindowCommand::SetSticky { window, sticky } => {
+                        self.engine.set_window_sticky(window, sticky)
+                    }
+                    WindowCommand::SetShadow { window, shadow } => {
+                        self.engine.set_window_shadow(window, shadow)
+                    }
+                    WindowCommand::SetOpacity {
+                        window,
+                        opacity,
+                        duration_ms,
+                    } => self.engine.set_window_opacity(window, opacity, duration_ms),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
