@@ -143,8 +143,10 @@ impl Platform for MacPlatform {
             create_space: sa_attribs & OSAX_ATTRIB_ADD_SPACE != 0,
             destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
             focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
-            set_window_layer: false,
-            set_window_opacity: false,
+            set_window_layer: self.sa_info.is_some(),
+            set_window_sticky: self.sa_info.is_some(),
+            set_window_shadow: self.sa_info.is_some(),
+            set_window_opacity: self.sa_info.is_some(),
             scripting_addition: self.sa_info.is_some(),
         }
     }
@@ -275,6 +277,24 @@ impl Platform for MacPlatform {
             }
             Action::DestroySpace { space } => {
                 return self.execute_sa(|sa| sa.destroy_space(space.0));
+            }
+            Action::SetWindowLayer { window, layer } => {
+                return self.execute_sa(|sa| sa.set_layer(window.0, *layer));
+            }
+            Action::SetWindowSticky { window, sticky } => {
+                return self.execute_sa(|sa| sa.set_sticky(window.0, *sticky));
+            }
+            Action::SetWindowShadow { window, shadow } => {
+                return self.execute_sa(|sa| sa.set_shadow(window.0, *shadow));
+            }
+            Action::SetWindowOpacity {
+                window,
+                opacity,
+                duration_ms,
+            } => {
+                return self.execute_sa(|sa| {
+                    sa.set_opacity(window.0, *opacity as f32, *duration_ms as f32 / 1000.0)
+                });
             }
         };
 

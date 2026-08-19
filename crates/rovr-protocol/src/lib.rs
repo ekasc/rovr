@@ -62,6 +62,23 @@ pub enum WindowCommand {
         window: WindowId,
         space: SpaceId,
     },
+    SetLayer {
+        window: WindowId,
+        layer: i32,
+    },
+    SetSticky {
+        window: WindowId,
+        sticky: bool,
+    },
+    SetShadow {
+        window: WindowId,
+        shadow: bool,
+    },
+    SetOpacity {
+        window: WindowId,
+        opacity: f64,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

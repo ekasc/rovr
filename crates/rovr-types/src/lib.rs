@@ -130,6 +130,8 @@ pub struct Capabilities {
     pub destroy_space: bool,
     pub focus_space: bool,
     pub set_window_layer: bool,
+    pub set_window_sticky: bool,
+    pub set_window_shadow: bool,
     pub set_window_opacity: bool,
     pub scripting_addition: bool,
 }

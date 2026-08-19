@@ -29,6 +29,8 @@ impl Platform for MockPlatform {
             destroy_space: true,
             focus_space: true,
             set_window_layer: true,
+            set_window_sticky: true,
+            set_window_shadow: true,
             set_window_opacity: true,
             scripting_addition: false,
         }
