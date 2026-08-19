@@ -109,6 +109,7 @@ enum SpaceSubcommand {
     Focus { space: u64 },
     Create { anchor: Option<u64> },
     Destroy { space: u64 },
+    Move { space: u64, after: u64 },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -233,6 +234,10 @@ fn map_command(command: TopCommand) -> Command {
             },
             SpaceSubcommand::Destroy { space } => SpaceCommand::Destroy {
                 space: SpaceId(space),
+            },
+            SpaceSubcommand::Move { space, after } => SpaceCommand::Move {
+                space: SpaceId(space),
+                after: SpaceId(after),
             },
         }),
         TopCommand::Config(args) => Command::Config(match args.command {

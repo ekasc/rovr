@@ -87,6 +87,7 @@ pub enum SpaceCommand {
     Focus { space: SpaceId },
     Create { anchor: Option<SpaceId> },
     Destroy { space: SpaceId },
+    Move { space: SpaceId, after: SpaceId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

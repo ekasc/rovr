@@ -32,6 +32,10 @@ pub enum Action {
     DestroySpace {
         space: SpaceId,
     },
+    MoveSpace {
+        space: SpaceId,
+        after: SpaceId,
+    },
     SetWindowLayer {
         window: WindowId,
         layer: i32,

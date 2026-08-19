@@ -421,6 +421,7 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
     CGDirectDisplayID active_displays[32] = {0};
     uint32_t active_display_count = 0;
     CGGetActiveDisplayList(32, active_displays, &active_display_count);
+    uint32_t position = 0;
 
     CFIndex display_count = CFArrayGetCount(display_spaces);
     for (CFIndex d = 0; d < display_count; d++) {
@@ -461,8 +462,10 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
                 .display_id = display_id,
                 .type = g_sls_space_get_type ? g_sls_space_get_type(cid, sid) : -1,
                 .focused = sid == active_sid ? 1 : 0,
+                .position = position,
             };
             callback(&space, context);
+            position++;
         }
     }
 
