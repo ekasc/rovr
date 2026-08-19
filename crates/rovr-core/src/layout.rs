@@ -43,6 +43,22 @@ fn matches_float_rule(w: &WindowSnapshot, rules: &[RuleConfig], observed: &Obser
     }
     false
 }
+/// Resolve the layout kind for a space. A named workspace (`WorkspaceConfig`)
+/// whose `name` matches the space's `label` overrides the global default
+/// layout. Falls back to `config.general.layout` when there is no label or no
+/// matching workspace — never panics.
+fn resolve_layout(config: &Config, space_id: SpaceId, observed: &ObservedState) -> LayoutKind {
+    if let Some(label) = observed
+        .spaces
+        .get(&space_id)
+        .and_then(|s| s.label.as_deref())
+    {
+        if let Some(ws) = config.workspaces.iter().find(|w| w.name == label) {
+            return ws.layout;
+        }
+    }
+    config.general.layout
+}
 
 /// Recompute tiling targets for every observed managed window and write them
 /// into `desired.windows[].frame`. Idempotent: rebuilt from `observed` each call.
@@ -60,7 +76,6 @@ pub fn apply_layout(
     desired: &mut DesiredState,
     layouts: &Layouts,
 ) {
-    let kind: LayoutKind = config.general.layout;
     let gap = config.general.gap as f64;
     let padding = config.general.padding as f64;
 
@@ -99,6 +114,7 @@ pub fn apply_layout(
     }
 
     for (space_id, (_display_id, area, window_ids)) in by_space {
+        let kind = resolve_layout(config, space_id, observed);
         // Orientation only affects BSP; other layouts ignore it.
         let orientation = if kind == LayoutKind::Bsp {
             layouts
@@ -158,7 +174,7 @@ pub fn apply_layout(
 mod tests {
     use super::*;
     use crate::layout_state::Layouts;
-    use rovr_config::Config;
+    use rovr_config::{Config, WorkspaceConfig};
     use rovr_types::{
         DisplayId, DisplaySnapshot, LayoutKind, ProcessId, Rect, SpaceId, SpaceSnapshot, WindowId,
         WindowSnapshot,
@@ -592,6 +608,87 @@ mod tests {
                 .and_then(|t| t.frame)
                 .is_some(),
             "no rules -> managed window must be tiled"
+        );
+    }
+    /// M3d: a Space whose label matches a named workspace uses that
+    /// workspace's layout; a non-matching label falls back to global.
+    #[test]
+    fn m3d_named_workspace_overrides_layout() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp; // global
+        config.workspaces = vec![WorkspaceConfig {
+            name: "dev".into(),
+            layout: LayoutKind::Stack,
+            display: None,
+            persistent: false,
+        }];
+
+        let mut observed = ObservedState::default();
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: Some("dev".into()),
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(12),
+            SpaceSnapshot {
+                id: SpaceId(12),
+                display_id: DisplayId(1),
+                label: Some("other".into()),
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        assert_eq!(
+            resolve_layout(&config, SpaceId(11), &observed),
+            LayoutKind::Stack,
+            "labeled 'dev' space must use the named workspace layout"
+        );
+        assert_eq!(
+            resolve_layout(&config, SpaceId(12), &observed),
+            LayoutKind::Bsp,
+            "non-matching label falls back to global"
+        );
+    }
+
+    /// M3d: an unlabeled space always uses the global layout even when a
+    /// named workspace exists.
+    #[test]
+    fn m3d_unlabeled_space_uses_global() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack; // global
+        config.workspaces = vec![WorkspaceConfig {
+            name: "dev".into(),
+            layout: LayoutKind::Bsp,
+            display: None,
+            persistent: false,
+        }];
+
+        let mut observed = ObservedState::default();
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+
+        assert_eq!(
+            resolve_layout(&config, SpaceId(11), &observed),
+            LayoutKind::Stack,
+            "unlabeled space uses global layout"
         );
     }
 }
