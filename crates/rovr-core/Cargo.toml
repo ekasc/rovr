@@ -7,5 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 rovr-types.workspace = true
+rovr-config.workspace = true
+rovr-layout.workspace = true
 serde.workspace = true
 thiserror.workspace = true

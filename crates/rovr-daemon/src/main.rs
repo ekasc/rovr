@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
-    let mut engine = Engine::default();
+    let mut engine = Engine::new(config.clone());
     match platform.snapshot() {
         Ok(snapshot) => {
             execute_actions(
@@ -295,6 +295,7 @@ impl Daemon {
                         .unwrap_or_else(|| self.config_path.clone());
                     match Config::load(&path) {
                         Ok(config) => {
+                            self.engine.config = config.clone();
                             self.config = config;
                             self.config_path = path;
                             Response::ok(id, json!({ "reloaded": true }))

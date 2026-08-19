@@ -1,7 +1,11 @@
+use rovr_config::Config;
 use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
 use thiserror::Error;
 
-use crate::{reconcile::reconcile, Action, DesiredState, Event, FlightRecorder, ObservedState};
+use crate::{
+    layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
+    ObservedState,
+};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -21,12 +25,21 @@ pub enum EngineError {
     #[error("window {0:?} is not on an observed display")]
     WindowNotOnDisplay(WindowId),
 }
-
 #[derive(Debug, Default)]
 pub struct Engine {
+    pub config: Config,
     pub observed: ObservedState,
     pub desired: DesiredState,
     pub flight_recorder: FlightRecorder,
+}
+
+impl Engine {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            ..Default::default()
+        }
+    }
 }
 
 impl Engine {
@@ -56,6 +69,8 @@ impl Engine {
                 self.observed.bump_generation();
             }
         }
+
+        apply_layout(&self.config, &self.observed, &mut self.desired);
 
         let actions = reconcile(&self.observed, &self.desired);
         for action in &actions {
@@ -308,7 +323,11 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use rovr_types::{DisplayId, ProcessId, Rect, WindowSnapshot};
+    use rovr_config::Config;
+    use rovr_types::{
+        DisplayId, DisplaySnapshot, PlatformSnapshot, ProcessId, Rect, SpaceId, SpaceSnapshot,
+        WindowId, WindowSnapshot,
+    };
 
     use super::*;
 
@@ -373,5 +392,94 @@ mod tests {
                 window: WindowId(2)
             }]
         );
+    }
+
+    /// M3a-3: applying a multi-display snapshot through the engine must produce
+    /// exactly one SetWindowFrame action per managed window (5 here).
+    #[test]
+    fn m3a3_engine_applies_tiling_actions() {
+        let snap_window = |id: u32, space: SpaceId, display: DisplayId| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(space),
+            display_id: Some(display),
+            focused: false,
+            minimized: false,
+            fullscreen: false,
+            managed: true,
+            generation: 0,
+        };
+
+        let snap = PlatformSnapshot {
+            windows: vec![
+                snap_window(1, SpaceId(11), DisplayId(1)),
+                snap_window(2, SpaceId(11), DisplayId(1)),
+                snap_window(3, SpaceId(11), DisplayId(1)),
+                snap_window(4, SpaceId(22), DisplayId(2)),
+                snap_window(5, SpaceId(22), DisplayId(2)),
+            ],
+            spaces: vec![
+                SpaceSnapshot {
+                    id: SpaceId(11),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: false,
+                    generation: 0,
+                    position: 0,
+                },
+                SpaceSnapshot {
+                    id: SpaceId(22),
+                    display_id: DisplayId(2),
+                    label: None,
+                    focused: false,
+                    generation: 0,
+                    position: 1,
+                },
+            ],
+            displays: vec![
+                DisplaySnapshot {
+                    id: DisplayId(1),
+                    frame: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1440.0,
+                        height: 900.0,
+                    },
+                    label: None,
+                    focused: false,
+                    generation: 0,
+                },
+                DisplaySnapshot {
+                    id: DisplayId(2),
+                    frame: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1920.0,
+                        height: 1080.0,
+                    },
+                    label: None,
+                    focused: false,
+                    generation: 0,
+                },
+            ],
+            complete: true,
+        };
+
+        let mut engine = Engine::new(Config::default());
+        let actions = engine.apply_event(Event::Snapshot(snap));
+        let set_frame_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::SetWindowFrame { .. }))
+            .count();
+        assert_eq!(set_frame_count, 5, "expected 5 SetWindowFrame actions");
     }
 }

@@ -2,6 +2,7 @@ mod action;
 mod engine;
 mod event;
 mod flight_recorder;
+mod layout;
 mod reconcile;
 mod state;
 
