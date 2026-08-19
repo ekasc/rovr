@@ -9,6 +9,8 @@ pub enum EngineError {
     WindowNotFound(WindowId),
     #[error("space {0:?} does not exist")]
     SpaceNotFound(SpaceId),
+    #[error("cannot move a space after itself")]
+    SameSpace,
     #[error("no focused space in observed state")]
     NoFocusedSpace,
     #[error("no focusable window in direction {direction:?} from {from:?}")]
@@ -170,6 +172,16 @@ impl Engine {
     pub fn destroy_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {
         self.require_space(space)?;
         Ok(vec![Action::DestroySpace { space }])
+    }
+
+    /// Move a Space to sit after another Space (SA-only reorder).
+    pub fn move_space(&self, space: SpaceId, after: SpaceId) -> Result<Vec<Action>, EngineError> {
+        self.require_space(space)?;
+        self.require_space(after)?;
+        if space == after {
+            return Err(EngineError::SameSpace);
+        }
+        Ok(vec![Action::MoveSpace { space, after }])
     }
 
     pub fn focus_direction(

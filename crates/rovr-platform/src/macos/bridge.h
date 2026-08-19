@@ -44,6 +44,7 @@ typedef struct rovr_bridge_space {
     uint32_t display_id;
     int32_t type;
     uint8_t focused;
+    uint32_t position;
 } rovr_bridge_space;
 
 typedef void (*rovr_space_callback)(const rovr_bridge_space *space, void *context);

@@ -10,7 +10,7 @@ use rovr_types::{
 
 use crate::{Platform, PlatformError};
 
-use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_REM_SPACE};
+use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE};
 
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
@@ -61,6 +61,7 @@ struct BridgeSpace {
     display_id: u32,
     type_: i32,
     focused: u8,
+    position: u32,
 }
 
 extern "C" {
@@ -143,6 +144,7 @@ impl Platform for MacPlatform {
             create_space: sa_attribs & OSAX_ATTRIB_ADD_SPACE != 0,
             destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
             focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
+            reorder_space: sa_attribs & OSAX_ATTRIB_MOV_SPACE != 0,
             set_window_layer: self.sa_info.is_some(),
             set_window_sticky: self.sa_info.is_some(),
             set_window_shadow: self.sa_info.is_some(),
@@ -213,6 +215,7 @@ impl Platform for MacPlatform {
                 label: None,
                 focused: space.focused != 0,
                 generation: 0,
+                position: space.position,
             });
         }
 
@@ -277,6 +280,9 @@ impl Platform for MacPlatform {
             }
             Action::DestroySpace { space } => {
                 return self.execute_sa(|sa| sa.destroy_space(space.0));
+            }
+            Action::MoveSpace { space, after } => {
+                return self.execute_sa(|sa| sa.move_space(space.0, after.0));
             }
             Action::SetWindowLayer { window, layer } => {
                 return self.execute_sa(|sa| sa.set_layer(window.0, *layer));
