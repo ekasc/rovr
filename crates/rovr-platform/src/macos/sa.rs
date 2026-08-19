@@ -68,17 +68,32 @@ impl SaClient {
         stream.write_all(&[0x01, 0x00, SA_OPCODE_HANDSHAKE]).ok()?;
 
         let mut buffer = [0u8; SA_SOCKET_BUFF_LEN];
-        let length = stream.read(&mut buffer).ok()?;
-        if length == 0 {
-            return None;
-        }
+        let mut length = 0usize;
 
         // Response: version cstring, NUL, u32 LE attributes. The version
         // string is skipped; capabilities come from the attribute bits.
-        let nul = buffer[..length].iter().position(|&byte| byte == 0)?;
-        if length < nul + 1 + 4 {
-            return None;
+        // Loop-read until the attributes are fully buffered, since a
+        // localhost read can theoretically split the small response.
+        loop {
+            let needed = buffer[..length]
+                .iter()
+                .position(|&byte| byte == 0)
+                .map(|nul| nul + 1 + 4)
+                .unwrap_or(length + 1);
+            if length >= needed {
+                break;
+            }
+            if length >= buffer.len() {
+                return None;
+            }
+            let bytes_read = stream.read(&mut buffer[length..]).ok()?;
+            if bytes_read == 0 {
+                return None;
+            }
+            length += bytes_read;
         }
+
+        let nul = buffer[..length].iter().position(|&byte| byte == 0)?;
         let attribs = u32::from_le_bytes(buffer[nul + 1..nul + 5].try_into().ok()?);
         Some(SaInfo { attribs })
     }
