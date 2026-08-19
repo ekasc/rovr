@@ -68,6 +68,8 @@ pub enum WindowCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpaceCommand {
     Focus { space: SpaceId },
+    Create { anchor: Option<SpaceId> },
+    Destroy { space: SpaceId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

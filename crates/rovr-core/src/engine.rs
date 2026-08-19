@@ -9,6 +9,8 @@ pub enum EngineError {
     WindowNotFound(WindowId),
     #[error("space {0:?} does not exist")]
     SpaceNotFound(SpaceId),
+    #[error("no focused space in observed state")]
+    NoFocusedSpace,
     #[error("no focusable window in direction {direction:?} from {from:?}")]
     NoWindowInDirection {
         from: WindowId,
@@ -94,6 +96,31 @@ impl Engine {
     pub fn focus_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {
         self.require_space(space)?;
         Ok(vec![Action::FocusSpace { space }])
+    }
+
+    /// Create a new Space on the display of the anchor Space. The new Space's
+    /// id is assigned by macOS; the anchor only selects the display. Without
+    /// an explicit anchor the currently focused Space is used.
+    pub fn create_space(&self, anchor: Option<SpaceId>) -> Result<Vec<Action>, EngineError> {
+        let anchor = match anchor {
+            Some(anchor) => {
+                self.require_space(anchor)?;
+                anchor
+            }
+            None => self
+                .observed
+                .spaces
+                .values()
+                .find(|space| space.focused)
+                .map(|space| space.id)
+                .ok_or(EngineError::NoFocusedSpace)?,
+        };
+        Ok(vec![Action::CreateSpace { anchor }])
+    }
+
+    pub fn destroy_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {
+        self.require_space(space)?;
+        Ok(vec![Action::DestroySpace { space }])
     }
 
     pub fn focus_direction(
