@@ -29,6 +29,7 @@ const SA_OPCODE_HANDSHAKE: u8 = 0x01;
 const SA_OPCODE_SPACE_FOCUS: u8 = 0x02;
 const SA_OPCODE_SPACE_CREATE: u8 = 0x03;
 const SA_OPCODE_SPACE_DESTROY: u8 = 0x04;
+const SA_OPCODE_SPACE_MOVE: u8 = 0x05;
 const SA_OPCODE_WINDOW_OPACITY: u8 = 0x07;
 const SA_OPCODE_WINDOW_OPACITY_FADE: u8 = 0x08;
 const SA_OPCODE_WINDOW_LAYER: u8 = 0x09;
@@ -37,6 +38,7 @@ const SA_OPCODE_WINDOW_SHADOW: u8 = 0x0B;
 
 pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
+pub const OSAX_ATTRIB_MOV_SPACE: u32 = 0x10;
 
 #[derive(Debug, Error)]
 pub enum SaError {
@@ -188,5 +190,14 @@ impl SaClient {
 
     pub fn destroy_space(&self, sid: u64) -> Result<(), SaError> {
         self.send_op(SA_OPCODE_SPACE_DESTROY, &sid.to_le_bytes())
+    }
+
+    pub fn move_space(&self, src_sid: u64, dst_sid: u64) -> Result<(), SaError> {
+        let mut payload = Vec::with_capacity(25);
+        payload.extend_from_slice(&src_sid.to_le_bytes());
+        payload.extend_from_slice(&dst_sid.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.push(0u8);
+        self.send_op(SA_OPCODE_SPACE_MOVE, &payload)
     }
 }

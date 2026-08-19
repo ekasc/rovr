@@ -101,6 +101,7 @@ pub struct SpaceSnapshot {
     pub label: Option<String>,
     pub focused: bool,
     pub generation: u64,
+    pub position: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +130,7 @@ pub struct Capabilities {
     pub create_space: bool,
     pub destroy_space: bool,
     pub focus_space: bool,
+    pub reorder_space: bool,
     pub set_window_layer: bool,
     pub set_window_sticky: bool,
     pub set_window_shadow: bool,

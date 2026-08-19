@@ -200,7 +200,7 @@ impl Daemon {
                 QueryCommand::Spaces => {
                     let mut spaces: Vec<_> =
                         self.engine.observed.spaces.values().cloned().collect();
-                    spaces.sort_by_key(|space| space.id);
+                    spaces.sort_by_key(|space| (space.position, space.id));
                     Response::ok(id, spaces)
                 }
                 QueryCommand::Displays => {
@@ -277,6 +277,7 @@ impl Daemon {
                     SpaceCommand::Focus { space } => self.engine.focus_space(space),
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
+                    SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
