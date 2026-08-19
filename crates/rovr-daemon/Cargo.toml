@@ -1,0 +1,22 @@
+[package]
+name = "rovr-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rovrd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rovr-config.workspace = true
+rovr-core.workspace = true
+rovr-platform.workspace = true
+rovr-protocol.workspace = true
+rovr-types.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

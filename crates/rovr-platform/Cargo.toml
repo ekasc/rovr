@@ -1,0 +1,15 @@
+[package]
+name = "rovr-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+rovr-core.workspace = true
+rovr-types.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"

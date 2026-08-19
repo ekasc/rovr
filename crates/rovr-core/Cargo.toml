@@ -1,0 +1,11 @@
+[package]
+name = "rovr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rovr-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true

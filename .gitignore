@@ -1,0 +1,18 @@
+# Rust build output
+/target
+
+# Local config written by rovrd when $HOME is unset (daemon fallback path)
+/rovr.toml
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
