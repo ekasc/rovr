@@ -28,6 +28,7 @@ pub enum Command {
     Doctor,
     Query(QueryCommand),
     Window(WindowCommand),
+    Space(SpaceCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
 }
@@ -61,6 +62,12 @@ pub enum WindowCommand {
         window: WindowId,
         space: SpaceId,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpaceCommand {
+    Focus { space: SpaceId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

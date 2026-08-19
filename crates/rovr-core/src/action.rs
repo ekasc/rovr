@@ -23,4 +23,7 @@ pub enum Action {
         from: WindowId,
         direction: Direction,
     },
+    FocusSpace {
+        space: SpaceId,
+    },
 }

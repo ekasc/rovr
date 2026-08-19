@@ -9,11 +9,17 @@
 #define ROVR_CAP_OBSERVE_WINDOWS (1ULL << 0)
 #define ROVR_CAP_SET_WINDOW_FRAME (1ULL << 1)
 #define ROVR_CAP_FOCUS_WINDOW (1ULL << 2)
+#define ROVR_CAP_OBSERVE_SPACES (1ULL << 3)
+#define ROVR_CAP_MOVE_WINDOW_TO_SPACE (1ULL << 4)
+#define ROVR_CAP_FOCUS_SPACE (1ULL << 5)
+#define ROVR_CAP_CREATE_SPACE (1ULL << 6)
+#define ROVR_CAP_DESTROY_SPACE (1ULL << 7)
 
 typedef struct rovr_bridge_window {
     uint32_t id;
     int32_t pid;
     uint32_t display_id;
+    uint64_t space_id;
     uint8_t focused;
     double x;
     double y;
@@ -35,6 +41,14 @@ typedef struct rovr_bridge_display {
 
 typedef void (*rovr_window_callback)(const rovr_bridge_window *window, void *context);
 typedef void (*rovr_display_callback)(const rovr_bridge_display *display, void *context);
+typedef struct rovr_bridge_space {
+    uint64_t id;
+    uint32_t display_id;
+    int32_t type;
+    uint8_t focused;
+} rovr_bridge_space;
+
+typedef void (*rovr_space_callback)(const rovr_bridge_space *space, void *context);
 
 int rovr_bridge_init(void);
 uint64_t rovr_bridge_capabilities(void);
@@ -43,3 +57,6 @@ int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context
 int rovr_bridge_set_window_frame(uint32_t window_id, double x, double y, double width, double height);
 int rovr_bridge_focus_window(uint32_t window_id);
 int rovr_bridge_needs_refresh(void);
+int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context);
+int rovr_bridge_move_window_to_space(uint32_t window_id, uint64_t space_id);
+int rovr_bridge_focus_space(uint64_t space_id);

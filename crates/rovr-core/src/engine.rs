@@ -7,6 +7,8 @@ use crate::{reconcile::reconcile, Action, DesiredState, Event, FlightRecorder, O
 pub enum EngineError {
     #[error("window {0:?} does not exist")]
     WindowNotFound(WindowId),
+    #[error("space {0:?} does not exist")]
+    SpaceNotFound(SpaceId),
     #[error("no focusable window in direction {direction:?} from {from:?}")]
     NoWindowInDirection {
         from: WindowId,
@@ -87,6 +89,13 @@ impl Engine {
         Ok(vec![Action::FocusWindow { window }])
     }
 
+    /// Focus a Space. Like window focus this is transient: reconciliation must
+    /// never re-steal focus, so the target is never stored in desired state.
+    pub fn focus_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {
+        self.require_space(space)?;
+        Ok(vec![Action::FocusSpace { space }])
+    }
+
     pub fn focus_direction(
         &mut self,
         from: WindowId,
@@ -101,6 +110,14 @@ impl Engine {
             Ok(())
         } else {
             Err(EngineError::WindowNotFound(window))
+        }
+    }
+
+    fn require_space(&self, space: SpaceId) -> Result<(), EngineError> {
+        if self.observed.spaces.contains_key(&space) {
+            Ok(())
+        } else {
+            Err(EngineError::SpaceNotFound(space))
         }
     }
 

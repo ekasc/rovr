@@ -2,8 +2,8 @@ use std::ffi::{c_char, c_void, CStr};
 
 use rovr_core::Action;
 use rovr_types::{
-    Capabilities, DisplayId, DisplaySnapshot, PlatformSnapshot, ProcessId, Rect, WindowId,
-    WindowSnapshot,
+    Capabilities, DisplayId, DisplaySnapshot, PlatformSnapshot, ProcessId, Rect, SpaceId,
+    SpaceSnapshot, WindowId, WindowSnapshot,
 };
 
 use crate::{Platform, PlatformError};
@@ -14,6 +14,11 @@ const ROVR_BUNDLE_MAX: usize = 256;
 const ROVR_CAP_OBSERVE_WINDOWS: u64 = 1 << 0;
 const ROVR_CAP_SET_WINDOW_FRAME: u64 = 1 << 1;
 const ROVR_CAP_FOCUS_WINDOW: u64 = 1 << 2;
+const ROVR_CAP_OBSERVE_SPACES: u64 = 1 << 3;
+const ROVR_CAP_MOVE_WINDOW_TO_SPACE: u64 = 1 << 4;
+const ROVR_CAP_FOCUS_SPACE: u64 = 1 << 5;
+const ROVR_CAP_CREATE_SPACE: u64 = 1 << 6;
+const ROVR_CAP_DESTROY_SPACE: u64 = 1 << 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -21,6 +26,7 @@ struct BridgeWindow {
     id: u32,
     pid: i32,
     display_id: u32,
+    space_id: u64,
     focused: u8,
     x: f64,
     y: f64,
@@ -44,6 +50,16 @@ struct BridgeDisplay {
 
 type WindowCallback = unsafe extern "C" fn(*const BridgeWindow, *mut c_void);
 type DisplayCallback = unsafe extern "C" fn(*const BridgeDisplay, *mut c_void);
+type SpaceCallback = unsafe extern "C" fn(*const BridgeSpace, *mut c_void);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BridgeSpace {
+    id: u64,
+    display_id: u32,
+    type_: i32,
+    focused: u8,
+}
 
 extern "C" {
     fn rovr_bridge_init() -> i32;
@@ -54,6 +70,9 @@ extern "C" {
         -> i32;
     fn rovr_bridge_focus_window(window_id: u32) -> i32;
     fn rovr_bridge_needs_refresh() -> i32;
+    fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
+    fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
+    fn rovr_bridge_focus_space(space_id: u64) -> i32;
 }
 
 pub struct MacPlatform {
@@ -81,10 +100,10 @@ impl Platform for MacPlatform {
             observe_windows: self.bridge_capabilities & ROVR_CAP_OBSERVE_WINDOWS != 0,
             set_window_frame: self.bridge_capabilities & ROVR_CAP_SET_WINDOW_FRAME != 0,
             focus_window: self.bridge_capabilities & ROVR_CAP_FOCUS_WINDOW != 0,
-            move_window_to_space: false,
-            create_space: false,
-            destroy_space: false,
-            focus_space: false,
+            move_window_to_space: self.bridge_capabilities & ROVR_CAP_MOVE_WINDOW_TO_SPACE != 0,
+            create_space: self.bridge_capabilities & ROVR_CAP_CREATE_SPACE != 0,
+            destroy_space: self.bridge_capabilities & ROVR_CAP_DESTROY_SPACE != 0,
+            focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
             set_window_layer: false,
             set_window_opacity: false,
             scripting_addition: false,
@@ -111,7 +130,7 @@ impl Platform for MacPlatform {
                     width: window.width,
                     height: window.height,
                 },
-                space_id: None,
+                space_id: (window.space_id != 0).then_some(SpaceId(window.space_id)),
                 display_id: (window.display_id != 0).then_some(DisplayId(window.display_id)),
                 focused: window.focused != 0,
                 minimized: false,
@@ -141,6 +160,21 @@ impl Platform for MacPlatform {
             });
         }
 
+        unsafe extern "C" fn collect_space(space: *const BridgeSpace, context: *mut c_void) {
+            if space.is_null() || context.is_null() {
+                return;
+            }
+            let space = *space;
+            let spaces = &mut *(context as *mut Vec<SpaceSnapshot>);
+            spaces.push(SpaceSnapshot {
+                id: SpaceId(space.id),
+                display_id: DisplayId(space.display_id),
+                label: None,
+                focused: space.focused != 0,
+                generation: 0,
+            });
+        }
+
         let mut windows = Vec::new();
         let window_status = unsafe {
             rovr_bridge_enumerate_windows(collect_window, &mut windows as *mut _ as *mut c_void)
@@ -161,9 +195,21 @@ impl Platform for MacPlatform {
             )));
         }
 
+        let mut spaces = Vec::new();
+        if self.bridge_capabilities & ROVR_CAP_OBSERVE_SPACES != 0 {
+            let space_status = unsafe {
+                rovr_bridge_enumerate_spaces(collect_space, &mut spaces as *mut _ as *mut c_void)
+            };
+            if space_status != 0 {
+                return Err(PlatformError::Operation(format!(
+                    "space enumeration failed with status {space_status}"
+                )));
+            }
+        }
+
         Ok(PlatformSnapshot {
             windows,
-            spaces: vec![],
+            spaces,
             displays,
             complete: true,
         })
@@ -176,9 +222,10 @@ impl Platform for MacPlatform {
                 rovr_bridge_set_window_frame(window.0, frame.x, frame.y, frame.width, frame.height)
             },
             Action::FocusWindow { window } => unsafe { rovr_bridge_focus_window(window.0) },
-            Action::MoveWindowToSpace { .. } => {
-                return Err(PlatformError::Unsupported("move_window_to_space"))
-            }
+            Action::MoveWindowToSpace { window, space } => unsafe {
+                rovr_bridge_move_window_to_space(window.0, space.0)
+            },
+            Action::FocusSpace { space } => unsafe { rovr_bridge_focus_space(space.0) },
             Action::FocusDirection { .. } => {
                 return Err(PlatformError::Unsupported("focus_direction"))
             }
