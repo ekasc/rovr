@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use rovr_config::{Config, RuleConfig};
+use rovr_config::{Config, RuleConfig, ScratchpadConfig};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
-use crate::layout_state::{Axis, Layouts, Orientation};
+use crate::layout_state::{Axis, Layouts, Orientation, ScratchpadState};
 use crate::{DesiredState, ObservedState};
 
 /// A window is tileable when the WM manages it and it is not fullscreen.
@@ -59,6 +59,27 @@ fn resolve_layout(config: &Config, space_id: SpaceId, observed: &ObservedState) 
     }
     config.general.layout
 }
+/// True when the window matches at least one scratchpad that is currently
+/// open. A pad matches on `app` (exact bundle id) and/or `title` (substring);
+/// `None` fields wildcard. Closed pads are ignored, so a window matching both
+/// an open and a closed pad still floats (no config-order dependence).
+fn matches_open_scratchpad(
+    w: &WindowSnapshot,
+    pads: &[ScratchpadConfig],
+    state: &ScratchpadState,
+) -> bool {
+    pads.iter().any(|pad| {
+        let app_ok = match &pad.app {
+            Some(app) => w.bundle_id.as_deref() == Some(app.as_str()),
+            None => true,
+        };
+        let title_ok = match &pad.title {
+            Some(title) => w.title.contains(title),
+            None => true,
+        };
+        app_ok && title_ok && state.is_open(&pad.name)
+    })
+}
 
 /// Recompute tiling targets for every observed managed window and write them
 /// into `desired.windows[].frame`. Idempotent: rebuilt from `observed` each call.
@@ -75,6 +96,7 @@ pub fn apply_layout(
     observed: &ObservedState,
     desired: &mut DesiredState,
     layouts: &Layouts,
+    scratchpads: &ScratchpadState,
 ) {
     let gap = config.general.gap as f64;
     let padding = config.general.padding as f64;
@@ -88,7 +110,10 @@ pub fn apply_layout(
 
     let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
-        if !is_tileable(w) || matches_float_rule(w, &config.rules, observed) {
+        if !is_tileable(w)
+            || matches_float_rule(w, &config.rules, observed)
+            || matches_open_scratchpad(w, &config.scratchpads, scratchpads)
+        {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
             }
@@ -246,7 +271,13 @@ mod tests {
         observed.windows.insert(WindowId(9), mk(9, true)); // fullscreen
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &Layouts::new(),
+            &ScratchpadState::new(),
+        );
 
         // Managed windows are tiled.
         for id in [WindowId(1), WindowId(2), WindowId(3)] {
@@ -348,7 +379,13 @@ mod tests {
         observed.windows.insert(WindowId(7), mk(false)); // floating
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &Layouts::new(),
+            &ScratchpadState::new(),
+        );
 
         assert!(
             desired
@@ -433,7 +470,13 @@ mod tests {
             .insert(WindowId(2), mk(2, "com.apple.Mail")); // no match
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &Layouts::new(),
+            &ScratchpadState::new(),
+        );
 
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -514,7 +557,13 @@ mod tests {
         observed.windows.insert(WindowId(2), mk(2, "Editor")); // no match
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &Layouts::new(),
+            &ScratchpadState::new(),
+        );
 
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -591,7 +640,13 @@ mod tests {
         observed.windows.insert(WindowId(2), mk(2));
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new());
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &Layouts::new(),
+            &ScratchpadState::new(),
+        );
 
         assert!(
             desired
@@ -689,6 +744,246 @@ mod tests {
             resolve_layout(&config, SpaceId(11), &observed),
             LayoutKind::Stack,
             "unlabeled space uses global layout"
+        );
+    }
+    /// M3e: a window matching an OPEN scratchpad is floated (excluded from tiling).
+    #[test]
+    fn m3e_open_scratchpad_floats_member() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.scratchpads = vec![ScratchpadConfig {
+            name: "term".into(),
+            app: Some("com.apple.Terminal".into()),
+            title: None,
+        }];
+
+        let mut pads = ScratchpadState::new();
+        pads.toggle("term"); // open
+        assert!(pads.is_open("term"));
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        observed.windows.insert(
+            WindowId(1),
+            WindowSnapshot {
+                id: WindowId(1),
+                pid: ProcessId(1),
+                app: String::new(),
+                bundle_id: Some("com.apple.Terminal".into()),
+                title: String::new(),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                space_id: Some(SpaceId(11)),
+                display_id: Some(DisplayId(1)),
+                focused: false,
+                minimized: false,
+                fullscreen: false,
+                managed: true,
+                generation: 0,
+            },
+        );
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "open scratchpad member must be floated (not tiled)"
+        );
+    }
+
+    /// M3e: a window matching a CLOSED scratchpad tiles normally (rejoins layout).
+    #[test]
+    fn m3e_closed_scratchpad_tiles_member() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.scratchpads = vec![ScratchpadConfig {
+            name: "term".into(),
+            app: Some("com.apple.Terminal".into()),
+            title: None,
+        }];
+
+        let pads = ScratchpadState::new(); // closed by default
+        assert!(!pads.is_open("term"));
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        observed.windows.insert(
+            WindowId(1),
+            WindowSnapshot {
+                id: WindowId(1),
+                pid: ProcessId(1),
+                app: String::new(),
+                bundle_id: Some("com.apple.Terminal".into()),
+                title: String::new(),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                space_id: Some(SpaceId(11)),
+                display_id: Some(DisplayId(1)),
+                focused: false,
+                minimized: false,
+                fullscreen: false,
+                managed: true,
+                generation: 0,
+            },
+        );
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(1))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "closed scratchpad member must tile normally"
+        );
+    }
+
+    /// M3e ordering guard: when a window matches a CLOSED pad (first in config)
+    /// and an OPEN pad (later in config), it must still float. Catches the
+    /// first-match-then-check-open defect.
+    #[test]
+    fn m3e_open_pad_beats_closed() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.scratchpads = vec![
+            ScratchpadConfig {
+                name: "term".into(),
+                app: Some("com.apple.Terminal".into()),
+                title: None,
+            },
+            ScratchpadConfig {
+                name: "term2".into(),
+                app: Some("com.apple.Terminal".into()),
+                title: None,
+            },
+        ];
+
+        let mut pads = ScratchpadState::new();
+        // open only the SECOND pad; first pad stays closed
+        pads.toggle("term2");
+        assert!(pads.is_open("term2"));
+        assert!(!pads.is_open("term"));
+
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        observed.windows.insert(
+            WindowId(1),
+            WindowSnapshot {
+                id: WindowId(1),
+                pid: ProcessId(1),
+                app: String::new(),
+                bundle_id: Some("com.apple.Terminal".into()),
+                title: String::new(),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                space_id: Some(SpaceId(11)),
+                display_id: Some(DisplayId(1)),
+                focused: false,
+                minimized: false,
+                fullscreen: false,
+                managed: true,
+                generation: 0,
+            },
+        );
+
+        let mut desired = DesiredState::default();
+        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "window matching a closed pad first + open pad later must float"
         );
     }
 }

@@ -2,7 +2,7 @@ use rovr_config::Config;
 use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
 use thiserror::Error;
 
-use crate::layout_state::Layouts;
+use crate::layout_state::{Layouts, ScratchpadState};
 use crate::{
     layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
     ObservedState,
@@ -33,6 +33,7 @@ pub struct Engine {
     pub desired: DesiredState,
     pub flight_recorder: FlightRecorder,
     pub layouts: Layouts,
+    pub scratchpads: ScratchpadState,
 }
 
 impl Engine {
@@ -41,6 +42,9 @@ impl Engine {
             config,
             ..Default::default()
         }
+    }
+    pub fn toggle_scratchpad(&mut self, name: &str) {
+        self.scratchpads.toggle(name);
     }
 }
 
@@ -86,6 +90,7 @@ impl Engine {
             &self.observed,
             &mut self.desired,
             &self.layouts,
+            &self.scratchpads,
         );
 
         let actions = reconcile(&self.observed, &self.desired);
@@ -565,7 +570,13 @@ mod tests {
 
         // Default orientation => vertical split => side by side (different x, same y).
         let mut desired = DesiredState::default();
-        apply_layout(&engine.config, &observed, &mut desired, &engine.layouts);
+        apply_layout(
+            &engine.config,
+            &observed,
+            &mut desired,
+            &engine.layouts,
+            &ScratchpadState::new(),
+        );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         let f2 = desired.windows[&WindowId(2)].frame.unwrap();
         assert!(
@@ -580,7 +591,13 @@ mod tests {
         // One rotate => horizontal axis => top/bottom (same x, different y).
         engine.rotate_layout(SpaceId(11));
         let mut desired2 = DesiredState::default();
-        apply_layout(&engine.config, &observed, &mut desired2, &engine.layouts);
+        apply_layout(
+            &engine.config,
+            &observed,
+            &mut desired2,
+            &engine.layouts,
+            &ScratchpadState::new(),
+        );
         let g1 = desired2.windows[&WindowId(1)].frame.unwrap();
         let g2 = desired2.windows[&WindowId(2)].frame.unwrap();
         assert!(
@@ -635,5 +652,18 @@ mod tests {
             "space 11 rotated to horizontal"
         );
         assert!(b.is_none(), "space 22 untouched (no entry)");
+    }
+    /// M3e: toggling a scratchpad flips its open/closed state in the engine.
+    #[test]
+    fn m3e_toggle_scratchpad_flips_open() {
+        let mut engine = Engine::new(Config::default());
+        assert!(!engine.scratchpads.is_open("term"), "default closed");
+        engine.toggle_scratchpad("term");
+        assert!(engine.scratchpads.is_open("term"), "open after toggle");
+        engine.toggle_scratchpad("term");
+        assert!(
+            !engine.scratchpads.is_open("term"),
+            "closed after second toggle"
+        );
     }
 }

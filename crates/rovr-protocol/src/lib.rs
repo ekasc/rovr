@@ -30,6 +30,7 @@ pub enum Command {
     Window(WindowCommand),
     Space(SpaceCommand),
     Layout(LayoutCommand),
+    Scratchpad(ScratchpadCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
 }
@@ -98,6 +99,11 @@ pub enum SpaceCommand {
 pub enum LayoutCommand {
     Rotate { space: SpaceId },
     Mirror { space: SpaceId },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScratchpadCommand {
+    Toggle { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

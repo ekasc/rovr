@@ -19,7 +19,7 @@ use rovr_platform::MockPlatform;
 use rovr_platform::Platform;
 use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
-    SpaceCommand, WindowCommand, PROTOCOL_VERSION,
+    ScratchpadCommand, SpaceCommand, WindowCommand, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -277,6 +277,21 @@ impl Daemon {
                 match command {
                     LayoutCommand::Rotate { space } => self.engine.rotate_layout(space),
                     LayoutCommand::Mirror { space } => self.engine.mirror_layout(space),
+                }
+                match self.platform.snapshot() {
+                    Ok(snapshot) => {
+                        let actions = self.engine.apply_event(Event::Snapshot(snapshot));
+                        match self.execute_and_refresh(actions) {
+                            Ok(()) => Response::ok(id, json!({ "accepted": true })),
+                            Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                        }
+                    }
+                    Err(err) => Response::error(id, "SNAPSHOT_ERROR", err.to_string()),
+                }
+            }
+            Command::Scratchpad(command) => {
+                match command {
+                    ScratchpadCommand::Toggle { name } => self.engine.toggle_scratchpad(&name),
                 }
                 match self.platform.snapshot() {
                     Ok(snapshot) => {

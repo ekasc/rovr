@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
-    SpaceCommand, WindowCommand,
+    ScratchpadCommand, SpaceCommand, WindowCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
@@ -32,6 +32,7 @@ enum TopCommand {
     Window(WindowArgs),
     Space(SpaceArgs),
     Layout(LayoutArgs),
+    Scratchpad(ScratchpadArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
 }
@@ -168,6 +169,16 @@ enum LayoutSubcommand {
     Rotate { space: u64 },
     Mirror { space: u64 },
 }
+#[derive(Debug, Args)]
+struct ScratchpadArgs {
+    #[command(subcommand)]
+    command: ScratchpadSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScratchpadSubcommand {
+    Toggle { name: String },
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -272,6 +283,9 @@ fn map_command(command: TopCommand) -> Command {
             LayoutSubcommand::Mirror { space } => LayoutCommand::Mirror {
                 space: SpaceId(space),
             },
+        }),
+        TopCommand::Scratchpad(args) => Command::Scratchpad(match args.command {
+            ScratchpadSubcommand::Toggle { name } => ScratchpadCommand::Toggle { name },
         }),
     }
 }
