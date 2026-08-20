@@ -255,7 +255,7 @@ fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -
                 out.write_all(buf.trim().as_bytes())?;
                 out.write_all(b"\n")?;
             }
-            Err(_) => continue,
+            Err(err) => return Err(err.into()),
         }
     }
     Ok(())
@@ -452,5 +452,33 @@ mod tests {
         let result = consume_subscribe_stream(&mut input, &mut out);
         assert!(result.is_err(), "non-ok ACK must abort the subscription");
         assert!(out.is_empty(), "nothing should be printed on ACK error");
+    }
+
+    /// M4b: a malformed notification frame must terminate the stream with an
+    /// error rather than disappearing silently.
+    #[test]
+    fn m4b_cli_malformed_notification_frame_aborts() {
+        use std::io::Cursor;
+        let ack =
+            serde_json::to_string(&Response::ok(1, serde_json::json!({ "subscribed": true })))
+                .unwrap();
+        let hello = serde_json::to_string(&Notification::Hello {
+            protocol_version: rovr_protocol::PROTOCOL_VERSION,
+        })
+        .unwrap();
+        // Garbage line after a valid Hello: the stream must error out.
+        let stream = format!("{ack}\n{hello}\nnot-json\n");
+        let mut input = Cursor::new(stream.into_bytes());
+        let mut out = Vec::new();
+        let result = consume_subscribe_stream(&mut input, &mut out);
+        assert!(
+            result.is_err(),
+            "malformed notification frame must abort the stream"
+        );
+        let printed = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            printed.contains(&hello),
+            "valid frames before the corruption must still be printed"
+        );
     }
 }

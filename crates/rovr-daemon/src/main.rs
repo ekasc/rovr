@@ -171,6 +171,13 @@ fn handle_client(
             protocol_version: PROTOCOL_VERSION,
         });
 
+        // Register the subscriber BEFORE spawning the writer thread. Hello is
+        // already buffered in the channel, so the writer still emits it first;
+        // but once registered, every notification the state loop delivers queues
+        // behind Hello. A client cannot observe Hello until the subscription
+        // actually exists, so no transition delivered after registration is lost.
+        register_subscriber(&subscribers, tx);
+
         // Move the socket into a dedicated writer thread that performs all
         // socket I/O off the state-owner path.
         let sub_stream = stream;
@@ -195,7 +202,6 @@ fn handle_client(
             // rx dropped on exit; the registry entry is reaped on the next try_send.
         });
 
-        register_subscriber(&subscribers, tx);
         return Ok(());
     }
 
@@ -407,7 +413,8 @@ impl Daemon {
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true })),
+                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                            .with_notifications(vec![Notification::StateChanged]),
                         Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
@@ -425,26 +432,31 @@ impl Daemon {
                     }
                 };
                 self.persist_state();
+                // The core policy mutation (rotate/mirror) has committed. The
+                // typed notification describes that committed transition and must
+                // be emitted even if applying it to macOS later fails; the
+                // response/error reports the platform problem separately.
+                let (horizontal, reversed) = self
+                    .engine
+                    .layout_orientation(space)
+                    .unwrap_or((false, false));
+                let notification = Notification::LayoutChanged {
+                    space,
+                    horizontal,
+                    reversed,
+                };
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                         match self.execute_and_refresh(actions) {
-                            Ok(()) => {
-                                let (horizontal, reversed) = self
-                                    .engine
-                                    .layout_orientation(space)
-                                    .unwrap_or((false, false));
-                                HandleResult::ok(id, json!({ "accepted": true }))
-                                    .with_notifications(vec![Notification::LayoutChanged {
-                                        space,
-                                        horizontal,
-                                        reversed,
-                                    }])
-                            }
-                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![notification.clone()]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                .with_notifications(vec![notification]),
                         }
                     }
-                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string())
+                        .with_notifications(vec![notification]),
                 }
             }
             Command::Scratchpad(command) => {
@@ -455,22 +467,24 @@ impl Daemon {
                     }
                 };
                 self.persist_state();
+                // The core policy mutation (toggle) has committed. The typed
+                // notification describes that committed transition and must be
+                // emitted even if applying it to macOS later fails; the
+                // response/error reports the platform problem separately.
+                let open = self.engine.scratchpads.is_open(&name);
+                let notification = Notification::ScratchpadToggled { name, open };
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                         match self.execute_and_refresh(actions) {
-                            Ok(()) => {
-                                let open = self.engine.scratchpads.is_open(&name);
-                                HandleResult::ok(id, json!({ "accepted": true }))
-                                    .with_notifications(vec![Notification::ScratchpadToggled {
-                                        name,
-                                        open,
-                                    }])
-                            }
-                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![notification.clone()]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                .with_notifications(vec![notification]),
                         }
                     }
-                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string())
+                        .with_notifications(vec![notification]),
                 }
             }
             Command::Space(command) => {
@@ -482,7 +496,8 @@ impl Daemon {
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true })),
+                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                            .with_notifications(vec![Notification::StateChanged]),
                         Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
@@ -615,7 +630,10 @@ mod tests {
     use super::*;
     use rovr_platform::MockPlatform;
     use rovr_protocol::ResponseOutcome;
-    use rovr_types::WindowId;
+    use rovr_types::{
+        DisplayId, DisplaySnapshot, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot, WindowId,
+        WindowSnapshot,
+    };
     use std::sync::mpsc::sync_channel;
 
     /// M4b: a slow or disconnected subscriber is evicted and never blocks the
@@ -735,6 +753,57 @@ mod tests {
         }
     }
 
+    /// Builds a daemon whose observed state contains one window on one space on
+    /// one display, so window/space mutations can succeed against the engine.
+    fn populated_daemon() -> Daemon {
+        let mut daemon = test_daemon();
+        let snapshot = PlatformSnapshot {
+            windows: vec![WindowSnapshot {
+                id: WindowId(1),
+                pid: rovr_types::ProcessId(10),
+                app: "App".into(),
+                bundle_id: None,
+                title: "w".into(),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                space_id: Some(SpaceId(1)),
+                display_id: Some(DisplayId(1)),
+                focused: true,
+                minimized: false,
+                fullscreen: false,
+                managed: true,
+                generation: 1,
+            }],
+            spaces: vec![SpaceSnapshot {
+                id: SpaceId(1),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 1,
+                position: 0,
+            }],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                },
+                label: None,
+                focused: true,
+                generation: 1,
+            }],
+            complete: true,
+        };
+        daemon.engine.apply_event(Event::Snapshot(snapshot));
+        daemon
+    }
+
     /// M4b: a failed config reload does not emit ConfigReloaded.
     #[test]
     fn m4b_failed_config_reload_does_not_emit_config_reloaded() {
@@ -787,6 +856,48 @@ mod tests {
         assert!(
             result.notifications.is_empty(),
             "failed command must not emit StateChanged"
+        );
+    }
+
+    /// M4b: a successful Window mutation emits StateChanged so subscribers learn
+    /// about the verified transition.
+    #[test]
+    fn successful_window_mutation_emits_state_changed() {
+        let mut daemon = populated_daemon();
+        let result = daemon.handle(Request::new(
+            4,
+            Command::Window(WindowCommand::Focus {
+                window: WindowId(1),
+            }),
+        ));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+        assert_eq!(
+            result.notifications,
+            vec![Notification::StateChanged],
+            "successful window mutation must emit StateChanged"
+        );
+    }
+
+    /// M4b: a successful Space mutation emits StateChanged so subscribers learn
+    /// about the verified transition.
+    #[test]
+    fn successful_space_mutation_emits_state_changed() {
+        let mut daemon = populated_daemon();
+        let result = daemon.handle(Request::new(
+            5,
+            Command::Space(SpaceCommand::Focus { space: SpaceId(1) }),
+        ));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+        assert_eq!(
+            result.notifications,
+            vec![Notification::StateChanged],
+            "successful space mutation must emit StateChanged"
         );
     }
 }
