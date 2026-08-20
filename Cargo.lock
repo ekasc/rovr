@@ -302,10 +302,12 @@ dependencies = [
 name = "rovr-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "rovr-config",
  "rovr-layout",
  "rovr-types",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
