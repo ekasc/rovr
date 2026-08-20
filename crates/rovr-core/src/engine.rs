@@ -1,6 +1,10 @@
 use rovr_config::Config;
 use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
+use std::path::Path;
 use thiserror::Error;
+
+use crate::persistence::PersistedState;
+use anyhow::{Context, Result};
 
 use crate::layout_state::{Layouts, ScratchpadState};
 use crate::{
@@ -45,6 +49,34 @@ impl Engine {
     }
     pub fn toggle_scratchpad(&mut self, name: &str) {
         self.scratchpads.toggle(name);
+    }
+    pub fn save_state(&self, path: &Path) -> Result<()> {
+        let persisted = PersistedState {
+            layouts: self
+                .layouts
+                .iter()
+                .map(|(id, state)| (id.0.to_string(), state.clone()))
+                .collect(),
+            scratchpads: self.scratchpads.0.clone(),
+        };
+        let json = serde_json::to_string_pretty(&persisted).context("serialize state")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("create state dir")?;
+        }
+        std::fs::write(path, json).context("write state file")?;
+        Ok(())
+    }
+
+    pub fn load_state(&mut self, path: &Path) -> Result<()> {
+        let data = std::fs::read_to_string(path).context("read state file")?;
+        let persisted: PersistedState = serde_json::from_str(&data).context("parse state file")?;
+        self.layouts = persisted
+            .layouts
+            .into_iter()
+            .filter_map(|(k, v)| k.parse::<u64>().ok().map(|n| (SpaceId(n), v)))
+            .collect();
+        self.scratchpads = ScratchpadState(persisted.scratchpads);
+        Ok(())
     }
 }
 
@@ -665,5 +697,41 @@ mod tests {
             !engine.scratchpads.is_open("term"),
             "closed after second toggle"
         );
+    }
+    /// M3f: rotated layout + open scratchpad survive a save/load round-trip.
+    #[test]
+    fn m3f_persist_restore() {
+        let config = Config::default();
+        let mut engine = Engine::new(config.clone());
+        engine.rotate_layout(SpaceId(11)); // -> horizontal axis
+        engine.toggle_scratchpad("term"); // -> open
+
+        let path = std::env::temp_dir().join(format!("rovr-m3f-{}.json", std::process::id()));
+        engine.save_state(&path).expect("save state");
+
+        let mut restored = Engine::new(config);
+        assert!(
+            !restored.layouts.contains_key(&SpaceId(11)),
+            "fresh engine has no orientation"
+        );
+        assert!(!restored.scratchpads.is_open("term"), "fresh engine closed");
+
+        restored.load_state(&path).expect("load state");
+
+        let st = restored
+            .layouts
+            .get(&SpaceId(11))
+            .expect("restored orientation present");
+        assert_eq!(
+            st.orientation.axis,
+            Axis::Horizontal,
+            "rotated axis persisted"
+        );
+        assert!(
+            restored.scratchpads.is_open("term"),
+            "scratchpad open state persisted"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
