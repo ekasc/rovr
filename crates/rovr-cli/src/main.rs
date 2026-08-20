@@ -6,7 +6,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
     ScratchpadCommand, SpaceCommand, WindowCommand,
@@ -35,6 +36,10 @@ enum TopCommand {
     Scratchpad(ScratchpadArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
+    #[command(about = "Generate shell completion scripts (bash/zsh/fish/powershell/elvish)")]
+    Completions {
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -182,12 +187,22 @@ enum ScratchpadSubcommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let TopCommand::Completions { shell } = cli.command {
+        generate_completions(shell);
+        return Ok(());
+    }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     let command = map_command(cli.command);
     let request = Request::new(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed), command);
     let response = send(&socket, &request)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+fn generate_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
 fn map_command(command: TopCommand) -> Command {
@@ -287,6 +302,9 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Scratchpad(args) => Command::Scratchpad(match args.command {
             ScratchpadSubcommand::Toggle { name } => ScratchpadCommand::Toggle { name },
         }),
+        TopCommand::Completions { .. } => {
+            unreachable!("completions are handled in main() before map_command is called")
+        }
     }
 }
 
@@ -305,4 +323,28 @@ fn send(path: &Path, request: &Request) -> Result<Response> {
 fn default_socket_path() -> PathBuf {
     let uid = std::env::var("UID").unwrap_or_else(|_| "unknown".into());
     PathBuf::from(format!("/tmp/rovr-{uid}.sock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use clap_complete::Shell;
+
+    /// M4a: the generated completion script advertises the CLI's known
+    /// subcommands (incl. the new `completions` command itself).
+    #[test]
+    fn m4a_completions_include_top_commands() {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        let mut buf = Vec::new();
+        generate(Shell::Zsh, &mut cmd, name, &mut buf);
+        let script = String::from_utf8(buf).expect("completion script is utf-8");
+        for expected in ["query", "layout", "scratchpad", "completions"] {
+            assert!(
+                script.contains(expected),
+                "completion script missing subcommand `{expected}`"
+            );
+        }
+    }
 }
