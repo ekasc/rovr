@@ -36,6 +36,7 @@ enum TopCommand {
     Scratchpad(ScratchpadArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
+    Subscribe,
     #[command(about = "Generate shell completion scripts (bash/zsh/fish/powershell/elvish)")]
     Completions {
         shell: Shell,
@@ -192,6 +193,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
+    if matches!(cli.command, TopCommand::Subscribe) {
+        return run_subscribe(&socket);
+    }
     let command = map_command(cli.command);
     let request = Request::new(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed), command);
     let response = send(&socket, &request)?;
@@ -203,6 +207,29 @@ fn generate_completions(shell: Shell) {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
     generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+fn run_subscribe(socket: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect to rovr daemon at {}", socket.display()))?;
+    let request = Request::new(
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        Command::Subscribe,
+    );
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        print!("{line}");
+        std::io::stdout().flush()?;
+    }
+    Ok(())
 }
 
 fn map_command(command: TopCommand) -> Command {
@@ -304,6 +331,9 @@ fn map_command(command: TopCommand) -> Command {
         }),
         TopCommand::Completions { .. } => {
             unreachable!("completions are handled in main() before map_command is called")
+        }
+        TopCommand::Subscribe => {
+            unreachable!("subscribe is handled in main() before map_command is called")
         }
     }
 }

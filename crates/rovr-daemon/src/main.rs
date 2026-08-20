@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -11,15 +12,15 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use rovr_config::Config;
-use rovr_core::{Action, Engine, Event};
+use rovr_core::{layout_state::Axis, Action, Engine, Event};
 #[cfg(target_os = "macos")]
 use rovr_platform::MacPlatform;
 #[cfg(not(target_os = "macos"))]
 use rovr_platform::MockPlatform;
 use rovr_platform::Platform;
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
-    ScratchpadCommand, SpaceCommand, WindowCommand, PROTOCOL_VERSION,
+    Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
+    Response, ScratchpadCommand, SpaceCommand, WindowCommand, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -110,15 +111,18 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
         .with_context(|| format!("bind rovr socket at {}", path.display()))?;
     info!(socket = %path.display(), "rovr daemon listening");
 
+    let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel::<Envelope>();
-    thread::spawn(move || state_loop(daemon, rx));
+    let subs_for_loop = subscribers.clone();
+    thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let tx = tx.clone();
+                let subs = subscribers.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, tx) {
+                    if let Err(err) = handle_client(stream, tx, subs) {
                         error!(%err, "IPC client failed");
                     }
                 });
@@ -130,11 +134,44 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut stream: UnixStream, tx: Sender<Envelope>) -> Result<()> {
+fn handle_client(
+    mut stream: UnixStream,
+    tx: Sender<Envelope>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line).context("decode request")?;
     let request_id = request.id;
+
+    if matches!(request.command, Command::Subscribe) {
+        let ack = Response::ok(request_id, json!({ "subscribed": true }));
+        serde_json::to_writer(&mut stream, &ack)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        if let Ok(mut subs) = subscribers.lock() {
+            subs.push(stream.try_clone()?);
+        }
+        broadcast_notification(
+            &subscribers,
+            &Notification::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        // Keep the connection open. The client sends nothing further, so an EOF
+        // (or read error) means it disconnected. The registry clone is pruned
+        // lazily by broadcast_notification on the next failed write.
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut buf = String::new();
+        loop {
+            match reader.read_line(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => buf.clear(),
+                Err(_) => break,
+            }
+        }
+        return Ok(());
+    }
 
     let (response_tx, response_rx) = mpsc::channel();
     tx.send(Envelope {
@@ -150,18 +187,101 @@ fn handle_client(mut stream: UnixStream, tx: Sender<Envelope>) -> Result<()> {
     Ok(())
 }
 
-fn state_loop(mut daemon: Daemon, rx: Receiver<Envelope>) {
+fn state_loop(
+    mut daemon: Daemon,
+    rx: Receiver<Envelope>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+) {
     loop {
         let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
         match rx.recv_timeout(interval) {
             Ok(envelope) => {
+                let command = envelope.request.command.clone();
                 let response = daemon.handle(envelope.request);
                 let _ = envelope.response.send(response);
+                broadcast_for_command(&daemon, &subscribers, &command);
             }
-            Err(RecvTimeoutError::Timeout) => daemon.refresh_observation(),
+            Err(RecvTimeoutError::Timeout) => {
+                daemon.refresh_observation();
+                broadcast_notification(
+                    &subscribers,
+                    &Notification::StateChanged {
+                        generation: daemon.engine.observed.generation,
+                    },
+                );
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn broadcast_notification(subscribers: &Arc<Mutex<Vec<UnixStream>>>, notification: &Notification) {
+    let mut subs = match subscribers.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut dead = Vec::new();
+    for (i, stream) in subs.iter_mut().enumerate() {
+        let payload = match serde_json::to_string(notification) {
+            Ok(mut s) => {
+                s.push('\n');
+                s
+            }
+            Err(_) => {
+                dead.push(i);
+                continue;
+            }
+        };
+        if stream
+            .write_all(payload.as_bytes())
+            .and_then(|_| stream.flush())
+            .is_err()
+        {
+            dead.push(i);
+        }
+    }
+    for i in dead.into_iter().rev() {
+        subs.remove(i);
+    }
+}
+
+fn broadcast_for_command(
+    daemon: &Daemon,
+    subscribers: &Arc<Mutex<Vec<UnixStream>>>,
+    command: &Command,
+) {
+    let notification = match command {
+        Command::Layout(LayoutCommand::Rotate { space })
+        | Command::Layout(LayoutCommand::Mirror { space }) => {
+            let (horizontal, reversed) = daemon
+                .engine
+                .layouts
+                .get(space)
+                .map(|state| {
+                    (
+                        state.orientation.axis == Axis::Horizontal,
+                        state.orientation.reversed,
+                    )
+                })
+                .unwrap_or((false, false));
+            Notification::LayoutChanged {
+                space: *space,
+                horizontal,
+                reversed,
+            }
+        }
+        Command::Scratchpad(ScratchpadCommand::Toggle { name }) => {
+            Notification::ScratchpadToggled {
+                name: name.clone(),
+                open: daemon.engine.scratchpads.is_open(name),
+            }
+        }
+        Command::Config(ConfigCommand::Reload { .. }) => Notification::ConfigReloaded,
+        _ => Notification::StateChanged {
+            generation: daemon.engine.observed.generation,
+        },
+    };
+    broadcast_notification(subscribers, &notification);
 }
 
 impl Daemon {
@@ -350,6 +470,11 @@ impl Daemon {
             Command::Debug(DebugCommand::Events) => {
                 Response::ok(id, self.engine.flight_recorder.snapshot())
             }
+            Command::Subscribe => Response::error(
+                id,
+                "SUBSCRIBE_STREAMING",
+                "subscribe is served on a streaming connection; the one-shot path does not support it",
+            ),
         }
     }
 
@@ -441,5 +566,40 @@ fn default_state_path() -> PathBuf {
         PathBuf::from(home).join(".config/rovr/state.json")
     } else {
         PathBuf::from("rovr-state.json")
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+
+    /// M4b: broadcast_notification writes a newline-delimited JSON notification
+    /// to every registered subscriber stream.
+    #[test]
+    fn m4b_broadcast_writes_notification_to_subscribers() {
+        let (writer, reader) = UnixStream::pair().expect("socket pair");
+        let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(vec![writer]));
+
+        broadcast_notification(
+            &subscribers,
+            &Notification::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        // Drop the registry so the clone held inside broadcast is released; the
+        // reader end stays open for us to read the written line.
+        drop(subscribers);
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read broadcast line");
+        let got: Notification =
+            serde_json::from_str(line.trim()).expect("parse broadcast notification");
+        assert_eq!(
+            got,
+            Notification::Hello {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
     }
 }

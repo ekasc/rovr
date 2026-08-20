@@ -33,6 +33,7 @@ pub enum Command {
     Scratchpad(ScratchpadCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
+    Subscribe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +120,27 @@ pub enum DebugCommand {
     Events,
 }
 
+/// Stable, versioned broadcast event streamed to subscribers over the IPC
+/// socket. `type` is the stable discriminator; new variants are additive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Notification {
+    /// Sent immediately when a subscription stream is established.
+    Hello { protocol_version: u16 },
+    /// A reconcile or command cycle mutated observed state; re-query `state`.
+    StateChanged { generation: u64 },
+    /// A Space's BSP orientation changed.
+    LayoutChanged {
+        space: SpaceId,
+        horizontal: bool,
+        reversed: bool,
+    },
+    /// A scratchpad was toggled open/closed.
+    ScratchpadToggled { name: String, open: bool },
+    /// The daemon reloaded its configuration.
+    ConfigReloaded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub version: u16,
@@ -162,5 +184,48 @@ impl Response {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4b: the notification wire format is stable and self-describing (tagged
+    /// `type`), and every variant round-trips through JSON.
+    #[test]
+    fn m4b_notification_round_trips() {
+        let cases: Vec<Notification> = vec![
+            Notification::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Notification::StateChanged { generation: 7 },
+            Notification::LayoutChanged {
+                space: SpaceId(3),
+                horizontal: true,
+                reversed: false,
+            },
+            Notification::ScratchpadToggled {
+                name: "term".into(),
+                open: true,
+            },
+            Notification::ConfigReloaded,
+        ];
+        for n in &cases {
+            let json = serde_json::to_string(n).expect("serialize notification");
+            let back: Notification = serde_json::from_str(&json).expect("deserialize notification");
+            assert_eq!(n, &back, "notification must round-trip: {json}");
+        }
+        // Stable discriminator + field shape.
+        let layout = serde_json::to_value(&Notification::LayoutChanged {
+            space: SpaceId(1),
+            horizontal: true,
+            reversed: false,
+        })
+        .unwrap();
+        assert_eq!(layout["type"], "layout_changed");
+        assert_eq!(layout["space"], 1);
+        assert_eq!(layout["horizontal"], true);
+        assert_eq!(layout["reversed"], false);
     }
 }

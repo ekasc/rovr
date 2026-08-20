@@ -3,7 +3,7 @@ mod engine;
 mod event;
 mod flight_recorder;
 mod layout;
-mod layout_state;
+pub mod layout_state;
 mod persistence;
 mod reconcile;
 mod state;
