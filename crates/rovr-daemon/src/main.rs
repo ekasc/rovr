@@ -1,10 +1,11 @@
+use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     thread,
     time::Duration,
 };
@@ -12,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use rovr_config::Config;
-use rovr_core::{layout_state::Axis, Action, Engine, Event};
+use rovr_core::{Action, Engine, Event};
 #[cfg(target_os = "macos")]
 use rovr_platform::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -25,6 +26,9 @@ use rovr_protocol::{
 use serde_json::json;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+/// Bounded per-subscriber backlog. A subscriber that falls this far behind is
+/// evicted (its channel is full), so the state loop never blocks on it.
+const SUBSCRIBER_BACKLOG: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(name = "rovr-daemon", version)]
@@ -111,7 +115,7 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
         .with_context(|| format!("bind rovr socket at {}", path.display()))?;
     info!(socket = %path.display(), "rovr daemon listening");
 
-    let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel::<Envelope>();
     let subs_for_loop = subscribers.clone();
     thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
@@ -137,39 +141,61 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
 fn handle_client(
     mut stream: UnixStream,
     tx: Sender<Envelope>,
-    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line).context("decode request")?;
     let request_id = request.id;
 
+    if let Some(err) = validate_request(&request) {
+        serde_json::to_writer(&mut stream, &err)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        return Ok(());
+    }
+
     if matches!(request.command, Command::Subscribe) {
+        // Acknowledge the subscription before streaming. The CLI consumes this
+        // one-shot Response as the subscription ACK, then reads notifications.
         let ack = Response::ok(request_id, json!({ "subscribed": true }));
         serde_json::to_writer(&mut stream, &ack)?;
         stream.write_all(b"\n")?;
         stream.flush()?;
-        if let Ok(mut subs) = subscribers.lock() {
-            subs.push(stream.try_clone()?);
-        }
-        broadcast_notification(
-            &subscribers,
-            &Notification::Hello {
-                protocol_version: PROTOCOL_VERSION,
-            },
-        );
-        // Keep the connection open. The client sends nothing further, so an EOF
-        // (or read error) means it disconnected. The registry clone is pruned
-        // lazily by broadcast_notification on the next failed write.
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut buf = String::new();
-        loop {
-            match reader.read_line(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => buf.clear(),
-                Err(_) => break,
+
+        // Per-subscriber bounded queue. Enqueue Hello before registering so the
+        // writer thread always emits Hello first (channel FIFO). The state loop
+        // never touches the socket; it only try_sends into this channel.
+        let (tx, rx) = mpsc::sync_channel::<Notification>(SUBSCRIBER_BACKLOG);
+        let _ = tx.try_send(Notification::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        });
+
+        // Move the socket into a dedicated writer thread that performs all
+        // socket I/O off the state-owner path.
+        let sub_stream = stream;
+        thread::spawn(move || {
+            let mut writer = sub_stream;
+            while let Ok(notif) = rx.recv() {
+                let payload = match serde_json::to_string(&notif) {
+                    Ok(mut s) => {
+                        s.push('\n');
+                        s
+                    }
+                    Err(_) => continue,
+                };
+                if writer
+                    .write_all(payload.as_bytes())
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
+            // rx dropped on exit; the registry entry is reaped on the next try_send.
+        });
+
+        register_subscriber(&subscribers, tx);
         return Ok(());
     }
 
@@ -190,53 +216,40 @@ fn handle_client(
 fn state_loop(
     mut daemon: Daemon,
     rx: Receiver<Envelope>,
-    subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) {
     loop {
         let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
         match rx.recv_timeout(interval) {
             Ok(envelope) => {
-                let command = envelope.request.command.clone();
-                let response = daemon.handle(envelope.request);
-                let _ = envelope.response.send(response);
-                broadcast_for_command(&daemon, &subscribers, &command);
+                let result = daemon.handle(envelope.request);
+                let _ = envelope.response.send(result.response);
+                for notif in &result.notifications {
+                    deliver_notification(&subscribers, notif);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 daemon.refresh_observation();
-                broadcast_notification(
-                    &subscribers,
-                    &Notification::StateChanged {
-                        generation: daemon.engine.observed.generation,
-                    },
-                );
+                deliver_notification(&subscribers, &Notification::StateChanged);
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
 
-fn broadcast_notification(subscribers: &Arc<Mutex<Vec<UnixStream>>>, notification: &Notification) {
+fn deliver_notification(
+    subscribers: &Arc<Mutex<Vec<SyncSender<Notification>>>>,
+    notification: &Notification,
+) {
     let mut subs = match subscribers.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
     let mut dead = Vec::new();
-    for (i, stream) in subs.iter_mut().enumerate() {
-        let payload = match serde_json::to_string(notification) {
-            Ok(mut s) => {
-                s.push('\n');
-                s
-            }
-            Err(_) => {
-                dead.push(i);
-                continue;
-            }
-        };
-        if stream
-            .write_all(payload.as_bytes())
-            .and_then(|_| stream.flush())
-            .is_err()
-        {
+    for (i, tx) in subs.iter().enumerate() {
+        // Non-blocking: a slow or dead subscriber is evicted immediately so the
+        // state loop can never block on client socket I/O.
+        if tx.try_send(notification.clone()).is_err() {
             dead.push(i);
         }
     }
@@ -245,62 +258,63 @@ fn broadcast_notification(subscribers: &Arc<Mutex<Vec<UnixStream>>>, notificatio
     }
 }
 
-fn broadcast_for_command(
-    daemon: &Daemon,
-    subscribers: &Arc<Mutex<Vec<UnixStream>>>,
-    command: &Command,
+fn register_subscriber(
+    subscribers: &Arc<Mutex<Vec<SyncSender<Notification>>>>,
+    tx: SyncSender<Notification>,
 ) {
-    let notification = match command {
-        Command::Layout(LayoutCommand::Rotate { space })
-        | Command::Layout(LayoutCommand::Mirror { space }) => {
-            let (horizontal, reversed) = daemon
-                .engine
-                .layouts
-                .get(space)
-                .map(|state| {
-                    (
-                        state.orientation.axis == Axis::Horizontal,
-                        state.orientation.reversed,
-                    )
-                })
-                .unwrap_or((false, false));
-            Notification::LayoutChanged {
-                space: *space,
-                horizontal,
-                reversed,
-            }
-        }
-        Command::Scratchpad(ScratchpadCommand::Toggle { name }) => {
-            Notification::ScratchpadToggled {
-                name: name.clone(),
-                open: daemon.engine.scratchpads.is_open(name),
-            }
-        }
-        Command::Config(ConfigCommand::Reload { .. }) => Notification::ConfigReloaded,
-        _ => Notification::StateChanged {
-            generation: daemon.engine.observed.generation,
-        },
-    };
-    broadcast_notification(subscribers, &notification);
+    if let Ok(mut subs) = subscribers.lock() {
+        subs.push(tx);
+    }
 }
 
-impl Daemon {
-    fn handle(&mut self, request: Request) -> Response {
-        if request.version != PROTOCOL_VERSION {
-            return Response::error(
-                request.id,
-                "PROTOCOL_VERSION_MISMATCH",
-                format!(
-                    "client protocol {} is incompatible with daemon protocol {}",
-                    request.version, PROTOCOL_VERSION
-                ),
-            );
-        }
+/// Validates the protocol version before any request (including Subscribe) is
+/// acted on. Returns an error Response to send back when the version is wrong.
+fn validate_request(request: &Request) -> Option<Response> {
+    if request.version != PROTOCOL_VERSION {
+        Some(Response::error(
+            request.id,
+            "PROTOCOL_VERSION_MISMATCH",
+            format!(
+                "client protocol {} is incompatible with daemon protocol {}",
+                request.version, PROTOCOL_VERSION
+            ),
+        ))
+    } else {
+        None
+    }
+}
 
+/// The result of handling one request: the one-shot Response plus any
+/// notifications describing state transitions that actually committed.
+struct HandleResult {
+    response: Response,
+    notifications: Vec<Notification>,
+}
+
+impl HandleResult {
+    fn ok(id: u64, body: impl Serialize) -> Self {
+        HandleResult {
+            response: Response::ok(id, body),
+            notifications: Vec::new(),
+        }
+    }
+    fn err(id: u64, code: &str, msg: impl Into<String>) -> Self {
+        HandleResult {
+            response: Response::error(id, code, msg),
+            notifications: Vec::new(),
+        }
+    }
+    fn with_notifications(mut self, notes: Vec<Notification>) -> Self {
+        self.notifications = notes;
+        self
+    }
+}
+impl Daemon {
+    fn handle(&mut self, request: Request) -> HandleResult {
         let id = request.id;
         match request.command {
-            Command::Ping => Response::ok(id, json!({ "pong": true })),
-            Command::Doctor => Response::ok(
+            Command::Ping => HandleResult::ok(id, json!({ "pong": true })),
+            Command::Doctor => HandleResult::ok(
                 id,
                 json!({
                     "protocol": PROTOCOL_VERSION,
@@ -321,21 +335,21 @@ impl Daemon {
                     let mut windows: Vec<_> =
                         self.engine.observed.windows.values().cloned().collect();
                     windows.sort_by_key(|window| window.id);
-                    Response::ok(id, windows)
+                    HandleResult::ok(id, windows)
                 }
                 QueryCommand::Spaces => {
                     let mut spaces: Vec<_> =
                         self.engine.observed.spaces.values().cloned().collect();
                     spaces.sort_by_key(|space| (space.position, space.id));
-                    Response::ok(id, spaces)
+                    HandleResult::ok(id, spaces)
                 }
                 QueryCommand::Displays => {
                     let mut displays: Vec<_> =
                         self.engine.observed.displays.values().cloned().collect();
                     displays.sort_by_key(|display| display.id);
-                    Response::ok(id, displays)
+                    HandleResult::ok(id, displays)
                 }
-                QueryCommand::State => Response::ok(
+                QueryCommand::State => HandleResult::ok(
                     id,
                     json!({
                         "observed": &self.engine.observed,
@@ -350,7 +364,7 @@ impl Daemon {
                         .values()
                         .find(|w| w.focused)
                         .cloned();
-                    Response::ok(id, focused)
+                    HandleResult::ok(id, focused)
                 }
                 QueryCommand::Current => {
                     let id_val = self
@@ -360,7 +374,7 @@ impl Daemon {
                         .values()
                         .find(|w| w.focused)
                         .map(|w| w.id.0);
-                    Response::ok(id, json!({ "id": id_val }))
+                    HandleResult::ok(id, json!({ "id": id_val }))
                 }
             },
             Command::Window(command) => {
@@ -393,43 +407,70 @@ impl Daemon {
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => Response::ok(id, json!({ "accepted": true })),
-                        Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true })),
+                        Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
-                    Err(err) => Response::error(id, "ENGINE_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                 }
             }
             Command::Layout(command) => {
-                match command {
-                    LayoutCommand::Rotate { space } => self.engine.rotate_layout(space),
-                    LayoutCommand::Mirror { space } => self.engine.mirror_layout(space),
-                }
+                let space = match command {
+                    LayoutCommand::Rotate { space } => {
+                        self.engine.rotate_layout(space);
+                        space
+                    }
+                    LayoutCommand::Mirror { space } => {
+                        self.engine.mirror_layout(space);
+                        space
+                    }
+                };
                 self.persist_state();
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                         match self.execute_and_refresh(actions) {
-                            Ok(()) => Response::ok(id, json!({ "accepted": true })),
-                            Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                            Ok(()) => {
+                                let (horizontal, reversed) = self
+                                    .engine
+                                    .layout_orientation(space)
+                                    .unwrap_or((false, false));
+                                HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::LayoutChanged {
+                                        space,
+                                        horizontal,
+                                        reversed,
+                                    }])
+                            }
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                         }
                     }
-                    Err(err) => Response::error(id, "SNAPSHOT_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
                 }
             }
             Command::Scratchpad(command) => {
-                match command {
-                    ScratchpadCommand::Toggle { name } => self.engine.toggle_scratchpad(&name),
-                }
+                let name = match command {
+                    ScratchpadCommand::Toggle { name } => {
+                        self.engine.toggle_scratchpad(&name);
+                        name
+                    }
+                };
                 self.persist_state();
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                         match self.execute_and_refresh(actions) {
-                            Ok(()) => Response::ok(id, json!({ "accepted": true })),
-                            Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                            Ok(()) => {
+                                let open = self.engine.scratchpads.is_open(&name);
+                                HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::ScratchpadToggled {
+                                        name,
+                                        open,
+                                    }])
+                            }
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                         }
                     }
-                    Err(err) => Response::error(id, "SNAPSHOT_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
                 }
             }
             Command::Space(command) => {
@@ -441,10 +482,10 @@ impl Daemon {
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => Response::ok(id, json!({ "accepted": true })),
-                        Err(err) => Response::error(id, "PLATFORM_ERROR", err.to_string()),
+                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true })),
+                        Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
-                    Err(err) => Response::error(id, "ENGINE_ERROR", err.to_string()),
+                    Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                 }
             }
             Command::Config(command) => match command {
@@ -457,20 +498,21 @@ impl Daemon {
                             self.engine.config = config.clone();
                             self.config = config;
                             self.config_path = path;
-                            Response::ok(id, json!({ "reloaded": true }))
+                            HandleResult::ok(id, json!({ "reloaded": true }))
+                                .with_notifications(vec![Notification::ConfigReloaded])
                         }
-                        Err(err) => Response::error(id, "CONFIG_ERROR", err.to_string()),
+                        Err(err) => HandleResult::err(id, "CONFIG_ERROR", err.to_string()),
                     }
                 }
                 ConfigCommand::Check { path } => match Config::load(&path) {
-                    Ok(_) => Response::ok(id, json!({ "valid": true })),
-                    Err(err) => Response::error(id, "CONFIG_ERROR", err.to_string()),
+                    Ok(_) => HandleResult::ok(id, json!({ "valid": true })),
+                    Err(err) => HandleResult::err(id, "CONFIG_ERROR", err.to_string()),
                 },
             },
             Command::Debug(DebugCommand::Events) => {
-                Response::ok(id, self.engine.flight_recorder.snapshot())
+                HandleResult::ok(id, self.engine.flight_recorder.snapshot())
             }
-            Command::Subscribe => Response::error(
+            Command::Subscribe => HandleResult::err(
                 id,
                 "SUBSCRIBE_STREAMING",
                 "subscribe is served on a streaming connection; the one-shot path does not support it",
@@ -571,35 +613,180 @@ fn default_state_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead;
+    use rovr_platform::MockPlatform;
+    use rovr_protocol::ResponseOutcome;
+    use rovr_types::WindowId;
+    use std::sync::mpsc::sync_channel;
 
-    /// M4b: broadcast_notification writes a newline-delimited JSON notification
-    /// to every registered subscriber stream.
+    /// M4b: a slow or disconnected subscriber is evicted and never blocks the
+    /// state loop, because delivery uses a non-blocking try_send into a bounded
+    /// per-subscriber channel.
     #[test]
-    fn m4b_broadcast_writes_notification_to_subscribers() {
-        let (writer, reader) = UnixStream::pair().expect("socket pair");
-        let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(vec![writer]));
+    fn m4b_slow_subscriber_cannot_block_state_loop() {
+        let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<Notification>(1); // capacity 1
+                                                        // Fill the channel so the next try_send must fail (Full).
+        tx.try_send(Notification::StateChanged).unwrap();
+        subscribers.lock().unwrap().push(tx);
 
-        broadcast_notification(
-            &subscribers,
-            &Notification::Hello {
-                protocol_version: PROTOCOL_VERSION,
-            },
+        // Delivering to a full channel must evict immediately (non-blocking).
+        deliver_notification(&subscribers, &Notification::StateChanged);
+
+        assert!(
+            subscribers.lock().unwrap().is_empty(),
+            "full subscriber must be evicted without blocking"
         );
-        // Drop the registry so the clone held inside broadcast is released; the
-        // reader end stays open for us to read the written line.
-        drop(subscribers);
+        drop(rx);
+    }
 
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read broadcast line");
-        let got: Notification =
-            serde_json::from_str(line.trim()).expect("parse broadcast notification");
+    /// M4b: Hello is enqueued before registration, so the writer thread always
+    /// emits Hello first on a subscriber's stream (channel FIFO).
+    #[test]
+    fn m4b_hello_is_first_notification() {
+        let (tx, rx) = sync_channel::<Notification>(4);
+        tx.try_send(Notification::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        tx.try_send(Notification::StateChanged).unwrap();
+
         assert_eq!(
-            got,
+            rx.try_recv().unwrap(),
             Notification::Hello {
                 protocol_version: PROTOCOL_VERSION
             }
+        );
+        assert_eq!(rx.try_recv().unwrap(), Notification::StateChanged);
+    }
+
+    /// M4b: a newly connected subscriber receives Hello; existing subscribers
+    /// must NOT receive a second Hello.
+    #[test]
+    fn m4b_second_subscriber_does_not_send_hello_to_existing_subscribers() {
+        let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (a_tx, a_rx) = sync_channel::<Notification>(8);
+        register_subscriber(&subscribers, a_tx);
+
+        // B subscribes: enqueue Hello for B only, then register B.
+        let (b_tx, b_rx) = sync_channel::<Notification>(8);
+        b_tx.try_send(Notification::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        register_subscriber(&subscribers, b_tx);
+
+        // A later broadcast must reach both, but only B got Hello.
+        deliver_notification(&subscribers, &Notification::StateChanged);
+
+        // A: only StateChanged, no Hello.
+        assert_eq!(a_rx.try_recv().unwrap(), Notification::StateChanged);
+        assert!(
+            a_rx.try_recv().is_err(),
+            "existing subscriber must not receive Hello again"
+        );
+
+        // B: Hello first, then StateChanged.
+        assert_eq!(
+            b_rx.try_recv().unwrap(),
+            Notification::Hello {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
+        assert_eq!(b_rx.try_recv().unwrap(), Notification::StateChanged);
+    }
+
+    /// M4b: subscribe with a mismatched protocol version is rejected before any
+    /// subscription is established.
+    #[test]
+    fn m4b_subscribe_rejects_protocol_version_mismatch() {
+        let good = Request {
+            version: PROTOCOL_VERSION,
+            id: 1,
+            command: Command::Subscribe,
+        };
+        assert!(
+            validate_request(&good).is_none(),
+            "matching version must pass"
+        );
+
+        let bad = Request {
+            version: PROTOCOL_VERSION + 999,
+            id: 2,
+            command: Command::Subscribe,
+        };
+        let err = validate_request(&bad).expect("mismatch must produce an error");
+        match err.outcome {
+            ResponseOutcome::Error { error } => {
+                assert_eq!(error.code, "PROTOCOL_VERSION_MISMATCH")
+            }
+            ResponseOutcome::Ok { .. } => panic!("mismatch must not be accepted"),
+        }
+    }
+
+    fn test_daemon() -> Daemon {
+        Daemon {
+            engine: Engine::new(Config::default()),
+            platform: Box::new(MockPlatform::default()),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        }
+    }
+
+    /// M4b: a failed config reload does not emit ConfigReloaded.
+    #[test]
+    fn m4b_failed_config_reload_does_not_emit_config_reloaded() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(
+            1,
+            Command::Config(ConfigCommand::Reload {
+                path: Some("/nonexistent/rovr-does-not-exist-xyz.toml".into()),
+            }),
+        ));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
+        assert!(
+            result.notifications.is_empty(),
+            "failed reload must not emit ConfigReloaded"
+        );
+    }
+
+    /// M4b: a read-only query does not emit any notification.
+    #[test]
+    fn m4b_query_does_not_emit_state_changed() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(2, Command::Query(QueryCommand::Windows)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+        assert!(
+            result.notifications.is_empty(),
+            "query must not emit StateChanged"
+        );
+    }
+
+    /// M4b: a failed command (unknown window) does not claim a state change.
+    #[test]
+    fn m4b_failed_command_does_not_claim_state_changed() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(
+            3,
+            Command::Window(WindowCommand::Focus {
+                window: WindowId(0xdeadbeef),
+            }),
+        ));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
+        assert!(
+            result.notifications.is_empty(),
+            "failed command must not emit StateChanged"
         );
     }
 }
