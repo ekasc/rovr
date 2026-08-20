@@ -17,6 +17,8 @@ pub struct Config {
     pub workspaces: Vec<WorkspaceConfig>,
     #[serde(default, rename = "rule")]
     pub rules: Vec<RuleConfig>,
+    #[serde(default, rename = "scratchpad")]
+    pub scratchpads: Vec<ScratchpadConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +81,15 @@ pub struct RuleConfig {
     pub workspace: Option<String>,
     #[serde(rename = "float")]
     pub floating: Option<bool>,
+}
+/// A scratchpad is a named, toggleable set of windows. Members are excluded
+/// from tiling while the scratchpad is "open". Matched by `app` (exact bundle
+/// id) and/or `title` (substring); `None` = wildcard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScratchpadConfig {
+    pub name: String,
+    pub app: Option<String>,
+    pub title: Option<String>,
 }
 
 fn default_layout() -> LayoutKind {

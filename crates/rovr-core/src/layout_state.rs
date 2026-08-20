@@ -62,3 +62,22 @@ pub struct LayoutState {
 }
 
 pub type Layouts = HashMap<SpaceId, LayoutState>;
+/// Per-named-scratchpad open/closed state. A scratchpad is "open" when its
+/// members should be excluded from tiling. Toggling flips the bool.
+#[derive(Debug, Clone, Default)]
+pub struct ScratchpadState(pub HashMap<String, bool>);
+
+impl ScratchpadState {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn is_open(&self, name: &str) -> bool {
+        self.0.get(name).copied().unwrap_or(false)
+    }
+
+    pub fn toggle(&mut self, name: &str) {
+        let entry = self.0.entry(name.to_string()).or_insert(false);
+        *entry = !*entry;
+    }
+}
