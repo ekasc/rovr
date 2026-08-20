@@ -1,8 +1,9 @@
 use rovr_types::SpaceId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Primary split axis for a Space's BSP tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Axis {
     #[default]
     Vertical,
@@ -11,7 +12,7 @@ pub enum Axis {
 
 /// Orientation of a Space's BSP tree. `reversed` flips the window order
 /// (180°/270° rotations); `axis` is the root split direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Orientation {
     pub axis: Axis,
     pub reversed: bool,
@@ -56,7 +57,7 @@ impl Orientation {
 /// Per-Space layout state. Currently just orientation; window order is derived
 /// from the observed snapshot each cycle (M3a recomputes), so order is not
 /// stored.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LayoutState {
     pub orientation: Orientation,
 }

@@ -46,6 +46,7 @@ struct Daemon {
     platform: Box<dyn Platform>,
     config: Config,
     config_path: PathBuf,
+    state_path: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -57,10 +58,14 @@ fn main() -> Result<()> {
     let _foreground = args.foreground;
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
     let config_path = args.config.unwrap_or_else(default_config_path);
+    let state_path = default_state_path();
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
     let mut engine = Engine::new(config.clone());
+    if let Err(err) = engine.load_state(&state_path) {
+        warn!(%err, "no persisted state (first run expected)");
+    }
     match platform.snapshot() {
         Ok(snapshot) => {
             execute_actions(
@@ -76,6 +81,7 @@ fn main() -> Result<()> {
         platform,
         config,
         config_path,
+        state_path,
     };
 
     run_socket_server(socket_path, daemon)
@@ -278,6 +284,7 @@ impl Daemon {
                     LayoutCommand::Rotate { space } => self.engine.rotate_layout(space),
                     LayoutCommand::Mirror { space } => self.engine.mirror_layout(space),
                 }
+                self.persist_state();
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
@@ -293,6 +300,7 @@ impl Daemon {
                 match command {
                     ScratchpadCommand::Toggle { name } => self.engine.toggle_scratchpad(&name),
                 }
+                self.persist_state();
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
@@ -386,6 +394,11 @@ impl Daemon {
         }
         Ok(())
     }
+    fn persist_state(&self) {
+        if let Err(err) = self.engine.save_state(&self.state_path) {
+            warn!(%err, "failed to persist daemon state");
+        }
+    }
 }
 
 fn execute_actions(platform: &mut dyn Platform, actions: Vec<Action>) {
@@ -421,5 +434,12 @@ fn default_config_path() -> PathBuf {
         PathBuf::from(home).join(".config/rovr/rovr.toml")
     } else {
         PathBuf::from("rovr.toml")
+    }
+}
+fn default_state_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/rovr/state.json")
+    } else {
+        PathBuf::from("rovr-state.json")
     }
 }
