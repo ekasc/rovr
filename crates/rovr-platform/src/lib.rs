@@ -6,7 +6,7 @@ mod mock;
 pub use mock::MockPlatform;
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;
 
