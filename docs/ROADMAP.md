@@ -19,33 +19,33 @@
 
 ## M1: useful on macOS without private APIs
 
-- [ ] enumerate windows through CoreGraphics + Accessibility
-- [ ] resolve CGWindowID <-> AXUIElement reliably
-- [ ] focus window
-- [ ] set window frame
-- [ ] observe AX window lifecycle
-- [ ] display topology observation
-- [ ] sleep/wake generation bump and complete refresh
-- [ ] query output compatibility layer for yabai scripts
+- [x] enumerate windows through CoreGraphics + Accessibility
+- [x] resolve CGWindowID <-> AXUIElement reliably
+- [x] focus window
+- [x] set window frame
+- [x] observe AX window lifecycle
+- [x] display topology observation
+- [x] sleep/wake generation bump and complete refresh
+- [x] query output compatibility layer for yabai scripts
 
 ## M2: port the yabai private capability layer
 
-- [ ] audit current yabai scripting-addition surface
-- [ ] port only required SkyLight symbols behind the C ABI
-- [ ] feature/capability probing instead of OS-name checks in core
-- [ ] move window between Spaces
-- [ ] create/destroy/focus/reorder Spaces
-- [ ] layer, sticky, opacity, shadow and PiP capabilities
-- [ ] hard timeouts around every private transition
+- [x] audit current yabai scripting-addition surface
+- [x] port only required SkyLight symbols behind the C ABI
+- [x] feature/capability probing instead of OS-name checks in core
+- [x] move window between Spaces
+- [x] create/destroy/focus/reorder Spaces
+- [x] layer, sticky, opacity, shadow and PiP capabilities
+- [x] hard timeouts around every private transition
 
 ## M3: window manager
 
-- [ ] wire pure layouts into workspace desired state
-- [ ] BSP tree mutation model (insert/remove/rotate/mirror)
-- [ ] reactive rules
-- [ ] named workspaces
-- [ ] persistent workspace restoration
-- [ ] scratchpads
+- [x] wire pure layouts into workspace desired state
+- [x] BSP tree mutation model (insert/remove/rotate/mirror)
+- [x] reactive rules
+- [x] named workspaces
+- [x] persistent workspace restoration
+- [x] scratchpads
 
 ## M4: ecosystem
 
