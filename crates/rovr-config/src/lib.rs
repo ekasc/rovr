@@ -30,6 +30,10 @@ pub struct GeneralConfig {
     pub padding: i32,
     pub reconcile_on_wake: bool,
     pub reconcile_interval_ms: u64,
+    /// Optional WASM layout plugin name (e.g. "my_plugin"). If Some and plugin loads,
+    /// it is used instead of built-in `layout` for tiling. Falls back to built-in on error.
+    #[serde(default)]
+    pub plugin: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -40,6 +44,7 @@ impl Default for GeneralConfig {
             padding: 8,
             reconcile_on_wake: true,
             reconcile_interval_ms: 1000,
+            plugin: None,
         }
     }
 }
@@ -74,15 +79,27 @@ pub struct WorkspaceConfig {
     pub display: Option<String>,
     #[serde(default)]
     pub persistent: bool,
+    /// Optional per-workspace WASM plugin override
+    #[serde(default)]
+    pub plugin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuleConfig {
     pub app: Option<String>,
     pub title: Option<String>,
+    /// Match condition: window's current workspace name (via backing mapping)
+    /// Not used as action; see `target_workspace` for action.
     pub workspace: Option<String>,
     #[serde(rename = "float")]
     pub floating: Option<bool>,
+    /// Action: move matching window to named workspace (logical)
+    #[serde(default, rename = "target_workspace")]
+    pub target_workspace: Option<String>,
+    /// Action: set opacity (0.0-1.0)
+    pub opacity: Option<f64>,
+    /// Action: set window layer
+    pub layer: Option<i32>,
 }
 /// A scratchpad is a named, toggleable set of windows. Members are excluded
 /// from tiling while the scratchpad is "open". Matched by `app` (exact bundle
@@ -136,6 +153,8 @@ pub enum ConfigError {
     EmptyBindCommand,
     #[error("duplicate keybind key: {0}")]
     DuplicateBind(String),
+    #[error("opacity must be between 0.0 and 1.0")]
+    InvalidOpacity,
 }
 
 impl Config {
@@ -184,6 +203,16 @@ impl Config {
             if let Some(workspace) = &rule.workspace {
                 if !names.contains(workspace.as_str()) {
                     return Err(ConfigError::UnknownWorkspace(workspace.clone()));
+                }
+            }
+            if let Some(target) = &rule.target_workspace {
+                if !names.contains(target.as_str()) {
+                    return Err(ConfigError::UnknownWorkspace(target.clone()));
+                }
+            }
+            if let Some(opacity) = rule.opacity {
+                if !(0.0..=1.0).contains(&opacity) {
+                    return Err(ConfigError::InvalidOpacity);
                 }
             }
         }
