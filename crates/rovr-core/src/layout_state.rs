@@ -2,6 +2,8 @@ use rovr_types::SpaceId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::bsp::BspTree;
+
 /// Primary split axis for a Space's BSP tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Axis {
@@ -54,12 +56,16 @@ impl Orientation {
     }
 }
 
-/// Per-Space layout state. Currently just orientation; window order is derived
-/// from the observed snapshot each cycle (M3a recomputes), so order is not
-/// stored.
+/// Per-Space layout state. `bsp` is the persistent BSP tree; `orientation`
+/// is retained for backwards compat and for non-BSP layouts. The BSP tree
+/// owns topology (splits, ratios, window order) and survives reconcile cycles
+/// and daemon restart via `PersistedState`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LayoutState {
+    #[serde(default)]
     pub orientation: Orientation,
+    #[serde(default)]
+    pub bsp: BspTree,
 }
 
 pub type Layouts = HashMap<SpaceId, LayoutState>;

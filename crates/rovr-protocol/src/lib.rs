@@ -31,6 +31,7 @@ pub enum Command {
     Space(SpaceCommand),
     Layout(LayoutCommand),
     Scratchpad(ScratchpadCommand),
+    Workspace(WorkspaceCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
     Subscribe,
@@ -85,6 +86,18 @@ pub enum WindowCommand {
     Pip {
         window: WindowId,
     },
+    Swap {
+        a: WindowId,
+        b: WindowId,
+    },
+    Warp {
+        window: WindowId,
+        target: WindowId,
+    },
+    MoveToWorkspace {
+        window: WindowId,
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,11 +113,20 @@ pub enum SpaceCommand {
 pub enum LayoutCommand {
     Rotate { space: SpaceId },
     Mirror { space: SpaceId },
+    Balance { space: SpaceId },
+    SetRatio { space: SpaceId, ratio: f64 },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScratchpadCommand {
     Toggle { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceCommand {
+    Focus { name: String },
+    MoveWindow { window: WindowId, workspace: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,10 +7,12 @@ use crate::persistence::PersistedState;
 use anyhow::{Context, Result};
 
 use crate::layout_state::{Axis, Layouts, ScratchpadState};
+use crate::workspace::WorkspaceRegistry;
 use crate::{
     layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
     ObservedState,
 };
+use rovr_layout_plugin::Registry as PluginRegistry;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -29,8 +31,12 @@ pub enum EngineError {
     },
     #[error("window {0:?} is not on an observed display")]
     WindowNotOnDisplay(WindowId),
+    #[error("workspace {0} not found")]
+    WorkspaceNotFound(String),
+    #[error("workspace {0} has no backing space")]
+    WorkspaceNoBacking(String),
 }
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Engine {
     pub config: Config,
     pub observed: ObservedState,
@@ -38,17 +44,120 @@ pub struct Engine {
     pub flight_recorder: FlightRecorder,
     pub layouts: Layouts,
     pub scratchpads: ScratchpadState,
+    pub workspaces: WorkspaceRegistry,
+    pub plugins: PluginRegistry,
+}
+
+fn load_plugins_from_disk(registry: &mut PluginRegistry) {
+    let dir = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".config/rovr/plugins"),
+        Err(_) => return,
+    };
+    if !dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+            let _ = registry.load_wasm_file(&path);
+        }
+    }
 }
 
 impl Engine {
     pub fn new(config: Config) -> Self {
+        let workspaces = WorkspaceRegistry::from_config(&config.workspaces);
+        let mut plugins = PluginRegistry::new();
+        load_plugins_from_disk(&mut plugins);
         Self {
+            plugins,
             config,
+            workspaces,
             ..Default::default()
         }
     }
-    pub fn toggle_scratchpad(&mut self, name: &str) {
+    pub fn toggle_scratchpad(&mut self, name: &str) -> Vec<Action> {
         self.scratchpads.toggle(name);
+        let is_open = self.scratchpads.is_open(name);
+        // Find pad config
+        let pad = match self.config.scratchpads.iter().find(|p| p.name == name) {
+            Some(p) => p.clone(),
+            None => return vec![],
+        };
+        // Locate first matching window (including minimized, since we now enumerate All)
+        let matching = self.observed.windows.values().find(|w| {
+            let app_ok = pad
+                .app
+                .as_ref()
+                .map(|a| w.bundle_id.as_deref() == Some(a.as_str()))
+                .unwrap_or(true);
+            let title_ok = pad
+                .title
+                .as_ref()
+                .map(|t| w.title.contains(t.as_str()))
+                .unwrap_or(true);
+            app_ok && title_ok
+        });
+        let Some(win) = matching else {
+            // No window yet — toggle open state is still persisted, layout will float when it appears.
+            // Spawn support can be added where pad specifies a command.
+            return vec![];
+        };
+        let win_id = win.id;
+        if is_open {
+            // Show: unminimize, move to focused space, center 800x600, focus
+            let focused_space = self
+                .observed
+                .spaces
+                .values()
+                .find(|s| s.focused)
+                .map(|s| s.id);
+            let display_frame = focused_space
+                .and_then(|sid| self.observed.spaces.get(&sid))
+                .and_then(|s| self.observed.displays.get(&s.display_id))
+                .map(|d| d.frame)
+                .or_else(|| self.observed.displays.values().next().map(|d| d.frame));
+            let mut actions = vec![Action::SetWindowMinimized {
+                window: win_id,
+                minimized: false,
+            }];
+            if let Some(space) = focused_space {
+                let current = self.observed.windows.get(&win_id).and_then(|w| w.space_id);
+                if current != Some(space) {
+                    actions.push(Action::MoveWindowToSpace {
+                        window: win_id,
+                        space,
+                    });
+                }
+            }
+            if let Some(frame) = display_frame {
+                let w = 800.0;
+                let h = 600.0;
+                let x = frame.x + (frame.width - w) / 2.0;
+                let y = frame.y + (frame.height - h) / 2.0;
+                actions.push(Action::SetWindowFrame {
+                    window: win_id,
+                    frame: Rect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    },
+                });
+            }
+            actions.push(Action::FocusWindow { window: win_id });
+            actions
+        } else {
+            // Hide: minimize
+            vec![Action::SetWindowMinimized {
+                window: win_id,
+                minimized: true,
+            }]
+        }
     }
     /// Returns the BSP orientation of a space, if tracked, as `(horizontal,
     /// reversed)`. Used by the daemon to describe layout changes without
@@ -69,6 +178,7 @@ impl Engine {
                 .map(|(id, state)| (id.0.to_string(), state.clone()))
                 .collect(),
             scratchpads: self.scratchpads.0.clone(),
+            workspaces: self.workspaces.0.clone(),
         };
         let json = serde_json::to_string_pretty(&persisted).context("serialize state")?;
         if let Some(parent) = path.parent() {
@@ -87,6 +197,9 @@ impl Engine {
             .filter_map(|(k, v)| k.parse::<u64>().ok().map(|n| (SpaceId(n), v)))
             .collect();
         self.scratchpads = ScratchpadState(persisted.scratchpads);
+        self.workspaces = crate::workspace::WorkspaceRegistry(persisted.workspaces);
+        // After load, ensure workspaces still reflect current config (preserve backing where name matches)
+        self.workspaces.ensure_from_config(&self.config.workspaces);
         Ok(())
     }
 }
@@ -95,17 +208,76 @@ impl Engine {
     pub fn rotate_layout(&mut self, space: SpaceId) {
         let state = self.layouts.entry(space).or_default();
         state.orientation = state.orientation.rotate();
+        state.bsp.rotate();
     }
 
     pub fn mirror_layout(&mut self, space: SpaceId) {
         let state = self.layouts.entry(space).or_default();
         state.orientation = state.orientation.mirror();
+        state.bsp.mirror();
     }
+
+    pub fn balance_layout(&mut self, space: SpaceId) {
+        if let Some(state) = self.layouts.get_mut(&space) {
+            state.bsp.balance();
+        }
+    }
+
+    pub fn swap_windows(&mut self, a: WindowId, b: WindowId) -> Result<(), EngineError> {
+        // Find space containing both? For now swap in any space that contains both.
+        for state in self.layouts.values_mut() {
+            if state.bsp.contains(a) && state.bsp.contains(b) && state.bsp.swap(a, b) {
+                return Ok(());
+            }
+        }
+        Err(EngineError::WindowNotFound(a))
+    }
+
+    pub fn warp_window(&mut self, window: WindowId, target: WindowId) -> Result<(), EngineError> {
+        self.require_window(window)?;
+        self.require_window(target)?;
+        for state in self.layouts.values_mut() {
+            if state.bsp.contains(target) && state.bsp.warp(window, target, false) {
+                return Ok(());
+            }
+        }
+        Err(EngineError::WindowNotFound(target))
+    }
+
+    pub fn set_split_ratio(&mut self, space: SpaceId, ratio: f64) -> Result<(), EngineError> {
+        let state = self
+            .layouts
+            .get_mut(&space)
+            .ok_or(EngineError::SpaceNotFound(space))?;
+        if !state.bsp.set_ratio(ratio) {
+            // If tree is empty/single leaf, ratio has no effect but still success
+            // Ensure at least orientation ratio concept? Return ok for empty.
+            if state.bsp.is_empty() || state.bsp.len() == 1 {
+                return Ok(());
+            }
+            return Err(EngineError::SpaceNotFound(space));
+        }
+        Ok(())
+    }
+    pub fn reload_config(&mut self, config: Config) {
+        self.config = config;
+        self.workspaces.ensure_from_config(&self.config.workspaces);
+        self.workspaces
+            .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
+        // Reload WASM plugins from disk (isolated, fuel-limited, version-checked)
+        self.plugins = PluginRegistry::new();
+        load_plugins_from_disk(&mut self.plugins);
+    }
+
     pub fn apply_event(&mut self, event: Event) -> Vec<Action> {
         self.flight_recorder.record("event", format!("{event:?}"));
 
         match event {
-            Event::Snapshot(snapshot) => self.apply_snapshot(snapshot),
+            Event::Snapshot(snapshot) => {
+                self.apply_snapshot(snapshot);
+                self.workspaces
+                    .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
+            }
             Event::WindowDestroyed { window } => {
                 self.observed.windows.remove(&window);
                 self.desired.windows.remove(&window);
@@ -132,7 +304,9 @@ impl Engine {
             &self.config,
             &self.observed,
             &mut self.desired,
-            &self.layouts,
+            &mut self.layouts,
+            &self.workspaces,
+            &self.plugins,
             &self.scratchpads,
         );
 
@@ -288,6 +462,33 @@ impl Engine {
             return Err(EngineError::SameSpace);
         }
         Ok(vec![Action::MoveSpace { space, after }])
+    }
+
+    pub fn focus_workspace(&self, name: &str) -> Result<Vec<Action>, EngineError> {
+        let space = self
+            .workspaces
+            .backing_for(name)
+            .ok_or_else(|| EngineError::WorkspaceNoBacking(name.to_string()))?;
+        self.require_space(space)?;
+        Ok(vec![Action::FocusSpace { space }])
+    }
+
+    pub fn move_window_to_workspace(
+        &self,
+        window: WindowId,
+        name: &str,
+    ) -> Result<Vec<Action>, EngineError> {
+        self.require_window(window)?;
+        let space = self
+            .workspaces
+            .backing_for(name)
+            .ok_or_else(|| EngineError::WorkspaceNoBacking(name.to_string()))?;
+        self.require_space(space)?;
+        Ok(vec![Action::MoveWindowToSpace { window, space }])
+    }
+
+    pub fn workspace_for_space(&self, space: SpaceId) -> Option<&str> {
+        self.workspaces.name_for_space(space)
     }
 
     pub fn focus_direction(
@@ -617,7 +818,9 @@ mod tests {
             &engine.config,
             &observed,
             &mut desired,
-            &engine.layouts,
+            &mut engine.layouts,
+            &engine.workspaces,
+            &engine.plugins,
             &ScratchpadState::new(),
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
@@ -638,7 +841,9 @@ mod tests {
             &engine.config,
             &observed,
             &mut desired2,
-            &engine.layouts,
+            &mut engine.layouts,
+            &engine.workspaces,
+            &engine.plugins,
             &ScratchpadState::new(),
         );
         let g1 = desired2.windows[&WindowId(1)].frame.unwrap();

@@ -1,4 +1,5 @@
 mod action;
+pub mod bsp;
 mod engine;
 mod event;
 mod flight_recorder;
@@ -7,6 +8,7 @@ mod layout_state;
 mod persistence;
 mod reconcile;
 mod state;
+pub mod workspace;
 
 pub use action::Action;
 pub use engine::{Engine, EngineError};
