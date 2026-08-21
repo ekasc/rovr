@@ -32,3 +32,16 @@ float = true
 [[rule]]
 app = "^Slack$"
 workspace = "chat"
+
+# Optional keybinds. These are the single source of truth for skhd and for a
+# future built-in hotkey listener. key uses skhd syntax, command is the rovr
+# CLI invocation without the leading "rovr".
+# [[bind]]
+# key = "alt - h"
+# command = "window focus-direction --from 1 --direction west"
+# [[bind]]
+# key = "alt - l"
+# command = "window focus-direction --from 1 --direction east"
+# [[bind]]
+# key = "alt - r"
+# command = "layout rotate --space 1"
