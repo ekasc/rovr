@@ -19,6 +19,8 @@ pub struct Config {
     pub rules: Vec<RuleConfig>,
     #[serde(default, rename = "scratchpad")]
     pub scratchpads: Vec<ScratchpadConfig>,
+    #[serde(default, rename = "bind")]
+    pub binds: Vec<KeybindConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +93,16 @@ pub struct ScratchpadConfig {
     pub app: Option<String>,
     pub title: Option<String>,
 }
+/// A keybind maps a macOS hotkey string to a rovr CLI command. The daemon does
+/// not yet register global hotkeys itself; this table is the single source of
+/// truth for skhd and for a future built-in listener. `key` uses skhd syntax
+/// like "cmd - h" or "alt + shift - r". `command` is the rovr CLI invocation
+/// without the leading "rovr", e.g. "window --focus 1" or "layout --rotate 1".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeybindConfig {
+    pub key: String,
+    pub command: String,
+}
 
 fn default_layout() -> LayoutKind {
     LayoutKind::Bsp
@@ -118,6 +130,12 @@ pub enum ConfigError {
         #[source]
         source: regex::Error,
     },
+    #[error("keybind key cannot be empty")]
+    EmptyBindKey,
+    #[error("keybind command cannot be empty")]
+    EmptyBindCommand,
+    #[error("duplicate keybind key: {0}")]
+    DuplicateBind(String),
 }
 
 impl Config {
@@ -170,6 +188,19 @@ impl Config {
             }
         }
 
+        let mut bind_keys = HashSet::new();
+        for bind in &self.binds {
+            if bind.key.trim().is_empty() {
+                return Err(ConfigError::EmptyBindKey);
+            }
+            if bind.command.trim().is_empty() {
+                return Err(ConfigError::EmptyBindCommand);
+            }
+            if !bind_keys.insert(bind.key.as_str()) {
+                return Err(ConfigError::DuplicateBind(bind.key.clone()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -177,6 +208,51 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_valid_binds() {
+        let cfg = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "window --focus-direction --from 1 --direction west"
+            [[bind]]
+            key = "alt - l"
+            command = "window --focus-direction --from 1 --direction east"
+            "#,
+        )
+        .expect("valid binds");
+        assert_eq!(cfg.binds.len(), 2);
+    }
+
+    #[test]
+    fn rejects_empty_bind_key() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = ""
+            command = "query --windows"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyBindKey));
+    }
+
+    #[test]
+    fn rejects_duplicate_bind_keys() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "query --windows"
+            [[bind]]
+            key = "alt - h"
+            command = "query --spaces"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "alt - h"));
+    }
 
     #[test]
     fn rejects_duplicate_workspaces() {

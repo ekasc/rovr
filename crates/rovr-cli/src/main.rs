@@ -150,8 +150,16 @@ struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigSubcommand {
-    Reload { path: Option<String> },
-    Check { path: String },
+    Reload {
+        path: Option<String>,
+    },
+    Check {
+        path: String,
+    },
+    #[command(name = "gen-skhd", about = "Generate skhd config from rovr.toml binds")]
+    GenSkhd {
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -191,6 +199,11 @@ fn main() -> Result<()> {
     if let TopCommand::Completions { shell } = cli.command {
         generate_completions(shell);
         return Ok(());
+    }
+    if let TopCommand::Config(args) = &cli.command {
+        if let ConfigSubcommand::GenSkhd { path } = &args.command {
+            return run_gen_skhd(path.as_deref());
+        }
     }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     if matches!(cli.command, TopCommand::Subscribe) {
@@ -343,6 +356,9 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Config(args) => Command::Config(match args.command {
             ConfigSubcommand::Reload { path } => ConfigCommand::Reload { path },
             ConfigSubcommand::Check { path } => ConfigCommand::Check { path },
+            ConfigSubcommand::GenSkhd { .. } => {
+                unreachable!("gen-skhd is handled in main() before map_command")
+            }
         }),
         TopCommand::Debug(args) => Command::Debug(match args.command {
             DebugSubcommand::Events => DebugCommand::Events,
@@ -365,6 +381,22 @@ fn map_command(command: TopCommand) -> Command {
             unreachable!("subscribe is handled in main() before map_command is called")
         }
     }
+}
+
+fn run_gen_skhd(path: Option<&str>) -> Result<()> {
+    let cfg_path = path.map(PathBuf::from).unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".config/rovr/rovr.toml")
+    });
+    let content = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read config {}", cfg_path.display()))?;
+    let cfg: rovr_config::Config =
+        toml::from_str(&content).with_context(|| format!("parse {}", cfg_path.display()))?;
+    cfg.validate()?;
+    for bind in &cfg.binds {
+        println!("{} : rovr {}", bind.key, bind.command);
+    }
+    Ok(())
 }
 
 fn send(path: &Path, request: &Request) -> Result<Response> {
