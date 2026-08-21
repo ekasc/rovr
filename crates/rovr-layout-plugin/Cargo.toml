@@ -11,3 +11,5 @@ rovr-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+wasmi = { version = "0.40", default-features = false, features = ["std"] }
+wat = "1"
