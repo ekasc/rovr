@@ -161,6 +161,52 @@ static uint64_t rovr_space_id_for_window(uint32_t wid) {
     return sid;
 }
 
+// 0 = false, 1 = true, 2 = unknown (AX unavailable / race / attribute missing).
+static int rovr_ax_bool_for_window(AXUIElementRef window, CFStringRef attribute) {
+    if (!window || !attribute) return 2;
+    CFTypeRef value = NULL;
+    AXError err = AXUIElementCopyAttributeValue(window, attribute, &value);
+    if (err != kAXErrorSuccess || !value) {
+        if (value) CFRelease(value);
+        return 2;
+    }
+    int result = 2;
+    if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+        result = CFBooleanGetValue((CFBooleanRef)value) ? 1 : 0;
+    }
+    CFRelease(value);
+    return result;
+}
+
+static int rovr_ax_managed_for_window(AXUIElementRef window) {
+    if (!window) return 2;
+    CFTypeRef role = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXRoleAttribute, &role) == kAXErrorSuccess && role) {
+        BOOL is_window = (CFStringCompare((CFStringRef)role, CFSTR("AXWindow"), 0) == kCFCompareEqualTo);
+        CFRelease(role);
+        if (!is_window) return 0;
+    } else {
+        if (role) CFRelease(role);
+        return 2;
+    }
+    CFTypeRef subrole = NULL;
+    if (AXUIElementCopyAttributeValue(window, kAXSubroleAttribute, &subrole) == kAXErrorSuccess && subrole) {
+        BOOL floating = NO;
+        if (CFStringCompare((CFStringRef)subrole, CFSTR("AXDialog"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemDialog"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXFloatingWindow"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemFloatingWindow"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXPopover"), 0) == kCFCompareEqualTo) {
+            floating = YES;
+        }
+        CFRelease(subrole);
+        if (floating) return 0;
+    } else {
+        if (subrole) CFRelease(subrole);
+    }
+    return 1;
+}
+
 static int rovr_mission_control_index(int cid, uint64_t sid) {
     CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
     if (!display_spaces) return 0;
@@ -288,7 +334,7 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
     @autoreleasepool {
         const uint32_t focused_window_id = rovr_focused_window_id();
         CFArrayRef list = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID);
         if (!list) return 2;
 
@@ -322,6 +368,26 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             window.y = bounds.origin.y;
             window.width = bounds.size.width;
             window.height = bounds.size.height;
+            // Conservative defaults: unknown = 2. Rust side maps unknown
+            // managed => false (don't tile), unknown minimized/fullscreen => false.
+            window.minimized = 2;
+            window.fullscreen = 2;
+            window.managed = 2;
+
+            // Best-effort AX refinement. This is per-window (may be slow)
+            // but necessary for truthful observation: minimized/fullscreen
+            // and AX dialog/system-floating distinction. Transient windows
+            // that disappear between CG and AX simply stay unknown.
+            AXUIElementRef ax_window = rovr_ax_window_for_id(window.id, NULL);
+            if (ax_window) {
+                int minimized = rovr_ax_bool_for_window(ax_window, kAXMinimizedAttribute);
+                int fullscreen = rovr_ax_bool_for_window(ax_window, CFSTR("AXFullScreen"));
+                int managed = rovr_ax_managed_for_window(ax_window);
+                window.minimized = (uint8_t)(minimized == 2 ? 2 : (minimized ? 1 : 0));
+                window.fullscreen = (uint8_t)(fullscreen == 2 ? 2 : (fullscreen ? 1 : 0));
+                window.managed = (uint8_t)(managed == 2 ? 2 : (managed ? 1 : 0));
+                CFRelease(ax_window);
+            }
 
             rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowOwnerName), window.app, sizeof(window.app));
             rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowName), window.title, sizeof(window.title));
@@ -404,6 +470,24 @@ int rovr_bridge_focus_window(uint32_t window_id) {
     AXError error = AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
     CFRelease(window);
     return error == kAXErrorSuccess ? 0 : 2;
+}
+
+int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized) {
+    AXUIElementRef window = rovr_ax_window_for_id(window_id, NULL);
+    if (!window) return 1;
+    CFBooleanRef value = minimized ? kCFBooleanTrue : kCFBooleanFalse;
+    AXError err = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute, value);
+    CFRelease(window);
+    return err == kAXErrorSuccess ? 0 : 2;
+}
+
+int32_t rovr_bridge_dock_pid(void) {
+    @autoreleasepool {
+        NSArray<NSRunningApplication *> *apps = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"];
+        if (apps.count == 0) return -1;
+        NSRunningApplication *dock = apps[0];
+        return (int32_t)dock.processIdentifier;
+    }
 }
 
 int rovr_bridge_needs_refresh(void) {
