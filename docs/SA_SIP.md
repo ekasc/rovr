@@ -5,25 +5,34 @@
 ## Summary
 
 - **No SIP change** is required to run Rovr without the SA: window enumeration, display/space observation, `move window to space` (via `SLSPerformAsynchronousBridgedWindowManagementOperation` / compat workaround), `focus space` via gesture synthesis, `set frame` / `focus window` via Accessibility, tiling, rules, layouts, subscriptions all work on stock macOS.
-- **SA-gated capabilities** (create/destroy/reorder Space, layer, sticky, shadow, opacity, PiP/scale) require code injected into Dock. Injecting into Dock is gated by SIP. The payload will only request the minimum relaxation that actually enables the primitive operations Rovr uses.
+- **SA-gated capabilities** (create/destroy/reorder Space, layer, sticky, shadow, opacity, PiP/scale) require code injected into Dock. Injecting into Dock is gated by SIP. The payload requests only the relaxations that actually enable those primitive operations.
 
-## What injection needs
+## Exact relaxations required
 
-- The payload is a small dylib injected into Dock. On macOS with SIP enabled, injection via `task_for_pid` / `DYLD_INSERT_LIBRARIES` / scripting-addition loading is blocked. The standard ways to permit it are:
-  - `csrutil enable --without debug` (also sometimes described as `--without fs` / `filesystem` depending on macOS vintage) — permits debugging / task-for-pid against system processes like Dock.
-  - In some configurations, installing the SA to a SIP-protected location additionally requires `--without fs` if filesystem protection would block the install path. Rovr will choose the minimal privileged install location that works with `--without debug` alone where possible.
+Injection uses `task_for_pid` against Dock plus a remote-thread `dlopen` of the payload dylib. That requires:
 
-Rovr will **not** ask for `csrutil disable` (full SIP off). The install flow will document which `csrutil` flag(s) the current macOS build actually requires for the operations listed above, and will refuse broader relaxations.
+1. **Debugging restrictions disabled** — permits `task_for_pid` against system processes:
+   - `csrutil enable --without debug` (recovery mode)
+2. **Filesystem protections disabled** — the loader binary and payload dylib live under `/Library/Application Support/rovr/`, and task ports for platform binaries are additionally gated on filesystem policy:
+   - `csrutil enable --without fs` (recovery mode)
+3. **Apple Silicon only**: `-arm64e_preview_abi` boot-arg — arm64e PAC requires signing injected code with the preview ABI:
+   - `sudo nvram boot-args="-arm64e_preview_abi"` (then reboot)
+
+Combined recovery-mode command: `csrutil enable --without debug --without fs`.
+
+Rovr will **not** ask for `csrutil disable` (full SIP off). `rovr sa install` checks `csrutil status` for exactly these two flags and refuses to attempt injection (with remediation instructions) when they are absent.
 
 ## Why not weaker?
 
 - The SA exists solely to expose primitive SkyLight / window-level ops that have no public API and require Dock context. The Rust daemon never runs with Dock privileges itself; it talks to Dock only over the private Unix socket `/tmp/rovr-sa_<uid>.sock` with a 2 s deadline and versioned handshake. The payload has no layout policy, no config, no desired-state — compromise of the SA cannot directly reconfigure tiling policy.
+- The installed loader is mode 744 (root-only execute), the dylib 644; both live in a root-owned directory. Normal Rovr operation never escalates.
 
 ## Operationally
 
-- `rovr sa status` reports `socket` / `present` / `version` / `compatible` / `attribs`. When injection is missing or incompatible, `rovr doctor` marks `capabilities.{create_space,destroy_space,reorder_space,layer,sticky,shadow,opacity,scale} = false` and `sa.present = false` with the expected version prefix — no silent fallback to a yabai payload (different socket namespace), so the failure mode is explicit.
-- `rovr sa install` / `rovr sa uninstall` will be the only operations that touch privileged state; normal `rovr` operation never escalates.
+- `rovr sa status` reports one of five states (`not_installed`, `installed_not_injected`, `injected_compatible`, `incompatible_protocol`, `capability_missing`) so a broken install is explicit, not silent.
+- When injection is missing or incompatible, `rovr doctor` marks `capabilities.{create_space,destroy_space,reorder_space,layer,sticky,shadow,opacity,scale} = false` and `sa.present = false` with the expected version prefix — no silent fallback to a yabai payload (different socket namespace).
+- `rovr sa install` / `rovr sa uninstall` are the only operations that touch privileged state.
 
-## Next
+## Verification status
 
-- When the `rovr-sa-payload` crate ships, update this doc with the exact `csrutil` invocation(s) verified on each supported macOS minor, the privileged install path, and the `launchctl` / injection command. Keep the claim minimal and tested — do not copy a broader yabai instruction set without verification.
+The SIP check logic is implemented in `rovr sa install`, but the actual injection flow has NOT been exercised end-to-end yet (requires a recovery-mode reboot). The exact `csrutil` invocations above must be verified per supported macOS minor before claiming `[x]`; do not promote the SA roadmap items until then.

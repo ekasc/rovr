@@ -1,0 +1,15 @@
+[package]
+name = "rovr-sa-payload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rovr scripting-addition payload (Dock-injected dylib; primitive SkyLight/Dock ops only)"
+build = "build.rs"
+
+# The payload is pure Objective-C; cargo only drives the build and exposes the
+# artifact path under target/*/build/rovr-sa-payload-*/out/.
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
