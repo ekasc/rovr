@@ -658,3 +658,44 @@ int rovr_bridge_focus_space(uint64_t space_id) {
     CFRelease(event);
     return 0;
 }
+
+uint64_t rovr_bridge_current_space_id(void) {
+    if (!g_sls_copy_managed_display_spaces || !g_sls_managed_display_get_current_space ||
+        !g_sls_main_connection) {
+        return 0;
+    }
+
+    int cid = g_sls_main_connection();
+    CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
+    if (!display_spaces) return 0;
+
+    CGDirectDisplayID active_displays[32] = {0};
+    uint32_t active_display_count = 0;
+    CGGetActiveDisplayList(32, active_displays, &active_display_count);
+
+    uint64_t result = 0;
+    CFIndex display_count = CFArrayGetCount(display_spaces);
+    for (CFIndex d = 0; d < display_count && result == 0; d++) {
+        CFDictionaryRef display_ref = (CFDictionaryRef)CFArrayGetValueAtIndex(display_spaces, d);
+        CFStringRef uuid = (CFStringRef)CFDictionaryGetValue(display_ref, CFSTR("Display Identifier"));
+        if (!uuid) continue;
+
+        uint32_t display_id = 0;
+        CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
+        if (parsed) {
+            display_id = CGDisplayGetDisplayIDFromUUID(parsed);
+            CFRelease(parsed);
+        }
+        if (display_id == 0) continue;
+
+        for (uint32_t i = 0; i < active_display_count; i++) {
+            if (active_displays[i] == display_id) {
+                result = g_sls_managed_display_get_current_space(cid, uuid);
+                break;
+            }
+        }
+    }
+
+    CFRelease(display_spaces);
+    return result;
+}
