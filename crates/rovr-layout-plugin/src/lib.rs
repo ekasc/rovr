@@ -38,14 +38,9 @@ pub trait LayoutPlugin: Send + Sync {
     fn compute(&self, request: &PluginRequest) -> Result<Vec<PluginPlacement>, PluginError>;
 }
 
+#[derive(Default)]
 pub struct Registry {
     plugins: Vec<Box<dyn LayoutPlugin>>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self { plugins: Vec::new() }
-    }
 }
 
 impl Registry {
@@ -65,7 +60,10 @@ impl Registry {
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.plugins.iter().map(|p| p.manifest().name.clone()).collect()
+        self.plugins
+            .iter()
+            .map(|p| p.manifest().name.clone())
+            .collect()
     }
 }
 
