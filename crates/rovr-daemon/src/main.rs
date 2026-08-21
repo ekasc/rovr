@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     thread,
     time::Duration,
 };
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -103,9 +105,20 @@ fn make_platform() -> Result<Box<dyn Platform>> {
 }
 
 fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("remove stale socket {}", path.display()))?;
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            anyhow::bail!("refusing to remove symlink at {}", path.display());
+        }
+        if ft.is_socket() {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove stale socket {}", path.display()))?;
+        } else {
+            anyhow::bail!(
+                "stale non-socket file at {} — refusing to remove",
+                path.display()
+            );
+        }
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -113,6 +126,7 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind rovr socket at {}", path.display()))?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!(socket = %path.display(), "rovr daemon listening");
 
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -143,9 +157,30 @@ fn handle_client(
     tx: Sender<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let request: Request = serde_json::from_str(&line).context("decode request")?;
+    let bytes = BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    if bytes == 0 {
+        anyhow::bail!("empty request");
+    }
+    if line.len() > MAX_REQUEST_BYTES {
+        let err = Response::error(0, "BAD_REQUEST", "request too large");
+        serde_json::to_writer(&mut stream, &err)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        return Ok(());
+    }
+    let request: Request = match serde_json::from_str(&line) {
+        Ok(req) => req,
+        Err(err) => {
+            let resp = Response::error(0, "BAD_REQUEST", format!("invalid request: {err}"));
+            serde_json::to_writer(&mut stream, &resp)?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            return Ok(());
+        }
+    };
     let request_id = request.id;
 
     if let Some(err) = validate_request(&request) {
@@ -235,8 +270,9 @@ fn state_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                daemon.refresh_observation();
-                deliver_notification(&subscribers, &Notification::StateChanged);
+                if daemon.refresh_observation() {
+                    deliver_notification(&subscribers, &Notification::StateChanged);
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -505,23 +541,39 @@ impl Daemon {
             }
             Command::Config(command) => match command {
                 ConfigCommand::Reload { path } => {
-                    let path = path
+                    let raw = path
                         .map(PathBuf::from)
                         .unwrap_or_else(|| self.config_path.clone());
-                    match Config::load(&path) {
+                    if raw.to_string_lossy().len() > 4096 {
+                        return HandleResult::err(id, "CONFIG_ERROR", "path too long");
+                    }
+                    match Config::load(&raw) {
                         Ok(config) => {
                             self.engine.config = config.clone();
                             self.config = config;
-                            self.config_path = path;
+                            self.config_path = raw;
                             HandleResult::ok(id, json!({ "reloaded": true }))
                                 .with_notifications(vec![Notification::ConfigReloaded])
                         }
-                        Err(err) => HandleResult::err(id, "CONFIG_ERROR", err.to_string()),
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let truncated = if msg.len() > 500 { &msg[..500] } else { &msg };
+                            HandleResult::err(id, "CONFIG_ERROR", truncated.to_string())
+                        }
                     }
                 }
-                ConfigCommand::Check { path } => match Config::load(&path) {
-                    Ok(_) => HandleResult::ok(id, json!({ "valid": true })),
-                    Err(err) => HandleResult::err(id, "CONFIG_ERROR", err.to_string()),
+                ConfigCommand::Check { path } => {
+                    if path.len() > 4096 {
+                        return HandleResult::err(id, "CONFIG_ERROR", "path too long");
+                    }
+                    match Config::load(&path) {
+                        Ok(_) => HandleResult::ok(id, json!({ "valid": true })),
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let truncated = if msg.len() > 500 { &msg[..500] } else { &msg };
+                            HandleResult::err(id, "CONFIG_ERROR", truncated.to_string())
+                        }
+                    }
                 },
             },
             Command::Debug(DebugCommand::Events) => {
@@ -535,23 +587,29 @@ impl Daemon {
         }
     }
 
-    fn refresh_observation(&mut self) {
+    fn refresh_observation(&mut self) -> bool {
+        let mut changed = false;
         // Event-driven: display topology callback sets the flag on reconfiguration.
         if self.platform.needs_refresh() {
             self.engine.observed.bump_generation();
             self.engine
                 .flight_recorder
                 .record("display.topology_changed", "callback-triggered refresh");
+            changed = true;
         }
 
         match self.platform.snapshot() {
             Ok(snapshot) => {
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
+                if !actions.is_empty() {
+                    changed = true;
+                }
                 if let Err(err) = execute_actions_result(&mut *self.platform, actions) {
                     self.engine
                         .flight_recorder
                         .record("platform.error", err.to_string());
                     warn!(%err, "periodic reconciliation failed");
+                    changed = true;
                 }
             }
             Err(err) => {
@@ -561,6 +619,7 @@ impl Daemon {
                 warn!(%err, "periodic snapshot failed");
             }
         }
+        changed
     }
 
     fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {

@@ -49,7 +49,7 @@
 
 ## M4: ecosystem
 
-- [ ] stable subscription API
+- [x] stable subscription API
 - [x] shell completions
 - [ ] skhd compatibility / optional built-in keybinds
 - [ ] Swift menu-bar diagnostics UI
