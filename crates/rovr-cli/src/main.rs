@@ -486,11 +486,24 @@ fn run_sa_status() -> Result<()> {
         let socket = client.socket_path().clone();
         println!("socket: {}", socket.display());
         println!("expected_prefix: {}", ROVR_SA_VERSION_PREFIX);
-        match client.probe() {
-            Some(info) => {
+
+        let state = sa_state(&client);
+        match &state {
+            SaState::NotInstalled => {
+                println!("state: not_installed");
+                println!("present: false");
+                println!("hint: run `sudo rovr sa install` (see docs/SA_SIP.md)");
+            }
+            SaState::InstalledNotInjected => {
+                println!("state: installed_not_injected");
+                println!("present: false");
+                println!("hint: payload files are installed but Dock is not running the payload; run `sudo rovr sa install` to inject");
+            }
+            SaState::InjectedCompatible(info) => {
+                println!("state: injected_compatible");
                 println!("present: true");
                 println!("version: {}", info.version);
-                println!("compatible: {}", info.is_compatible());
+                println!("compatible: true");
                 println!("attribs: 0x{:08x}", info.attribs);
                 let add = (info.attribs & 0x04) != 0;
                 let rem = (info.attribs & 0x08) != 0;
@@ -499,11 +512,23 @@ fn run_sa_status() -> Result<()> {
                 println!("  create_space: {}", add);
                 println!("  destroy_space: {}", rem);
                 println!("  reorder_space: {}", mov_);
-                println!("  layer/sticky/shadow/opacity/scale: true (when present)");
+                println!("  layer/sticky/shadow/opacity/scale: true");
             }
-            None => {
-                println!("present: false");
-                println!("hint: run `rovr sa install` then restart Dock, or check SIP / payload injection");
+            SaState::IncompatibleProtocol(version) => {
+                println!("state: incompatible_protocol");
+                println!("present: true");
+                println!("version: {}", version);
+                println!("compatible: false");
+                println!("hint: a non-Rovr or outdated payload is answering on the Rovr socket; reinstall via `sudo rovr sa install`");
+            }
+            SaState::CapabilityMissing(info, missing) => {
+                println!("state: capability_missing");
+                println!("present: true");
+                println!("version: {}", info.version);
+                println!("compatible: true");
+                println!("attribs: 0x{:08x}", info.attribs);
+                println!("missing: {}", missing.join(", "));
+                println!("hint: the payload resolved fewer Dock internals on this macOS build; affected operations will fail until supported");
             }
         }
     }
@@ -529,24 +554,249 @@ fn run_sa_status() -> Result<()> {
     Ok(())
 }
 
+/// Privileged install locations for the Rovr SA artifacts.
+#[cfg(target_os = "macos")]
+const SA_INSTALL_DIR: &str = "/Library/Application Support/rovr";
+#[cfg(target_os = "macos")]
+const SA_INSTALLED_DYLIB: &str = "/Library/Application Support/rovr/librovr_sa_payload.dylib";
+#[cfg(target_os = "macos")]
+const SA_INSTALLED_LOADER: &str = "/Library/Application Support/rovr/rovr-sa-loader";
+
+/// The five honest SA states surfaced by `rovr sa status` (blocker 1).
+#[cfg(target_os = "macos")]
+enum SaState {
+    NotInstalled,
+    InstalledNotInjected,
+    InjectedCompatible(rovr_platform::macos::sa::SaInfo),
+    IncompatibleProtocol(String),
+    CapabilityMissing(rovr_platform::macos::sa::SaInfo, Vec<String>),
+}
+
+#[cfg(target_os = "macos")]
+fn sa_installed_files_present() -> bool {
+    std::path::Path::new(SA_INSTALLED_DYLIB).exists()
+}
+
+#[cfg(target_os = "macos")]
+fn sa_state(client: &rovr_platform::macos::sa::SaClient) -> SaState {
+    use rovr_platform::macos::sa::{
+        OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE,
+    };
+    match client.probe() {
+        Some(info) => {
+            if !info.is_compatible() {
+                return SaState::IncompatibleProtocol(info.version);
+            }
+            let mut missing = Vec::new();
+            if info.attribs & OSAX_ATTRIB_ADD_SPACE == 0 {
+                missing.push("create_space".to_string());
+            }
+            if info.attribs & OSAX_ATTRIB_REM_SPACE == 0 {
+                missing.push("destroy_space".to_string());
+            }
+            if info.attribs & OSAX_ATTRIB_MOV_SPACE == 0 {
+                missing.push("reorder_space".to_string());
+            }
+            if missing.is_empty() {
+                SaState::InjectedCompatible(info)
+            } else {
+                SaState::CapabilityMissing(info, missing)
+            }
+        }
+        None => {
+            if sa_installed_files_present() {
+                SaState::InstalledNotInjected
+            } else {
+                SaState::NotInstalled
+            }
+        }
+    }
+}
+
+/// Locate build artifacts: env overrides, then cargo target build dirs
+/// relative to this executable.
+#[cfg(target_os = "macos")]
+fn find_sa_artifacts() -> Result<(PathBuf, PathBuf)> {
+    if let (Ok(dylib), Ok(loader)) = (
+        std::env::var("ROVR_SA_PAYLOAD"),
+        std::env::var("ROVR_SA_LOADER"),
+    ) {
+        return Ok((PathBuf::from(dylib), PathBuf::from(loader)));
+    }
+    let exe = std::env::current_exe().context("locate rovr executable")?;
+    // exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir where
+    // cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
+    let target_root = exe
+        .ancestors()
+        .nth(1)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let find = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
+        let base = target_root.join("build");
+        let mut hits: Vec<PathBuf> = std::fs::read_dir(&base)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(crate_prefix))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.join("out").join(artifact))
+            .filter(|p| p.exists())
+            .collect();
+        hits.sort();
+        hits.pop()
+    };
+    let dylib = find("rovr-sa-payload", "librovr_sa_payload.dylib")
+        .context("payload dylib not built — run `cargo build -p rovr-sa-payload` first")?;
+    let loader = find("rovr-sa-loader", "rovr-sa-loader")
+        .context("loader binary not built — run `cargo build -p rovr-sa-loader` first")?;
+    Ok((dylib, loader))
+}
+
+/// UID of the console user (the uid Dock runs as). Under `sudo`, $UID is 0,
+/// but the payload socket is created with the console user's uid.
+#[cfg(target_os = "macos")]
+fn console_uid() -> Option<u32> {
+    let out = std::process::Command::new("stat")
+        .args(["-f", "%u", "/dev/console"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<u32>().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn check_sip_for_install() -> Result<()> {
+    let out = std::process::Command::new("csrutil")
+        .arg("status")
+        .output()
+        .context("run csrutil status")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    let debug_ok = text.contains("debugging restrictions: disabled")
+        || text.contains("system integrity protection status: disabled");
+    let fs_ok = text.contains("filesystem protections: disabled")
+        || text.contains("system integrity protection status: disabled");
+    if !(debug_ok && fs_ok) {
+        anyhow::bail!(
+            "SIP is too strict for injection. Required (in recovery mode):\n               csrutil enable --without debug --without fs\n             On Apple Silicon additionally: sudo nvram bootarg=\"-arm64e_preview_abi\" boot-args=\"-arm64e_preview_abi\"\n             See docs/SA_SIP.md for why each relaxation is needed."
+        );
+    }
+    Ok(())
+}
+
 fn run_sa_install() -> Result<()> {
-    // Phase-1 slice: document and verify. Full payload injection ships next.
-    // We intentionally do NOT weaken SIP beyond what the payload needs: see
-    // docs/SA_SIP.md for the scoped requirement (see SA.md for payload scope).
-    println!("rovr sa install: Rovr-owned payload injection is not yet bundled in this build.");
-    println!("This command will, when the payload ships:");
-    println!("  1) install the Rovr SA payload to a privileged location,");
-    println!("  2) inject it into Dock (requires SIP with `csrutil enable --without debug` / `filesystem` relaxation depending on macOS),");
-    println!("  3) create the Rovr socket at /tmp/rovr-sa_<uid>.sock (never /tmp/yabai-sa_*).");
-    println!("See docs/SA_SIP.md (to be added) and `rovr sa status` for diagnostics.");
-    println!("For now, verify: yabai must NOT be required; SA socket must be Rovr-owned.");
-    anyhow::bail!("sa install: payload not yet bundled — see `rovr sa status` and TODO.md Phase 1");
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("sa install is only available on macOS");
+        anyhow::bail!("sa install: unsupported platform");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let (dylib, loader) = find_sa_artifacts()?;
+        println!("payload: {}", dylib.display());
+        println!("loader:  {}", loader.display());
+
+        if unsafe { libc_getuid() } != 0 {
+            eprintln!("sa install must run as root — it writes to {SA_INSTALL_DIR} and injects into Dock:");
+            eprintln!("  sudo rovr sa install");
+            anyhow::bail!("sa install: root required");
+        }
+        check_sip_for_install()?;
+
+        std::fs::create_dir_all(SA_INSTALL_DIR)
+            .with_context(|| format!("create {SA_INSTALL_DIR}"))?;
+        std::fs::copy(&dylib, SA_INSTALLED_DYLIB)
+            .with_context(|| format!("copy payload to {SA_INSTALLED_DYLIB}"))?;
+        std::fs::copy(&loader, SA_INSTALLED_LOADER)
+            .with_context(|| format!("copy loader to {SA_INSTALLED_LOADER}"))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(SA_INSTALLED_LOADER, std::fs::Permissions::from_mode(0o744))?;
+        std::fs::set_permissions(SA_INSTALLED_DYLIB, std::fs::Permissions::from_mode(0o644))?;
+        println!("installed payload + loader to {SA_INSTALL_DIR}");
+
+        // Inject into Dock. The loader dlopens the payload inside Dock; the
+        // payload's constructor then listens on /tmp/rovr-sa_<console-uid>.sock.
+        let out = std::process::Command::new(SA_INSTALLED_LOADER)
+            .arg(SA_INSTALLED_DYLIB)
+            .output()
+            .context("run rovr-sa-loader")?;
+        print!("{}", String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            anyhow::bail!(
+                "sa install: injection failed (exit {:?})",
+                out.status.code()
+            );
+        }
+
+        // Verify by probing the socket as the CONSOLE user would see it.
+        let uid = console_uid().context("determine console uid")?;
+        let client = rovr_platform::macos::sa::SaClient::with_socket_path(
+            rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
+        );
+        for _ in 0..20 {
+            if let Some(info) = client.probe() {
+                println!(
+                    "handshake ok: version={} attribs=0x{:08x}",
+                    info.version, info.attribs
+                );
+                println!("sa install complete.");
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        anyhow::bail!(
+            "sa install: injection ran but the payload socket did not answer — check `rovr sa status` and Console.app for [rovr-sa] logs"
+        )
+    }
 }
 
 fn run_sa_uninstall() -> Result<()> {
-    println!("rovr sa uninstall: payload not yet bundled; nothing to remove in this build.");
-    println!("When bundled, this will remove the Rovr payload and restore Dock.");
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("sa uninstall is only available on macOS");
+        anyhow::bail!("sa uninstall: unsupported platform");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { libc_getuid() } != 0 {
+            eprintln!("sa uninstall must run as root:");
+            eprintln!("  sudo rovr sa uninstall");
+            anyhow::bail!("sa uninstall: root required");
+        }
+        let mut removed = false;
+        for path in [SA_INSTALLED_DYLIB, SA_INSTALLED_LOADER] {
+            if std::path::Path::new(path).exists() {
+                std::fs::remove_file(path).with_context(|| format!("remove {path}"))?;
+                println!("removed {path}");
+                removed = true;
+            }
+        }
+        if !removed {
+            println!("nothing installed — nothing to remove.");
+            return Ok(());
+        }
+        // Restart Dock so the injected payload unloads and its socket closes.
+        let _ = std::process::Command::new("killall").arg("Dock").status();
+        println!(
+            "Dock restarted; payload unloaded. `rovr sa status` should now report not_installed."
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn libc_getuid() -> u32 {
+    getuid()
 }
 
 fn run_gen_skhd(path: Option<&str>) -> Result<()> {

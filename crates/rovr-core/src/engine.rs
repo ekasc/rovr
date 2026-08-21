@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rovr_config::Config;
 use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
 use std::path::Path;
@@ -39,6 +41,13 @@ pub enum EngineError {
 #[derive(Default)]
 pub struct Engine {
     pub config: Config,
+    /// Rules with regex matchers compiled once per config load/reload
+    /// (blocker 10). Order preserved from config for deterministic evaluation.
+    pub rules: Vec<rovr_config::CompiledRule>,
+    /// Platform capability bits, set by the daemon at startup. The engine
+    /// gates lifecycle actions (e.g. persistent-space creation) on them so a
+    /// missing payload does not produce failing actions every cycle.
+    pub capabilities: rovr_types::Capabilities,
     pub observed: ObservedState,
     pub desired: DesiredState,
     pub flight_recorder: FlightRecorder,
@@ -71,11 +80,13 @@ fn load_plugins_from_disk(registry: &mut PluginRegistry) {
 impl Engine {
     pub fn new(config: Config) -> Self {
         let workspaces = WorkspaceRegistry::from_config(&config.workspaces);
+        let rules = config.compile_rules().unwrap_or_default();
         let mut plugins = PluginRegistry::new();
         load_plugins_from_disk(&mut plugins);
         Self {
             plugins,
             config,
+            rules,
             workspaces,
             ..Default::default()
         }
@@ -171,12 +182,26 @@ impl Engine {
         })
     }
     pub fn save_state(&self, path: &Path) -> Result<()> {
+        // Blocker 5: logical workspaces OWN their layout state (BSP tree);
+        // raw SpaceId keys only describe the current runtime backing Space.
+        // Workspace-owned trees are persisted under the stable workspace name
+        // so they survive SpaceId churn; leftover SpaceId-keyed entries belong
+        // to unmanaged/non-logical Spaces.
+        let mut layouts = self.layouts.clone();
+        let mut workspace_layouts = HashMap::new();
+        for (name, ws) in &self.workspaces.0 {
+            if let Some(sid) = ws.backing_space {
+                if let Some(state) = layouts.remove(&sid) {
+                    workspace_layouts.insert(name.clone(), state);
+                }
+            }
+        }
         let persisted = PersistedState {
-            layouts: self
-                .layouts
+            layouts: layouts
                 .iter()
                 .map(|(id, state)| (id.0.to_string(), state.clone()))
                 .collect(),
+            workspace_layouts,
             scratchpads: self.scratchpads.0.clone(),
             workspaces: self.workspaces.0.clone(),
         };
@@ -184,7 +209,26 @@ impl Engine {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create state dir")?;
         }
-        std::fs::write(path, json).context("write state file")?;
+        // Durable replacement: a crash or power loss mid-save must never
+        // truncate the live state file. Write to a sibling temp file, fsync
+        // it, rename over the target (atomic on the same fs), then fsync the
+        // parent directory so the rename's directory-entry update itself
+        // survives power loss (macOS honors fsync on directory fds).
+        let tmp = path.with_extension("json.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp).context("create state temp file")?;
+            f.write_all(json.as_bytes())
+                .context("write state temp file")?;
+            f.sync_all().context("sync state temp file")?;
+        }
+        std::fs::rename(&tmp, path).context("replace state file")?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .context("open state dir")?
+                .sync_all()
+                .context("sync state dir")?;
+        }
         Ok(())
     }
 
@@ -198,9 +242,72 @@ impl Engine {
             .collect();
         self.scratchpads = ScratchpadState(persisted.scratchpads);
         self.workspaces = crate::workspace::WorkspaceRegistry(persisted.workspaces);
+        // Blocker 5: restore workspace-owned layout state onto each
+        // workspace's current backing Space.
+        for (name, state) in persisted.workspace_layouts {
+            if let Some(sid) = self.workspaces.backing_for(&name) {
+                self.layouts.insert(sid, state);
+            }
+        }
         // After load, ensure workspaces still reflect current config (preserve backing where name matches)
         self.workspaces.ensure_from_config(&self.config.workspaces);
         Ok(())
+    }
+
+    /// Carry SpaceId-keyed layout state to each workspace's new backing Space
+    /// after a remap, so BSP topology/ratios/order stay attached to the LOGICAL
+    /// workspace when macOS reassigns SpaceIds (blocker 5).
+    fn apply_remap_moves(&mut self, moves: &[crate::workspace::RemapMove]) {
+        for mv in moves {
+            if let Some(from) = mv.from {
+                if from == mv.to {
+                    continue;
+                }
+                if let Some(state) = self.layouts.remove(&from) {
+                    self.layouts.insert(mv.to, state);
+                    self.flight_recorder.record(
+                        "workspace.remap_layout",
+                        format!("{}: {:?} -> {:?}", mv.name, from, mv.to),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Anchor for recreating the lowest-ordinal missing PERSISTENT workspace
+    /// (blocker 4): one CreateSpace per snapshot cycle, deterministically.
+    /// Returns None when nothing is missing or creation is unsupported.
+    fn persistent_creation_anchor(&self) -> Option<SpaceId> {
+        if !self.capabilities.create_space {
+            return None;
+        }
+        let first_missing = self.workspaces.ensure_persistent().into_iter().next()?;
+        // Prefer an anchor on the workspace's desired display, else focused.
+        let desired_display = self
+            .workspaces
+            .0
+            .get(&first_missing)
+            .and_then(|w| w.desired_display.clone());
+        let anchor = self
+            .observed
+            .spaces
+            .values()
+            .find(|s| match &desired_display {
+                Some(name) => self
+                    .observed
+                    .displays
+                    .get(&s.display_id)
+                    .map(|d| {
+                        name == "main" && d.focused
+                            || name.parse::<u32>().map(|n| n == d.id.0).unwrap_or(false)
+                    })
+                    .unwrap_or(false),
+                None => false,
+            })
+            .or_else(|| self.observed.spaces.values().find(|s| s.focused))
+            .or_else(|| self.observed.spaces.values().next())
+            .map(|s| s.id)?;
+        Some(anchor)
     }
 }
 
@@ -260,10 +367,13 @@ impl Engine {
         Ok(())
     }
     pub fn reload_config(&mut self, config: Config) {
+        self.rules = config.compile_rules().unwrap_or_default();
         self.config = config;
         self.workspaces.ensure_from_config(&self.config.workspaces);
-        self.workspaces
+        let moves = self
+            .workspaces
             .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
+        self.apply_remap_moves(&moves);
         // Reload WASM plugins from disk (isolated, fuel-limited, version-checked)
         self.plugins = PluginRegistry::new();
         load_plugins_from_disk(&mut self.plugins);
@@ -272,11 +382,27 @@ impl Engine {
     pub fn apply_event(&mut self, event: Event) -> Vec<Action> {
         self.flight_recorder.record("event", format!("{event:?}"));
 
+        let mut lifecycle_action: Option<Action> = None;
         match event {
             Event::Snapshot(snapshot) => {
                 self.apply_snapshot(snapshot);
-                self.workspaces
+                let moves = self
+                    .workspaces
                     .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
+                // Blocker 5: carry BSP/layout state to each workspace's new
+                // backing Space so topology survives SpaceId churn.
+                self.apply_remap_moves(&moves);
+                // Blocker 4: recreate missing persistent workspaces. One
+                // CreateSpace per cycle, lowest ordinal first; the new Space's
+                // real id is only learned by OBSERVING the next snapshot, and
+                // deterministic remap then binds it to the logical workspace.
+                if let Some(anchor) = self.persistent_creation_anchor() {
+                    self.flight_recorder.record(
+                        "workspace.create_persistent",
+                        "missing persistent workspace — requesting CreateSpace",
+                    );
+                    lifecycle_action = Some(Action::CreateSpace { anchor });
+                }
             }
             Event::WindowDestroyed { window } => {
                 self.observed.windows.remove(&window);
@@ -308,9 +434,13 @@ impl Engine {
             &self.workspaces,
             &self.plugins,
             &self.scratchpads,
+            &self.rules,
         );
 
-        let actions = reconcile(&self.observed, &self.desired);
+        let mut actions = reconcile(&self.observed, &self.desired);
+        if let Some(lifecycle) = lifecycle_action {
+            actions.push(lifecycle);
+        }
         for action in &actions {
             self.flight_recorder
                 .record("reconcile.action", format!("{action:?}"));
@@ -565,7 +695,7 @@ impl Engine {
             .values()
             .filter(|candidate| {
                 candidate.id != from
-                    && !candidate.minimized
+                    && candidate.minimized == rovr_types::ObservedBool::No
                     && candidate.generation == self.observed.generation
             })
             .filter_map(|candidate| {
@@ -624,9 +754,9 @@ mod tests {
             space_id: None,
             display_id: Some(DisplayId(1)),
             focused: id == 1,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         }
     }
@@ -681,9 +811,9 @@ mod tests {
             space_id: Some(space),
             display_id: Some(display),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
 
@@ -802,9 +932,9 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
         observed.windows.insert(WindowId(1), mk(1));
@@ -822,6 +952,7 @@ mod tests {
             &engine.workspaces,
             &engine.plugins,
             &ScratchpadState::new(),
+            &[],
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         let f2 = desired.windows[&WindowId(2)].frame.unwrap();
@@ -845,6 +976,7 @@ mod tests {
             &engine.workspaces,
             &engine.plugins,
             &ScratchpadState::new(),
+            &[],
         );
         let g1 = desired2.windows[&WindowId(1)].frame.unwrap();
         let g2 = desired2.windows[&WindowId(2)].frame.unwrap();
@@ -949,5 +1081,288 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Blockers 4 + 5: persistent workspace lifecycle and BSP ownership ----
+
+    fn space_snap(id: u64, display: u32, pos: u32, focused: bool) -> SpaceSnapshot {
+        SpaceSnapshot {
+            id: SpaceId(id),
+            display_id: DisplayId(display),
+            label: None,
+            focused,
+            generation: 0,
+            position: pos,
+        }
+    }
+
+    fn display_snap(id: u32) -> DisplaySnapshot {
+        DisplaySnapshot {
+            id: DisplayId(id),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: id == 1,
+            generation: 0,
+        }
+    }
+
+    /// Blocker 5 acceptance: a non-trivial BSP tree built for logical
+    /// workspace "code" (backed by SpaceId 11) must survive SpaceId churn —
+    /// after 11 disappears and 101 takes over, the exact topology, ratios and
+    /// window ordering remain attached to "code".
+    #[test]
+    fn blocker5_bsp_tree_survives_space_id_remap() {
+        let mut engine = Engine::new(Config::default());
+        engine.capabilities.create_space = false; // no lifecycle noise in this test
+
+        // Observed: space 11 with windows 1..4.
+        let snap = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        engine.apply_event(Event::Snapshot(snap));
+        // Bind "code" to space 11 (no workspaces configured by default).
+        let mut ws = crate::workspace::WorkspaceState::new("code".into(), None, true);
+        ws.ordinal = 0;
+        ws.backing_space = Some(SpaceId(11));
+        engine.workspaces.0.insert("code".into(), ws);
+
+        // Build a non-trivial tree: 4 leaves, custom root ratio, rotated.
+        for id in [1u32, 2, 3, 4] {
+            engine
+                .layouts
+                .entry(SpaceId(11))
+                .or_default()
+                .bsp
+                .insert(WindowId(id));
+        }
+        engine.set_split_ratio(SpaceId(11), 0.62).unwrap();
+        engine.rotate_layout(SpaceId(11));
+
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        let before = engine.layouts[&SpaceId(11)].bsp.placements(area, 8.0);
+        assert_eq!(before.len(), 4, "non-trivial tree has 4 placements");
+
+        // Dock restart: 11 disappears, 101 appears at the same position.
+        let snap2 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(101, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        engine.apply_event(Event::Snapshot(snap2));
+
+        // The tree moved WITH the logical workspace to the new backing.
+        assert_eq!(
+            engine.workspaces.backing_for("code"),
+            Some(SpaceId(101)),
+            "code must be remapped onto the new backing space"
+        );
+        let after = engine.layouts[&SpaceId(101)].bsp.placements(area, 8.0);
+        assert_eq!(
+            before, after,
+            "exact BSP topology, ratios and window order must survive the remap"
+        );
+        assert!(!engine.layouts.contains_key(&SpaceId(11)));
+    }
+
+    /// Blocker 5: persistence round-trip — the BSP tree is stored under the
+    /// workspace NAME, so it reloads onto whatever Space now backs "code",
+    /// even when the SpaceId changed across daemon restarts.
+    #[test]
+    fn blocker5_persistence_keys_tree_by_workspace_not_space_id() {
+        let config = Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "code".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: None,
+                persistent: true,
+                plugin: None,
+            }],
+            ..Default::default()
+        };
+        let mut engine = Engine::new(config.clone());
+        engine.capabilities.create_space = false;
+        let snap = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        engine.apply_event(Event::Snapshot(snap));
+        engine.workspaces.0.get_mut("code").unwrap().backing_space = Some(SpaceId(11));
+        for id in [1u32, 2, 3] {
+            engine
+                .layouts
+                .entry(SpaceId(11))
+                .or_default()
+                .bsp
+                .insert(WindowId(id));
+        }
+
+        let path = std::env::temp_dir().join(format!("rovr-blocker5-{}.json", std::process::id()));
+        engine.save_state(&path).unwrap();
+
+        // Restart: fresh engine (same config) loads state. The persisted
+        // backing SpaceId 11 is now STALE (macOS rebuilt Spaces as 101); the
+        // next observation must detect that and carry the tree across.
+        let mut restored = Engine::new(engine.config.clone());
+        restored.load_state(&path).unwrap();
+        assert_eq!(
+            restored.workspaces.backing_for("code"),
+            Some(SpaceId(11)),
+            "persisted backing survives the restart"
+        );
+        assert!(
+            restored.layouts.contains_key(&SpaceId(11)),
+            "tree restores onto persisted backing first"
+        );
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        let expected = restored.layouts[&SpaceId(11)].bsp.placements(area, 8.0);
+
+        let snap2 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(101, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        restored.apply_event(Event::Snapshot(snap2));
+        let got = restored.layouts[&SpaceId(101)].bsp.placements(area, 8.0);
+        assert_eq!(expected, got, "tree survives restart AND remap intact");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Blocker 4: when a persistent workspace has no backing AND no unclaimed
+    /// space exists to claim, the engine emits exactly ONE CreateSpace per
+    /// snapshot cycle. Once macOS materializes the new Space (id learned only
+    /// by observing), deterministic remap binds it and creation stops.
+    #[test]
+    fn blocker4_missing_persistent_workspace_is_recreated() {
+        let config = Config {
+            workspaces: vec![
+                rovr_config::WorkspaceConfig {
+                    name: "code".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+                rovr_config::WorkspaceConfig {
+                    name: "chat".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut engine = Engine::new(config);
+        engine.capabilities.create_space = true;
+
+        // Cycle 1: only space 11 exists. Ordinal 0 ("code") claims it; "chat"
+        // has no backing and there is no unclaimed space left -> CreateSpace.
+        let snap1 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        let actions = engine.apply_event(Event::Snapshot(snap1));
+        assert_eq!(
+            actions,
+            vec![Action::CreateSpace { anchor: SpaceId(11) }],
+            "missing persistent workspace with nothing claimable must request exactly one CreateSpace"
+        );
+        assert_eq!(engine.workspaces.backing_for("code"), Some(SpaceId(11)));
+        assert_eq!(engine.workspaces.backing_for("chat"), None);
+
+        // Cycle 2: macOS created Space 20 (id only known by OBSERVING).
+        let snap2 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, false), space_snap(20, 1, 1, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        let actions2 = engine.apply_event(Event::Snapshot(snap2));
+        assert!(
+            !actions2
+                .iter()
+                .any(|a| matches!(a, Action::CreateSpace { .. })),
+            "creation must stop once every persistent workspace is backed"
+        );
+        assert_eq!(
+            engine.workspaces.backing_for("chat"),
+            Some(SpaceId(20)),
+            "the newly created space must be bound to the logical workspace"
+        );
+    }
+
+    /// Blocker 4: WHICH workspace claims the existing space and which waits
+    /// for creation is decided by stable config ordinal order — deterministic.
+    #[test]
+    fn blocker4_claim_order_follows_ordinal() {
+        let config = Config {
+            workspaces: vec![
+                rovr_config::WorkspaceConfig {
+                    name: "chat".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+                rovr_config::WorkspaceConfig {
+                    name: "code".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut engine = Engine::new(config);
+        engine.capabilities.create_space = true;
+
+        let snap1 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        let _ = engine.apply_event(Event::Snapshot(snap1));
+        // "chat" has ordinal 0 -> it claims the single existing space.
+        assert_eq!(engine.workspaces.backing_for("chat"), Some(SpaceId(11)));
+        assert_eq!(engine.workspaces.backing_for("code"), None);
+
+        let snap2 = PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, false), space_snap(20, 1, 1, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        let _ = engine.apply_event(Event::Snapshot(snap2));
+        assert_eq!(
+            engine.workspaces.backing_for("code"),
+            Some(SpaceId(20)),
+            "the created space goes to the lowest-ordinal still-missing workspace"
+        );
     }
 }

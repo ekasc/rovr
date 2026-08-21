@@ -1,4 +1,6 @@
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
+pub mod command_parser;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -21,7 +23,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "domain", content = "command", rename_all = "snake_case")]
 pub enum Command {
     Ping,
@@ -37,7 +39,7 @@ pub enum Command {
     Subscribe,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryCommand {
     Windows,
@@ -48,7 +50,7 @@ pub enum QueryCommand {
     Current,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WindowCommand {
     Focus {
@@ -100,7 +102,7 @@ pub enum WindowCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpaceCommand {
     Focus { space: SpaceId },
@@ -108,7 +110,7 @@ pub enum SpaceCommand {
     Destroy { space: SpaceId },
     Move { space: SpaceId, after: SpaceId },
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayoutCommand {
     Rotate { space: SpaceId },
@@ -116,27 +118,27 @@ pub enum LayoutCommand {
     Balance { space: SpaceId },
     SetRatio { space: SpaceId, ratio: f64 },
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScratchpadCommand {
     Toggle { name: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceCommand {
     Focus { name: String },
     MoveWindow { window: WindowId, workspace: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConfigCommand {
     Reload { path: Option<String> },
     Check { path: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DebugCommand {
     Events,

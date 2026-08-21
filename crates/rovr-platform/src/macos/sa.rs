@@ -54,6 +54,21 @@ pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
 pub const OSAX_ATTRIB_MOV_SPACE: u32 = 0x10;
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn libc_getuid() -> u32 {
+    getuid()
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn libc_getuid() -> u32 {
+    0
+}
+
 #[derive(Debug, Error)]
 pub enum SaError {
     #[error("scripting addition socket is not available: {0}")]
@@ -92,15 +107,11 @@ impl SaClient {
     }
 
     pub fn default_socket_path() -> PathBuf {
-        // Prefer UID (stable, matches daemon's launchd env) over $USER.
-        let uid = std::env::var("UID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                // Fallback: derive from $USER when UID unset (e.g. tests / non-login shells).
-                std::env::var("USER").unwrap_or_else(|_| "unknown".into())
-            });
-        Self::socket_path_for_uid(&uid)
+        // The payload keys its socket on getuid(); the client must use the
+        // SAME value. ($USER is not consulted: macOS does not set a UID env
+        // var, so a username fallback would never match the payload.)
+        let uid = unsafe { libc_getuid() };
+        Self::socket_path_for_uid(&uid.to_string())
     }
 
     pub fn new() -> Self {
@@ -122,7 +133,8 @@ impl SaClient {
     /// fall back to non-SA paths.
     pub fn probe(&self) -> Option<SaInfo> {
         let mut stream = self.connect().ok()?;
-        stream.write_all(&[0x01, 0x00, SA_OPCODE_HANDSHAKE]).ok()?;
+        // Frame: len = 3 + payload_len (payload empty for handshake).
+        stream.write_all(&[0x03, 0x00, SA_OPCODE_HANDSHAKE]).ok()?;
 
         let mut buffer = [0u8; SA_SOCKET_BUFF_LEN];
         let mut length = 0usize;
@@ -175,7 +187,10 @@ impl SaClient {
     }
 
     fn send_op(&self, opcode: u8, payload: &[u8]) -> Result<(), SaError> {
-        let length = (1 + payload.len()) as i16;
+        // Framing matches the payload's reader (and upstream's): `len` counts
+        // 2 bytes of length field + 1 opcode byte + payload; the reader
+        // consumes `len - 2` bytes after the prefix.
+        let length = (3 + payload.len()) as i16;
         let mut bytes = Vec::with_capacity(2 + 1 + payload.len());
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.push(opcode);

@@ -121,6 +121,24 @@ pub struct KeybindConfig {
     pub command: String,
 }
 
+/// A rule with its regex matchers compiled once at config load/reload time.
+/// Field order mirrors [`RuleConfig`]; the Vec returned by
+/// [`Config::compile_rules`] preserves config order so evaluation is
+/// deterministic. Runtime matching MUST use these compiled regexes — not
+/// equality/substring checks — so validation and behavior cannot diverge.
+#[derive(Debug, Clone)]
+pub struct CompiledRule {
+    pub app: Option<Regex>,
+    pub title: Option<Regex>,
+    /// Match condition: window's logical workspace name (exact).
+    pub workspace: Option<String>,
+    #[allow(dead_code)]
+    pub floating: Option<bool>,
+    pub target_workspace: Option<String>,
+    pub opacity: Option<f64>,
+    pub layer: Option<i32>,
+}
+
 fn default_layout() -> LayoutKind {
     LayoutKind::Bsp
 }
@@ -153,6 +171,8 @@ pub enum ConfigError {
     EmptyBindCommand,
     #[error("duplicate keybind key: {0}")]
     DuplicateBind(String),
+    #[error("invalid bind command for key {key:?}: {reason}")]
+    InvalidBindCommand { key: String, reason: String },
     #[error("opacity must be between 0.0 and 1.0")]
     InvalidOpacity,
 }
@@ -225,12 +245,63 @@ impl Config {
             if bind.command.trim().is_empty() {
                 return Err(ConfigError::EmptyBindCommand);
             }
+            // Blocker 8: an invalid bind command fails config load/reload —
+            // it can never silently become a different command at runtime.
+            // Blocker 7: validation uses the ONE shared parser (same grammar
+            // as the CLI and hotkey dispatch), so syntax cannot drift.
+            if let Err(parse_err) = rovr_protocol::command_parser::parse_command(&bind.command) {
+                return Err(ConfigError::InvalidBindCommand {
+                    key: bind.key.clone(),
+                    reason: parse_err.message,
+                });
+            }
             if !bind_keys.insert(bind.key.as_str()) {
                 return Err(ConfigError::DuplicateBind(bind.key.clone()));
             }
         }
 
         Ok(())
+    }
+
+    /// Compile all rule matchers into a deterministic, ready-to-evaluate
+    /// representation. Call once per config load/reload — never per reconcile
+    /// cycle. Regexes were already validated by [`Self::validate`], but a
+    /// direct call on an unvalidated config surfaces the compile error.
+    pub fn compile_rules(&self) -> Result<Vec<CompiledRule>, ConfigError> {
+        self.rules
+            .iter()
+            .map(|rule| {
+                let app =
+                    match &rule.app {
+                        Some(pattern) => Some(Regex::new(pattern).map_err(|source| {
+                            ConfigError::InvalidRegex {
+                                field: "app",
+                                source,
+                            }
+                        })?),
+                        None => None,
+                    };
+                let title =
+                    match &rule.title {
+                        Some(pattern) => Some(Regex::new(pattern).map_err(|source| {
+                            ConfigError::InvalidRegex {
+                                field: "title",
+                                source,
+                            }
+                        })?),
+                        None => None,
+                    };
+                Ok(CompiledRule {
+                    app,
+                    title,
+                    workspace: rule.workspace.clone(),
+                    floating: rule.floating,
+                    target_workspace: rule.target_workspace.clone(),
+                    opacity: rule.opacity,
+                    layer: rule.layer,
+                })
+            })
+            .collect()
     }
 }
 
@@ -244,10 +315,10 @@ mod tests {
             r#"
             [[bind]]
             key = "alt - h"
-            command = "window --focus-direction --from 1 --direction west"
+            command = "window focus-direction 1 west"
             [[bind]]
             key = "alt - l"
-            command = "window --focus-direction --from 1 --direction east"
+            command = "window focus-direction 1 east"
             "#,
         )
         .expect("valid binds");
@@ -273,14 +344,39 @@ mod tests {
             r#"
             [[bind]]
             key = "alt - h"
-            command = "query --windows"
+            command = "query windows"
             [[bind]]
             key = "alt - h"
-            command = "query --spaces"
+            command = "query spaces"
             "#,
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "alt - h"));
+    }
+
+    #[test]
+    fn blocker8_invalid_bind_command_fails_config_load() {
+        // Flag-style syntax diverging from the real CLI must be rejected at
+        // load time — never silently accepted and never substituted.
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "window --focus 1"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBindCommand { ref key, .. } if key == "alt - h"));
+
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - x"
+            command = "definitely not a command"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBindCommand { .. }));
     }
 
     #[test]
@@ -310,5 +406,48 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ConfigError::UnknownWorkspace(name) if name == "chat"));
+    }
+
+    // ---- Blocker 10: regex validation and compiled-rule behavior ----
+
+    #[test]
+    fn blocker10_invalid_regex_rejected_at_load() {
+        let err = Config::parse(
+            r#"
+            [[rule]]
+            app = "^Finder$"
+            title = "([unclosed"
+            float = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRegex { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn blocker10_compile_rules_preserves_order_and_compiles_matchers() {
+        let cfg = Config::parse(
+            r#"
+            [[rule]]
+            app = "^Finder$"
+            float = true
+            [[rule]]
+            title = "Preferences|Settings"
+            target_workspace = "main"
+            [[workspace]]
+            name = "main"
+            "#,
+        )
+        .unwrap();
+        let rules = cfg.compile_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        // Deterministic order: first config rule first.
+        assert!(rules[0].app.as_ref().unwrap().is_match("Finder"));
+        assert!(!rules[0].app.as_ref().unwrap().is_match("Finder Helper"));
+        assert!(rules[1].title.as_ref().unwrap().is_match("Settings"));
+        assert_eq!(rules[1].target_workspace.as_deref(), Some("main"));
     }
 }

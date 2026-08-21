@@ -1,0 +1,12 @@
+[package]
+name = "rovr-sa-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rovr scripting-addition loader (root helper injecting the payload into Dock)"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]

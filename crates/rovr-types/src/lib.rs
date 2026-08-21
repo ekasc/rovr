@@ -77,6 +77,42 @@ pub enum LayoutKind {
     Float,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedBool {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl ObservedBool {
+    pub fn is_yes(self) -> bool {
+        matches!(self, Self::Yes)
+    }
+    pub fn is_no(self) -> bool {
+        matches!(self, Self::No)
+    }
+    pub fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+    pub fn as_option(self) -> Option<bool> {
+        match self {
+            Self::Yes => Some(true),
+            Self::No => Some(false),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl From<Option<bool>> for ObservedBool {
+    fn from(v: Option<bool>) -> Self {
+        match v {
+            Some(true) => Self::Yes,
+            Some(false) => Self::No,
+            None => Self::Unknown,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowSnapshot {
     pub id: WindowId,
@@ -88,9 +124,9 @@ pub struct WindowSnapshot {
     pub space_id: Option<SpaceId>,
     pub display_id: Option<DisplayId>,
     pub focused: bool,
-    pub minimized: bool,
-    pub fullscreen: bool,
-    pub managed: bool,
+    pub minimized: ObservedBool,
+    pub fullscreen: ObservedBool,
+    pub managed: ObservedBool,
     pub generation: u64,
 }
 
