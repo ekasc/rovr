@@ -51,9 +51,9 @@
 
 - [x] stable subscription API
 - [x] shell completions
-- [ ] skhd compatibility / optional built-in keybinds
-- [ ] Swift menu-bar diagnostics UI
-- [ ] layout plugin protocol, likely WASM
+- [x] skhd compatibility / optional built-in keybinds
+- [x] Swift menu-bar diagnostics UI
+- [x] layout plugin protocol, likely WASM
 
 ## Explicitly deferred
 
