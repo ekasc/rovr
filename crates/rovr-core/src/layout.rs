@@ -4,50 +4,98 @@ use rovr_config::{Config, RuleConfig, ScratchpadConfig};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
-use crate::layout_state::{Axis, Layouts, Orientation, ScratchpadState};
+use crate::layout_state::{Layouts, ScratchpadState};
+use crate::workspace::WorkspaceRegistry;
 use crate::{DesiredState, ObservedState};
+use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 
-/// A window is tileable when the WM manages it and it is not fullscreen.
-/// `managed` is false for floating windows (yabai semantics). The snapshot
-/// bridge currently hardcodes `managed: true` and `fullscreen: false`, so this
-/// only differentiates once the bridge reports them truthfully.
+/// A window is tileable when the WM manages it and it is not fullscreen
+/// and not minimized. `managed` is false for floating/system windows.
+/// `minimized`/`fullscreen` are observed via AX; unknown is treated as not
+/// tileable by the reconciliation layer (see is_tileable guards).
 fn is_tileable(w: &WindowSnapshot) -> bool {
-    w.managed && !w.fullscreen
+    w.managed && !w.fullscreen && !w.minimized
 }
-/// A window floats when some `floating == Some(true)` rule matches it on every
-/// field it specifies (app / title / workspace). Used to exclude windows from
-/// tiling without relying on the bridge's hardcoded `managed` flag.
-fn matches_float_rule(w: &WindowSnapshot, rules: &[RuleConfig], observed: &ObservedState) -> bool {
+fn window_matches_rule(
+    w: &WindowSnapshot,
+    rule: &RuleConfig,
+    observed: &ObservedState,
+    workspaces: &WorkspaceRegistry,
+) -> bool {
+    let app_ok = match &rule.app {
+        Some(app) => w.bundle_id.as_deref() == Some(app.as_str()) || w.app == *app,
+        None => true,
+    };
+    let title_ok = match &rule.title {
+        Some(title) => w.title.contains(title.as_str()),
+        None => true,
+    };
+    let workspace_ok = match &rule.workspace {
+        Some(ws) => {
+            // Match against logical workspace name backing the window's space
+            let ws_name = w
+                .space_id
+                .and_then(|sid| workspaces.name_for_space(sid))
+                .or_else(|| {
+                    w.space_id
+                        .and_then(|sid| observed.spaces.get(&sid))
+                        .and_then(|s| s.label.as_deref())
+                });
+            ws_name == Some(ws.as_str())
+        }
+        None => true,
+    };
+    app_ok && title_ok && workspace_ok
+}
+
+/// A window floats when some `floating == Some(true)` rule matches it.
+fn matches_float_rule(
+    w: &WindowSnapshot,
+    rules: &[RuleConfig],
+    observed: &ObservedState,
+    workspaces: &WorkspaceRegistry,
+) -> bool {
     for rule in rules {
         let Some(true) = rule.floating else { continue };
-        let app_ok = match &rule.app {
-            Some(app) => w.bundle_id.as_deref() == Some(app.as_str()),
-            None => true,
-        };
-        let title_ok = match &rule.title {
-            Some(title) => w.title.contains(title),
-            None => true,
-        };
-        let workspace_ok = match &rule.workspace {
-            Some(ws) => {
-                w.space_id
-                    .and_then(|sid| observed.spaces.get(&sid))
-                    .and_then(|s| s.label.as_deref())
-                    == Some(ws.as_str())
-            }
-            None => true,
-        };
-        if app_ok && title_ok && workspace_ok {
+        if window_matches_rule(w, rule, observed, workspaces) {
             return true;
         }
     }
     false
 }
-/// Resolve the layout kind for a space. A named workspace (`WorkspaceConfig`)
-/// whose `name` matches the space's `label` overrides the global default
-/// layout. Falls back to `config.general.layout` when there is no label or no
-/// matching workspace — never panics.
-fn resolve_layout(config: &Config, space_id: SpaceId, observed: &ObservedState) -> LayoutKind {
+
+fn target_workspace_for_window(
+    w: &WindowSnapshot,
+    rules: &[RuleConfig],
+    observed: &ObservedState,
+    workspaces: &WorkspaceRegistry,
+) -> Option<SpaceId> {
+    for rule in rules {
+        if let Some(target) = &rule.target_workspace {
+            if window_matches_rule(w, rule, observed, workspaces) {
+                if let Some(sid) = workspaces.backing_for(target) {
+                    return Some(sid);
+                }
+            }
+        }
+    }
+    None
+}
+/// Resolve the layout kind for a space. Logical workspaces own the name:
+/// if `space_id` is backing a logical workspace, that workspace's layout
+/// overrides the global. Falls back to legacy `space.label == workspace.name`
+/// for back-compat, then global.
+fn resolve_layout(
+    config: &Config,
+    space_id: SpaceId,
+    observed: &ObservedState,
+    workspaces: &WorkspaceRegistry,
+) -> LayoutKind {
+    if let Some(name) = workspaces.name_for_space(space_id) {
+        if let Some(ws) = config.workspaces.iter().find(|w| w.name == name) {
+            return ws.layout;
+        }
+    }
     if let Some(label) = observed
         .spaces
         .get(&space_id)
@@ -81,21 +129,32 @@ fn matches_open_scratchpad(
     })
 }
 
-/// Recompute tiling targets for every observed managed window and write them
-/// into `desired.windows[].frame`. Idempotent: rebuilt from `observed` each call.
-///
-/// `area` is the raw display frame; `rovr_layout::compute` insets it by `padding`
-/// internally (lib.rs:34), so we must NOT pre-inset here (that would double-inset).
-///
-/// Layout is computed per Space (each macOS Space tiles independently within its
-/// display's area). For BSP, `layouts` supplies a per-Space orientation: `reversed`
-/// reorders windows and `axis == Horizontal` is applied as an area transpose so
-/// `compute` (kept pure) still yields the right frames.
+fn inset_area(area: Rect, padding: f64) -> Option<Rect> {
+    let w = area.width - padding * 2.0;
+    let h = area.height - padding * 2.0;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x + padding,
+        y: area.y + padding,
+        width: w,
+        height: h,
+    })
+}
+
+/// Recompute tiling targets for every observed tileable window and write them
+/// into `desired.windows[].frame`. For BSP the persistent per-space `BspTree`
+/// is synced with observed tileable windows (insert/remove) so topology
+/// is preserved across reconcile cycles and not derived from enumeration order.
+/// Non-BSP layouts remain stateless but use deterministic sorted order.
 pub fn apply_layout(
     config: &Config,
     observed: &ObservedState,
     desired: &mut DesiredState,
-    layouts: &Layouts,
+    layouts: &mut Layouts,
+    workspaces: &WorkspaceRegistry,
+    plugins: &PluginRegistry,
     scratchpads: &ScratchpadState,
 ) {
     let gap = config.general.gap as f64;
@@ -110,16 +169,37 @@ pub fn apply_layout(
 
     let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
-        if !is_tileable(w)
-            || matches_float_rule(w, &config.rules, observed)
-            || matches_open_scratchpad(w, &config.scratchpads, scratchpads)
-        {
+        // Rule-driven workspace move: evaluated every snapshot, deterministic.
+        // This writes desired.space so reconcile will move the window.
+        if let Some(target) = target_workspace_for_window(w, &config.rules, observed, workspaces) {
+            if observed.spaces.contains_key(&target) {
+                if let Some(t) = desired.windows.get_mut(&w.id) {
+                    if t.space != Some(target) {
+                        t.space = Some(target);
+                    }
+                }
+            }
+        }
+        let is_floating = !is_tileable(w)
+            || matches_float_rule(w, &config.rules, observed, workspaces)
+            || matches_open_scratchpad(w, &config.scratchpads, scratchpads);
+        if is_floating {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
             }
+            // Still honor target workspace move even for floating windows
+            // (desired.space already set above); continue without tiling.
             continue;
         }
-        let Some(space) = w.space_id.and_then(|s| observed.spaces.get(&s)) else {
+        // Determine effective space for tiling: use rule target if present, else current
+        let effective_space_id = desired
+            .windows
+            .get(&w.id)
+            .and_then(|t| t.space)
+            .or(w.space_id)
+            .and_then(|sid| observed.spaces.get(&sid).map(|s| s.id))
+            .or(w.space_id);
+        let Some(space) = effective_space_id.and_then(|sid| observed.spaces.get(&sid)) else {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
             }
@@ -139,60 +219,80 @@ pub fn apply_layout(
     }
 
     for (space_id, (_display_id, area, window_ids)) in by_space {
-        let kind = resolve_layout(config, space_id, observed);
-        // Orientation only affects BSP; other layouts ignore it.
-        let orientation = if kind == LayoutKind::Bsp {
-            layouts
-                .get(&space_id)
-                .map(|l| l.orientation)
-                .unwrap_or_default()
-        } else {
-            Orientation::default()
-        };
-        let mut wids = window_ids;
-        if kind == LayoutKind::Bsp && orientation.reversed {
-            wids.reverse();
-        }
-        // Horizontal axis: transpose the area so the pure vertical split in
-        // compute becomes a top/bottom split, then transpose frames back.
-        let (area2, swap) = if kind == LayoutKind::Bsp && orientation.axis == Axis::Horizontal {
-            (
-                Rect {
-                    x: area.y,
-                    y: area.x,
-                    width: area.height,
-                    height: area.width,
-                },
-                true,
-            )
-        } else {
-            (area, false)
-        };
-        let request = LayoutRequest {
-            area: area2,
-            windows: &wids,
-            gap,
-            padding,
-            split_ratio: 0.5,
-        };
-        if let Ok(placements) = compute(kind, request) {
-            for p in placements {
-                let frame = if swap {
-                    Rect {
-                        x: p.frame.y,
-                        y: p.frame.x,
-                        width: p.frame.height,
-                        height: p.frame.width,
+        // Plugin layout: check per-workspace override then general
+        let plugin_name: Option<String> = workspaces
+            .name_for_space(space_id)
+            .and_then(|n| config.workspaces.iter().find(|w| w.name == n))
+            .and_then(|w| w.plugin.clone())
+            .or_else(|| config.general.plugin.clone());
+        if let Some(name) = plugin_name {
+            if let Some(plugin) = plugins.get(&name) {
+                if let Some(inset) = inset_area(area, padding) {
+                    let req = PluginRequest {
+                        area: inset,
+                        windows: window_ids.clone(),
+                        gap,
+                        padding: 0.0,
+                    };
+                    match plugin.compute(&req) {
+                        Ok(placements) => {
+                            for p in placements {
+                                if let Some(t) = desired.windows.get_mut(&p.window) {
+                                    t.frame = Some(p.frame);
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(plugin=%name, error=%e, "plugin compute failed, falling back to built-in");
+                        }
                     }
-                } else {
-                    p.frame
-                };
-                if let Some(t) = desired.windows.get_mut(&p.window) {
-                    t.frame = Some(frame);
+                }
+            } else {
+                tracing::warn!(plugin=%name, "plugin not found, falling back");
+            }
+        }
+        let kind = resolve_layout(config, space_id, observed, workspaces);
+        if kind == LayoutKind::Bsp {
+            // Persistent BSP: sync tree with observed tileable set for this space.
+            let state = layouts.entry(space_id).or_default();
+            let set: std::collections::HashSet<WindowId> = window_ids.iter().copied().collect();
+            state.bsp.sync_with_windows(&set);
+            // Inset area before BSP placement (compute() did this internally;
+            // tree placements expect already-inset area).
+            if let Some(inset) = inset_area(area, padding) {
+                let placements = state.bsp.placements(inset, gap);
+                for (win, frame) in placements {
+                    if let Some(t) = desired.windows.get_mut(&win) {
+                        t.frame = Some(frame);
+                    }
+                }
+            }
+            // BSP tree is authoritative; orientation is retained only for
+            // diagnostics/back-compat and is not driven from the tree here.
+        } else {
+            let mut wids = window_ids;
+            wids.sort_unstable();
+            let request = LayoutRequest {
+                area,
+                windows: &wids,
+                gap,
+                padding,
+                split_ratio: 0.5,
+            };
+            if let Ok(placements) = compute(kind, request) {
+                for p in placements {
+                    if let Some(t) = desired.windows.get_mut(&p.window) {
+                        t.frame = Some(p.frame);
+                    }
                 }
             }
         }
     }
+    // Clean up BSP trees for spaces with no tileable windows (optional: keep
+    // empty tree). We retain the tree even when empty so ratio/topology
+    // survives temporary hibernation; sync already removed missing windows.
+    // No extra cleanup needed.
 }
 
 #[cfg(test)]
@@ -275,7 +375,9 @@ mod tests {
             &config,
             &observed,
             &mut desired,
-            &Layouts::new(),
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
         );
 
@@ -383,7 +485,9 @@ mod tests {
             &config,
             &observed,
             &mut desired,
-            &Layouts::new(),
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
         );
 
@@ -474,7 +578,9 @@ mod tests {
             &config,
             &observed,
             &mut desired,
-            &Layouts::new(),
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
         );
 
@@ -561,7 +667,9 @@ mod tests {
             &config,
             &observed,
             &mut desired,
-            &Layouts::new(),
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
         );
 
@@ -644,7 +752,9 @@ mod tests {
             &config,
             &observed,
             &mut desired,
-            &Layouts::new(),
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
         );
 
@@ -676,6 +786,7 @@ mod tests {
             layout: LayoutKind::Stack,
             display: None,
             persistent: false,
+            plugin: None,
         }];
 
         let mut observed = ObservedState::default();
@@ -703,12 +814,22 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_layout(&config, SpaceId(11), &observed),
+            resolve_layout(
+                &config,
+                SpaceId(11),
+                &observed,
+                &crate::workspace::WorkspaceRegistry::default()
+            ),
             LayoutKind::Stack,
             "labeled 'dev' space must use the named workspace layout"
         );
         assert_eq!(
-            resolve_layout(&config, SpaceId(12), &observed),
+            resolve_layout(
+                &config,
+                SpaceId(12),
+                &observed,
+                &crate::workspace::WorkspaceRegistry::default()
+            ),
             LayoutKind::Bsp,
             "non-matching label falls back to global"
         );
@@ -725,6 +846,7 @@ mod tests {
             layout: LayoutKind::Bsp,
             display: None,
             persistent: false,
+            plugin: None,
         }];
 
         let mut observed = ObservedState::default();
@@ -741,7 +863,12 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_layout(&config, SpaceId(11), &observed),
+            resolve_layout(
+                &config,
+                SpaceId(11),
+                &observed,
+                &crate::workspace::WorkspaceRegistry::default()
+            ),
             LayoutKind::Stack,
             "unlabeled space uses global layout"
         );
@@ -813,7 +940,15 @@ mod tests {
         );
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &pads,
+        );
 
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -888,7 +1023,15 @@ mod tests {
         );
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &pads,
+        );
 
         assert!(
             desired
@@ -978,7 +1121,15 @@ mod tests {
         );
 
         let mut desired = DesiredState::default();
-        apply_layout(&config, &observed, &mut desired, &Layouts::new(), &pads);
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &pads,
+        );
 
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
