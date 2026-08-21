@@ -285,7 +285,10 @@ fn deliver_notification(
 ) {
     let mut subs = match subscribers.lock() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(poisoned) => {
+            error!("subscriber registry poisoned — recovering");
+            poisoned.into_inner()
+        }
     };
     let mut dead = Vec::new();
     for (i, tx) in subs.iter().enumerate() {
@@ -304,8 +307,12 @@ fn register_subscriber(
     subscribers: &Arc<Mutex<Vec<SyncSender<Notification>>>>,
     tx: SyncSender<Notification>,
 ) {
-    if let Ok(mut subs) = subscribers.lock() {
-        subs.push(tx);
+    match subscribers.lock() {
+        Ok(mut subs) => subs.push(tx),
+        Err(poisoned) => {
+            error!("subscriber registry poisoned on register — recovering");
+            poisoned.into_inner().push(tx);
+        }
     }
 }
 
