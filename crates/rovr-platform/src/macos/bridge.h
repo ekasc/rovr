@@ -19,6 +19,9 @@ typedef struct rovr_bridge_window {
     uint32_t display_id;
     uint64_t space_id;
     uint8_t focused;
+    uint8_t minimized;
+    uint8_t fullscreen;
+    uint8_t managed;
     double x;
     double y;
     double width;
@@ -59,3 +62,5 @@ int rovr_bridge_needs_refresh(void);
 int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context);
 int rovr_bridge_move_window_to_space(uint32_t window_id, uint64_t space_id);
 int rovr_bridge_focus_space(uint64_t space_id);
+int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);
+int32_t rovr_bridge_dock_pid(void);
