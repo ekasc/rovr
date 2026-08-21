@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::persistence::PersistedState;
 use anyhow::{Context, Result};
 
-use crate::layout_state::{Layouts, ScratchpadState};
+use crate::layout_state::{Axis, Layouts, ScratchpadState};
 use crate::{
     layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
     ObservedState,
@@ -49,6 +49,17 @@ impl Engine {
     }
     pub fn toggle_scratchpad(&mut self, name: &str) {
         self.scratchpads.toggle(name);
+    }
+    /// Returns the BSP orientation of a space, if tracked, as `(horizontal,
+    /// reversed)`. Used by the daemon to describe layout changes without
+    /// reaching into `layout_state` internals.
+    pub fn layout_orientation(&self, space: SpaceId) -> Option<(bool, bool)> {
+        self.layouts.get(&space).map(|state| {
+            (
+                state.orientation.axis == Axis::Horizontal,
+                state.orientation.reversed,
+            )
+        })
     }
     pub fn save_state(&self, path: &Path) -> Result<()> {
         let persisted = PersistedState {

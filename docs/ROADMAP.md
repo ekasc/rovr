@@ -49,8 +49,8 @@
 
 ## M4: ecosystem
 
-- [ ] stable subscription API
-- [ ] shell completions
+- [x] stable subscription API
+- [x] shell completions
 - [ ] skhd compatibility / optional built-in keybinds
 - [ ] Swift menu-bar diagnostics UI
 - [ ] layout plugin protocol, likely WASM

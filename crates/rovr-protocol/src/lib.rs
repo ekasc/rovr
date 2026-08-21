@@ -33,6 +33,7 @@ pub enum Command {
     Scratchpad(ScratchpadCommand),
     Config(ConfigCommand),
     Debug(DebugCommand),
+    Subscribe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +120,37 @@ pub enum DebugCommand {
     Events,
 }
 
+/// Stable, versioned broadcast event streamed to subscribers over the IPC
+/// socket. `type` is the stable discriminator. New variants are additive:
+/// old clients deserialize unknown variants as `Unknown` instead of erroring,
+/// so the stream stays forward-compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Notification {
+    /// Sent immediately when a subscription stream is established; the client
+    /// should treat this as the first event on the stream.
+    Hello { protocol_version: u16 },
+    /// Observable state may have changed (reconcile tick or a verified
+    /// mutation); re-query `state` to refresh. Carries no counter: it is a
+    /// re-poll hint, not a revision number.
+    StateChanged,
+    /// A Space's BSP orientation changed (emitted after the mutation applied).
+    LayoutChanged {
+        space: SpaceId,
+        horizontal: bool,
+        reversed: bool,
+    },
+    /// A scratchpad was toggled open/closed (emitted after the mutation applied).
+    ScratchpadToggled { name: String, open: bool },
+    /// The daemon reloaded its configuration successfully.
+    ConfigReloaded,
+    /// Catch-all for variants added after this client was built. Old clients
+    /// receive this instead of failing deserialization, preserving forward
+    /// compatibility. Never constructed by this version.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub version: u16,
@@ -162,5 +194,57 @@ impl Response {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4b: the notification wire format is stable and self-describing (tagged
+    /// `type`), and every known variant round-trips through JSON.
+    #[test]
+    fn m4b_notification_round_trips() {
+        let cases: Vec<Notification> = vec![
+            Notification::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Notification::StateChanged,
+            Notification::LayoutChanged {
+                space: SpaceId(3),
+                horizontal: true,
+                reversed: false,
+            },
+            Notification::ScratchpadToggled {
+                name: "term".into(),
+                open: true,
+            },
+            Notification::ConfigReloaded,
+        ];
+        for n in &cases {
+            let json = serde_json::to_string(n).expect("serialize notification");
+            let back: Notification = serde_json::from_str(&json).expect("deserialize notification");
+            assert_eq!(n, &back, "notification must round-trip: {json}");
+        }
+        // Stable discriminator + field shape.
+        let layout = serde_json::to_value(&Notification::LayoutChanged {
+            space: SpaceId(1),
+            horizontal: true,
+            reversed: false,
+        })
+        .unwrap();
+        assert_eq!(layout["type"], "layout_changed");
+        assert_eq!(layout["space"], 1);
+        assert_eq!(layout["horizontal"], true);
+        assert_eq!(layout["reversed"], false);
+    }
+
+    /// M4b: forward compatibility — an old client deserializes notification
+    /// variants added after it was built as `Unknown` instead of erroring.
+    #[test]
+    fn m4b_unknown_variant_deserializes_to_unknown() {
+        let json = r#"{"type":"window_created","id":42}"#;
+        let n: Notification = serde_json::from_str(json).expect("unknown variant must not error");
+        assert_eq!(n, Notification::Unknown);
     }
 }
