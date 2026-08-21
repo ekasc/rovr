@@ -60,4 +60,8 @@ pub enum Action {
         w: f32,
         h: f32,
     },
+    SetWindowMinimized {
+        window: WindowId,
+        minimized: bool,
+    },
 }
