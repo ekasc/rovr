@@ -3,6 +3,7 @@ members = [
   "crates/rovr-types",
   "crates/rovr-core",
   "crates/rovr-layout",
+  "crates/rovr-layout-plugin",
   "crates/rovr-config",
   "crates/rovr-protocol",
   "crates/rovr-platform",
