@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::layout_state::LayoutState;
+use crate::workspace::WorkspaceState;
 
 /// Serialized form of the engine's mutable runtime state.
 ///
@@ -14,4 +15,6 @@ use crate::layout_state::LayoutState;
 pub struct PersistedState {
     pub layouts: HashMap<String, LayoutState>,
     pub scratchpads: HashMap<String, bool>,
+    #[serde(default)]
+    pub workspaces: HashMap<String, WorkspaceState>,
 }

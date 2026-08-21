@@ -9,6 +9,8 @@ rust-version.workspace = true
 rovr-types.workspace = true
 rovr-config.workspace = true
 rovr-layout.workspace = true
+rovr-layout-plugin = { path = "../rovr-layout-plugin" }
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
