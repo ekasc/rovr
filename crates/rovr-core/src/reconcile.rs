@@ -68,9 +68,9 @@ mod tests {
             space_id: None,
             display_id: None,
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation,
         }
     }

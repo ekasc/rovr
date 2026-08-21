@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rovr_config::{Config, RuleConfig, ScratchpadConfig};
+use rovr_config::{CompiledRule, Config, ScratchpadConfig};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
@@ -14,20 +14,28 @@ use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 /// `minimized`/`fullscreen` are observed via AX; unknown is treated as not
 /// tileable by the reconciliation layer (see is_tileable guards).
 fn is_tileable(w: &WindowSnapshot) -> bool {
-    w.managed && !w.fullscreen && !w.minimized
+    w.managed == rovr_types::ObservedBool::Yes
+        && w.fullscreen == rovr_types::ObservedBool::No
+        && w.minimized == rovr_types::ObservedBool::No
 }
+/// Blocker 10: rule matching uses the COMPILED regexes from config load —
+/// never equality/substring checks that would diverge from validation.
 fn window_matches_rule(
     w: &WindowSnapshot,
-    rule: &RuleConfig,
+    rule: &CompiledRule,
     observed: &ObservedState,
     workspaces: &WorkspaceRegistry,
 ) -> bool {
     let app_ok = match &rule.app {
-        Some(app) => w.bundle_id.as_deref() == Some(app.as_str()) || w.app == *app,
+        Some(re) => {
+            let bundle_hit = w.bundle_id.as_deref().is_some_and(|b| re.is_match(b));
+            let app_hit = re.is_match(&w.app);
+            bundle_hit || app_hit
+        }
         None => true,
     };
     let title_ok = match &rule.title {
-        Some(title) => w.title.contains(title.as_str()),
+        Some(re) => re.is_match(&w.title),
         None => true,
     };
     let workspace_ok = match &rule.workspace {
@@ -51,7 +59,7 @@ fn window_matches_rule(
 /// A window floats when some `floating == Some(true)` rule matches it.
 fn matches_float_rule(
     w: &WindowSnapshot,
-    rules: &[RuleConfig],
+    rules: &[CompiledRule],
     observed: &ObservedState,
     workspaces: &WorkspaceRegistry,
 ) -> bool {
@@ -66,7 +74,7 @@ fn matches_float_rule(
 
 fn target_workspace_for_window(
     w: &WindowSnapshot,
-    rules: &[RuleConfig],
+    rules: &[CompiledRule],
     observed: &ObservedState,
     workspaces: &WorkspaceRegistry,
 ) -> Option<SpaceId> {
@@ -148,6 +156,10 @@ fn inset_area(area: Rect, padding: f64) -> Option<Rect> {
 /// is synced with observed tileable windows (insert/remove) so topology
 /// is preserved across reconcile cycles and not derived from enumeration order.
 /// Non-BSP layouts remain stateless but use deterministic sorted order.
+///
+/// `rules` are the config's COMPILED rules (see `Config::compile_rules`) —
+/// built once at load/reload, never per cycle.
+#[allow(clippy::too_many_arguments)] // pure function over engine state slices; a struct would obscure the borrow split
 pub fn apply_layout(
     config: &Config,
     observed: &ObservedState,
@@ -156,6 +168,7 @@ pub fn apply_layout(
     workspaces: &WorkspaceRegistry,
     plugins: &PluginRegistry,
     scratchpads: &ScratchpadState,
+    rules: &[CompiledRule],
 ) {
     let gap = config.general.gap as f64;
     let padding = config.general.padding as f64;
@@ -167,21 +180,27 @@ pub fn apply_layout(
         desired.windows.entry(*id).or_default();
     }
 
+    // Blocker 9: rule-derived desired state is rebuilt from scratch every
+    // cycle. `desired.space` is exclusively rule-owned (manual moves are
+    // one-shot actions and never stored here), so clearing it first means a
+    // rule that stops matching stops pulling the window immediately.
+    for target in desired.windows.values_mut() {
+        target.space = None;
+    }
+
     let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
         // Rule-driven workspace move: evaluated every snapshot, deterministic.
         // This writes desired.space so reconcile will move the window.
-        if let Some(target) = target_workspace_for_window(w, &config.rules, observed, workspaces) {
+        if let Some(target) = target_workspace_for_window(w, rules, observed, workspaces) {
             if observed.spaces.contains_key(&target) {
                 if let Some(t) = desired.windows.get_mut(&w.id) {
-                    if t.space != Some(target) {
-                        t.space = Some(target);
-                    }
+                    t.space = Some(target);
                 }
             }
         }
         let is_floating = !is_tileable(w)
-            || matches_float_rule(w, &config.rules, observed, workspaces)
+            || matches_float_rule(w, rules, observed, workspaces)
             || matches_open_scratchpad(w, &config.scratchpads, scratchpads);
         if is_floating {
             if let Some(t) = desired.windows.get_mut(&w.id) {
@@ -236,12 +255,21 @@ pub fn apply_layout(
                     };
                     match plugin.compute(&req) {
                         Ok(placements) => {
-                            for p in placements {
-                                if let Some(t) = desired.windows.get_mut(&p.window) {
-                                    t.frame = Some(p.frame);
+                            // Blocker 12: validate the ENTIRE result before
+                            // applying any of it. Invalid output is discarded
+                            // wholesale and the built-in layout takes over.
+                            if let Err(reason) =
+                                rovr_layout_plugin::validate_placements(&req, &placements)
+                            {
+                                tracing::warn!(plugin = %name, %reason, "invalid plugin output discarded, falling back to built-in layout");
+                            } else {
+                                for p in placements {
+                                    if let Some(t) = desired.windows.get_mut(&p.window) {
+                                        t.frame = Some(p.frame);
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
                         }
                         Err(e) => {
                             tracing::warn!(plugin=%name, error=%e, "plugin compute failed, falling back to built-in");
@@ -299,7 +327,7 @@ pub fn apply_layout(
 mod tests {
     use super::*;
     use crate::layout_state::Layouts;
-    use rovr_config::{Config, WorkspaceConfig};
+    use rovr_config::{Config, RuleConfig, WorkspaceConfig};
     use rovr_types::{
         DisplayId, DisplaySnapshot, LayoutKind, ProcessId, Rect, SpaceId, SpaceSnapshot, WindowId,
         WindowSnapshot,
@@ -346,6 +374,7 @@ mod tests {
         );
 
         let mk = |id: u32, fullscreen: bool| WindowSnapshot {
+            // convert bool to ObservedBool
             id: WindowId(id),
             pid: ProcessId(1),
             app: String::new(),
@@ -360,9 +389,13 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: if fullscreen {
+                rovr_types::ObservedBool::Yes
+            } else {
+                rovr_types::ObservedBool::No
+            },
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
         observed.windows.insert(WindowId(1), mk(1, false));
@@ -379,6 +412,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
+            &[],
         );
 
         // Managed windows are tiled.
@@ -472,9 +506,13 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: use_managed,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: if use_managed {
+                rovr_types::ObservedBool::Yes
+            } else {
+                rovr_types::ObservedBool::No
+            },
             generation: 0,
         };
         observed.windows.insert(WindowId(1), mk(true)); // managed, non-fullscreen
@@ -489,6 +527,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
+            &[],
         );
 
         assert!(
@@ -504,6 +543,110 @@ mod tests {
             None,
             "floating (managed = false) window must not be tiled"
         );
+    }
+
+    /// Blocker 13: an eligibility-critical property reported as Unknown must
+    /// NOT be tiled — the policy is conservative and never invents certainty.
+    #[test]
+    fn blocker13_unknown_state_is_not_tiled() {
+        let config = Config::default();
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        let mk = |id: u32,
+                  managed: rovr_types::ObservedBool,
+                  fullscreen: rovr_types::ObservedBool,
+                  minimized: rovr_types::ObservedBool| WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized,
+            fullscreen,
+            managed,
+            generation: 0,
+        };
+        observed.windows.insert(
+            WindowId(1),
+            mk(
+                1,
+                rovr_types::ObservedBool::Unknown,
+                rovr_types::ObservedBool::No,
+                rovr_types::ObservedBool::No,
+            ),
+        );
+        observed.windows.insert(
+            WindowId(2),
+            mk(
+                2,
+                rovr_types::ObservedBool::Yes,
+                rovr_types::ObservedBool::Unknown,
+                rovr_types::ObservedBool::No,
+            ),
+        );
+        observed.windows.insert(
+            WindowId(3),
+            mk(
+                3,
+                rovr_types::ObservedBool::Yes,
+                rovr_types::ObservedBool::No,
+                rovr_types::ObservedBool::Unknown,
+            ),
+        );
+
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &[],
+        );
+
+        for id in [WindowId(1), WindowId(2), WindowId(3)] {
+            assert_eq!(
+                desired.windows.get(&id).and_then(|t| t.frame),
+                None,
+                "window {id:?} with an unknown eligibility property must not be tiled"
+            );
+        }
     }
     /// M3c: a window whose bundle id matches a `float = true` rule is skipped
     /// even though the bridge reports it as managed.
@@ -561,9 +704,9 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
         observed
@@ -582,6 +725,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
+            &config.compile_rules().unwrap(),
         );
 
         assert_eq!(
@@ -654,9 +798,9 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
         observed.windows.insert(WindowId(1), mk(1, "Login Modal")); // matches
@@ -671,6 +815,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
+            &config.compile_rules().unwrap(),
         );
 
         assert_eq!(
@@ -739,9 +884,9 @@ mod tests {
             space_id: Some(SpaceId(11)),
             display_id: Some(DisplayId(1)),
             focused: false,
-            minimized: false,
-            fullscreen: false,
-            managed: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
             generation: 0,
         };
         observed.windows.insert(WindowId(1), mk(1));
@@ -756,6 +901,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
+            &[],
         );
 
         assert!(
@@ -773,6 +919,231 @@ mod tests {
                 .and_then(|t| t.frame)
                 .is_some(),
             "no rules -> managed window must be tiled"
+        );
+    }
+
+    // ---- Blockers 9 + 10: rule-derived desired state and regex matching ----
+
+    /// Builds an observed state with one display, two spaces (11 backing the
+    /// logical workspace "chat"), and one managed window on space 12.
+    fn observed_for_rule_tests() -> ObservedState {
+        let mut observed = ObservedState::default();
+        observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: false,
+                generation: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(11),
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+        );
+        observed.spaces.insert(
+            SpaceId(12),
+            SpaceSnapshot {
+                id: SpaceId(12),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 1,
+            },
+        );
+        observed.windows.insert(
+            WindowId(1),
+            WindowSnapshot {
+                id: WindowId(1),
+                pid: ProcessId(1),
+                app: "Slack".into(),
+                bundle_id: Some("com.tinyspeck.slackmacgap".into()),
+                title: "deploy bot".into(),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                space_id: Some(SpaceId(12)),
+                display_id: Some(DisplayId(1)),
+                focused: false,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
+                generation: 0,
+            },
+        );
+        observed
+    }
+
+    /// Blocker 9: while a rule matches, desired.space points at the rule's
+    /// target workspace; once the rule stops matching (title changed), the
+    /// rule-derived target must DISAPPEAR in the next cycle — never stick.
+    #[test]
+    fn blocker9_rule_derived_space_clears_when_rule_stops_matching() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                app: Some("^com\\.tinyspeck\\.slackmacgap$".into()),
+                title: Some("deploy bot".into()),
+                target_workspace: Some("chat".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rules = config.compile_rules().unwrap();
+        let mut workspaces = crate::workspace::WorkspaceRegistry::default();
+        workspaces.0.insert(
+            "chat".into(),
+            crate::workspace::WorkspaceState {
+                name: "chat".into(),
+                persistent: true,
+                backing_space: Some(SpaceId(11)),
+                desired_display: None,
+                ordinal: 0,
+                last_position: None,
+            },
+        );
+
+        // Cycle 1: rule matches -> desired.space = chat's backing space.
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed_for_rule_tests(),
+            &mut desired,
+            &mut Layouts::new(),
+            &workspaces,
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+        );
+        assert_eq!(
+            desired.windows[&WindowId(1)].space,
+            Some(SpaceId(11)),
+            "matching rule must set rule-derived workspace target"
+        );
+
+        // Cycle 2: title changed so the rule no longer matches.
+        let mut observed = observed_for_rule_tests();
+        observed.windows.get_mut(&WindowId(1)).unwrap().title = "standup notes".into();
+        let mut desired2 = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired2,
+            &mut Layouts::new(),
+            &workspaces,
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+        );
+        assert_eq!(
+            desired2.windows[&WindowId(1)].space,
+            None,
+            "rule-derived workspace target must disappear when the rule stops matching"
+        );
+    }
+
+    /// Blocker 10: exact regex anchoring is honored at runtime — a pattern
+    /// `^Finder$` must NOT match "Finder Helper".
+    #[test]
+    fn blocker10_exact_regex_is_enforced_at_runtime() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                app: Some(r"^com\.tinyspeck\.slackmacgap$".into()),
+                floating: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rules = config.compile_rules().unwrap();
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed_for_rule_tests(),
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+        );
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "exact regex hit must float the window"
+        );
+    }
+
+    /// Blocker 10: alternation patterns match any alternative at runtime.
+    #[test]
+    fn blocker10_alternation_regex_matches() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                title: Some("Preferences|Settings".into()),
+                floating: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rules = config.compile_rules().unwrap();
+
+        for title in ["Preferences", "Settings"] {
+            let mut observed = observed_for_rule_tests();
+            observed.windows.get_mut(&WindowId(1)).unwrap().title = title.into();
+            let mut desired = DesiredState::default();
+            apply_layout(
+                &config,
+                &observed,
+                &mut desired,
+                &mut Layouts::new(),
+                &crate::workspace::WorkspaceRegistry::default(),
+                &rovr_layout_plugin::Registry::new(),
+                &ScratchpadState::new(),
+                &rules,
+            );
+            assert_eq!(
+                desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+                None,
+                "alternation must match {title}"
+            );
+        }
+
+        // Non-match: unrelated title stays tiled.
+        let mut observed = observed_for_rule_tests();
+        observed.windows.get_mut(&WindowId(1)).unwrap().title = "Editor".into();
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+        );
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(1))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "non-matching title must stay tiled"
         );
     }
     /// M3d: a Space whose label matches a named workspace uses that
@@ -932,9 +1303,9 @@ mod tests {
                 space_id: Some(SpaceId(11)),
                 display_id: Some(DisplayId(1)),
                 focused: false,
-                minimized: false,
-                fullscreen: false,
-                managed: true,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
                 generation: 0,
             },
         );
@@ -948,6 +1319,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &pads,
+            &[],
         );
 
         assert_eq!(
@@ -1015,9 +1387,9 @@ mod tests {
                 space_id: Some(SpaceId(11)),
                 display_id: Some(DisplayId(1)),
                 focused: false,
-                minimized: false,
-                fullscreen: false,
-                managed: true,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
                 generation: 0,
             },
         );
@@ -1031,6 +1403,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &pads,
+            &[],
         );
 
         assert!(
@@ -1113,9 +1486,9 @@ mod tests {
                 space_id: Some(SpaceId(11)),
                 display_id: Some(DisplayId(1)),
                 focused: false,
-                minimized: false,
-                fullscreen: false,
-                managed: true,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
                 generation: 0,
             },
         );
@@ -1129,6 +1502,7 @@ mod tests {
             &crate::workspace::WorkspaceRegistry::default(),
             &rovr_layout_plugin::Registry::new(),
             &pads,
+            &[],
         );
 
         assert_eq!(

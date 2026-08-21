@@ -72,6 +72,7 @@ fn main() -> Result<()> {
 
     let mut platform: Box<dyn Platform> = make_platform()?;
     let mut engine = Engine::new(config.clone());
+    engine.capabilities = platform.capabilities();
     if let Err(err) = engine.load_state(&state_path) {
         warn!(%err, "no persisted state (first run expected)");
     }
@@ -93,7 +94,7 @@ fn main() -> Result<()> {
         state_path,
     };
 
-    run_socket_server(socket_path, daemon)
+    run_daemon(socket_path, daemon)
 }
 
 #[cfg(target_os = "macos")]
@@ -106,7 +107,12 @@ fn make_platform() -> Result<Box<dyn Platform>> {
     Ok(Box::new(MockPlatform::default()))
 }
 
-fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
+/// Binds the IPC socket, then splits work across threads (blocker 6):
+/// - MAIN thread: creates the global hotkey manager (Carbon event target
+///   requires the main thread) and runs the AppKit event loop so hotkeys fire.
+/// - accept thread: UnixListener::incoming + per-client handler threads.
+/// - state thread: the single owner of engine/platform mutable state.
+fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(&path) {
         let ft = meta.file_type();
         if ft.is_symlink() {
@@ -131,30 +137,46 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!(socket = %path.display(), "rovr daemon listening");
 
-    // Built-in hotkey backend — separate from core policy, communicates only via public IPC.
-    // Keeps `GlobalHotKeyManager` alive for daemon lifetime; if no binds, this is a no-op.
-    let _hotkey_manager = hotkey::spawn_hotkey_listener(daemon.config.clone(), path.clone());
+    // Built-in hotkey manager MUST be created on the main thread. It is kept
+    // alive by the AppKit event loop below for the daemon's lifetime.
+    let hotkey_manager = hotkey::create_hotkey_manager(daemon.config.clone(), path.clone());
 
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel::<Envelope>();
+
+    // State loop on its own thread (single owner of daemon state).
     let subs_for_loop = subscribers.clone();
     thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let tx = tx.clone();
-                let subs = subscribers.clone();
-                thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, tx, subs) {
-                        error!(%err, "IPC client failed");
-                    }
-                });
+    // Socket accept loop off the main thread.
+    let subs_for_accept = subscribers.clone();
+    let _accept_handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let tx = tx.clone();
+                    let subs = subs_for_accept.clone();
+                    thread::spawn(move || {
+                        if let Err(err) = handle_client(stream, tx, subs) {
+                            error!(%err, "IPC client failed");
+                        }
+                    });
+                }
+                Err(err) => error!(%err, "socket accept failed"),
             }
-            Err(err) => error!(%err, "socket accept failed"),
         }
-    }
+    });
 
+    // Main thread: pump the AppKit/CFRunLoop event loop forever so global
+    // hotkeys are delivered. Never returns while the daemon lives.
+    #[cfg(target_os = "macos")]
+    hotkey::run_appkit_event_loop(hotkey_manager);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = hotkey_manager;
+        let _ = _accept_handle.join();
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(())
 }
 
@@ -389,12 +411,14 @@ impl Daemon {
                 };
                 #[cfg(not(target_os = "macos"))]
                 let sa_diagnostics = json!({ "available": false, "reason": "not_macos" });
+                let snapshot_wedged_ms = self.platform.snapshot_wedged_ms();
                 HandleResult::ok(
                 id,
                 json!({
                     "protocol": PROTOCOL_VERSION,
                     "capabilities": self.platform.capabilities(),
                     "sa": sa_diagnostics,
+                    "snapshot_wedged_ms": snapshot_wedged_ms,
                     "generation": self.engine.observed.generation,
                     "refresh_required": self.engine.observed.refresh_required,
                     "windows": self.engine.observed.windows.len(),
@@ -943,9 +967,9 @@ mod tests {
                 space_id: Some(SpaceId(1)),
                 display_id: Some(DisplayId(1)),
                 focused: true,
-                minimized: false,
-                fullscreen: false,
-                managed: true,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
                 generation: 1,
             }],
             spaces: vec![SpaceSnapshot {
