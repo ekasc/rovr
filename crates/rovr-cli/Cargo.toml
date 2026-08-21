@@ -14,6 +14,7 @@ anyhow.workspace = true
 clap_complete.workspace = true
 clap.workspace = true
 rovr-config.workspace = true
+rovr-platform.workspace = true
 rovr-protocol.workspace = true
 rovr-types.workspace = true
 serde_json.workspace = true

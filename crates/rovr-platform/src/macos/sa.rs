@@ -1,18 +1,24 @@
-// Scripting-addition client transport.
+// Scripting-addition client transport — Rovr-owned.
 //
-// The SA payload (when loaded into Dock by yabai) listens on
-// /tmp/yabai-sa_<username>.socket and speaks a length-prefixed binary
-// protocol. Wire format, adapted from yabai src/sa.m / src/osax/common.h
-// (MIT, © 2019 Åsmund Vikane):
+// Rovr speaks the same length-prefixed binary framing as yabai's SA
+// (src/sa.m / src/osax/common.h, MIT © 2019 Åsmund Vikane) but over its
+// OWN socket namespace `/tmp/rovr-sa_<uid>.sock` and with a versioned
+// handshake. The payload is Rovr-owned: primitive operations only, no layout
+// policy, no config parsing, no desired-state. Every transition carries a
+// hard deadline.
 //
+// Wire format:
 //   request:  [i16 LE length][u8 opcode][payload...]
 //             where length = 1 + payload size (excludes the length field)
 //   handshake: request opcode 0x01 with no payload
 //              response: version cstring, NUL, u32 LE capability attributes
+//              Rovr payload version strings are `rovr-sa-<semver>` (e.g.
+//              `rovr-sa-1.0`). The client probes, parses and version-checks
+//              this string; a yabai payload (`yabai-sa-*`) is treated as
+//              incompatible (different namespace), not silently accepted.
 //   ops: payload is packed little-endian; the payload echoes one byte ACK.
 //
-// Rovr connects to a SA installed and injected by yabai; rovr does not
-// (yet) ship its own payload. Every transition carries a hard deadline.
+// Rovr never connects to `/tmp/yabai-sa_*.socket`.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -21,7 +27,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-const SA_SOCKET_PATH_FMT: &str = "/tmp/yabai-sa_{}.socket";
+/// Rovr-owned SA socket namespace. Uses UID (not $USER) so the daemon
+/// and CLI agree even when $USER is unset or differs; `$USER` fallback is
+/// kept only for error messaging.
+pub const SA_SOCKET_PATH_FMT: &str = "/tmp/rovr-sa_{}.sock";
+/// Expected payload version prefix. Bump the minor on wire-compatible
+/// extensions; bump the major on breaking changes. `probe()` rejects any
+/// payload whose version string does not start with this prefix.
+pub const ROVR_SA_VERSION_PREFIX: &str = "rovr-sa-1.";
 const SA_SOCKET_BUFF_LEN: usize = 0x1000;
 const SA_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -49,23 +62,59 @@ pub enum SaError {
     Operation(String),
 }
 
-/// Result of a successful handshake: the capability attribute bits the
-/// payload reports for this macOS version.
-#[derive(Debug, Clone, Copy)]
+/// Result of a successful handshake: the payload's version string plus
+/// the capability attribute bits it reports for this macOS build.
+#[derive(Debug, Clone)]
 pub struct SaInfo {
+    pub version: String,
     pub attribs: u32,
+}
+
+impl SaInfo {
+    pub fn is_compatible(&self) -> bool {
+        self.version.starts_with(ROVR_SA_VERSION_PREFIX)
+    }
 }
 
 pub struct SaClient {
     socket_path: PathBuf,
 }
 
+impl Default for SaClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SaClient {
+    pub fn socket_path_for_uid(uid: &str) -> PathBuf {
+        PathBuf::from(SA_SOCKET_PATH_FMT.replace("{}", uid))
+    }
+
+    pub fn default_socket_path() -> PathBuf {
+        // Prefer UID (stable, matches daemon's launchd env) over $USER.
+        let uid = std::env::var("UID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                // Fallback: derive from $USER when UID unset (e.g. tests / non-login shells).
+                std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+            });
+        Self::socket_path_for_uid(&uid)
+    }
+
     pub fn new() -> Self {
-        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
         Self {
-            socket_path: PathBuf::from(SA_SOCKET_PATH_FMT.replace("{}", &user)),
+            socket_path: Self::default_socket_path(),
         }
+    }
+
+    pub fn with_socket_path(path: PathBuf) -> Self {
+        Self { socket_path: path }
+    }
+
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
     }
 
     /// Probe the payload once. Absence of the socket or a failed handshake
@@ -102,8 +151,16 @@ impl SaClient {
         }
 
         let nul = buffer[..length].iter().position(|&byte| byte == 0)?;
+        let version_bytes = &buffer[..nul];
+        let version = String::from_utf8_lossy(version_bytes).into_owned();
+        // Require Rovr payload; a yabai payload ("yabai-sa-*") or any
+        // unexpected version is treated as incompatible — not silently
+        // accepted. This prevents accidentally depending on yabai.
+        if !version.starts_with(ROVR_SA_VERSION_PREFIX) {
+            return None;
+        }
         let attribs = u32::from_le_bytes(buffer[nul + 1..nul + 5].try_into().ok()?);
-        Some(SaInfo { attribs })
+        Some(SaInfo { version, attribs })
     }
 
     fn connect(&self) -> Result<UnixStream, SaError> {

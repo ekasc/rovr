@@ -23,8 +23,10 @@ use rovr_platform::MockPlatform;
 use rovr_platform::Platform;
 use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
-    Response, ScratchpadCommand, SpaceCommand, WindowCommand, PROTOCOL_VERSION,
+    Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
+
+mod hotkey;
 use serde_json::json;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -128,6 +130,10 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
         .with_context(|| format!("bind rovr socket at {}", path.display()))?;
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!(socket = %path.display(), "rovr daemon listening");
+
+    // Built-in hotkey backend — separate from core policy, communicates only via public IPC.
+    // Keeps `GlobalHotKeyManager` alive for daemon lifetime; if no binds, this is a no-op.
+    let _hotkey_manager = hotkey::spawn_hotkey_listener(daemon.config.clone(), path.clone());
 
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel::<Envelope>();
@@ -363,11 +369,32 @@ impl Daemon {
         let id = request.id;
         match request.command {
             Command::Ping => HandleResult::ok(id, json!({ "pong": true })),
-            Command::Doctor => HandleResult::ok(
+            Command::Doctor => {
+                #[cfg(target_os = "macos")]
+                let sa_diagnostics = {
+                    // Downcast to MacPlatform via `sa_status` by probing directly — avoids
+                    // adding a new trait method for this diagnostics-only path.
+                    // If the platform is not MacPlatform, this block is not compiled.
+                    use rovr_platform::macos::sa::SaClient;
+                    let c = SaClient::new();
+                    let info = c.probe();
+                    json!({
+                        "socket": c.socket_path().display().to_string(),
+                        "present": info.is_some(),
+                        "version": info.as_ref().map(|i| i.version.clone()),
+                        "compatible": info.as_ref().is_some_and(|i| i.is_compatible()),
+                        "attribs": info.as_ref().map(|i| i.attribs),
+                        "expected_prefix": rovr_platform::macos::sa::ROVR_SA_VERSION_PREFIX,
+                    })
+                };
+                #[cfg(not(target_os = "macos"))]
+                let sa_diagnostics = json!({ "available": false, "reason": "not_macos" });
+                HandleResult::ok(
                 id,
                 json!({
                     "protocol": PROTOCOL_VERSION,
                     "capabilities": self.platform.capabilities(),
+                    "sa": sa_diagnostics,
                     "generation": self.engine.observed.generation,
                     "refresh_required": self.engine.observed.refresh_required,
                     "windows": self.engine.observed.windows.len(),
@@ -378,7 +405,8 @@ impl Daemon {
                     "gap": self.config.general.gap,
                     "reconcile_interval_ms": self.config.general.reconcile_interval_ms,
                 }),
-            ),
+            )
+            }
             Command::Query(command) => match command {
                 QueryCommand::Windows => {
                     let mut windows: Vec<_> =
@@ -427,6 +455,45 @@ impl Daemon {
                 }
             },
             Command::Window(command) => {
+                match command {
+                    WindowCommand::Swap { a, b } => {
+                        return match self.engine.swap_windows(a, b) {
+                            Ok(()) => {
+                                self.persist_state();
+                                match self.platform.snapshot() {
+                                    Ok(snap) => {
+                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
+                                        match self.execute_and_refresh(actions) {
+                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
+                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
+                                        }
+                                    }
+                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                                }
+                            }
+                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                        };
+                    }
+                    WindowCommand::Warp { window, target } => {
+                        return match self.engine.warp_window(window, target) {
+                            Ok(()) => {
+                                self.persist_state();
+                                match self.platform.snapshot() {
+                                    Ok(snap) => {
+                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
+                                        match self.execute_and_refresh(actions) {
+                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
+                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
+                                        }
+                                    }
+                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                                }
+                            }
+                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                        };
+                    }
+                    _ => {}
+                }
                 let result = match command {
                     WindowCommand::Focus { window } => self.engine.focus_window(window),
                     WindowCommand::FocusDirection { from, direction } => {
@@ -437,6 +504,9 @@ impl Daemon {
                     }
                     WindowCommand::MoveToSpace { window, space } => {
                         self.engine.move_window_to_space(window, space)
+                    }
+                    WindowCommand::MoveToWorkspace { window, workspace } => {
+                        self.engine.move_window_to_workspace(window, &workspace)
                     }
                     WindowCommand::SetLayer { window, layer } => {
                         self.engine.set_window_layer(window, layer)
@@ -453,6 +523,7 @@ impl Daemon {
                         duration_ms,
                     } => self.engine.set_window_opacity(window, opacity, duration_ms),
                     WindowCommand::Pip { window } => self.engine.toggle_window_pip(window),
+                    WindowCommand::Swap { .. } | WindowCommand::Warp { .. } => unreachable!(),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -471,6 +542,17 @@ impl Daemon {
                     }
                     LayoutCommand::Mirror { space } => {
                         self.engine.mirror_layout(space);
+                        space
+                    }
+                    LayoutCommand::Balance { space } => {
+                        self.engine.balance_layout(space);
+                        space
+                    }
+                    LayoutCommand::SetRatio { space, ratio } => {
+                        let res = self.engine.set_split_ratio(space, ratio);
+                        if let Err(e) = res {
+                            return HandleResult::err(id, "ENGINE_ERROR", e.to_string());
+                        }
                         space
                     }
                 };
@@ -502,24 +584,45 @@ impl Daemon {
                         .with_notifications(vec![notification]),
                 }
             }
+            Command::Workspace(command) => {
+                let result = match command {
+                    WorkspaceCommand::Focus { name } => self.engine.focus_workspace(&name),
+                    WorkspaceCommand::MoveWindow { window, workspace } => {
+                        self.engine.move_window_to_workspace(window, &workspace)
+                    }
+                };
+                match result {
+                    Ok(actions) => match self.execute_and_refresh(actions) {
+                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                            .with_notifications(vec![Notification::StateChanged]),
+                        Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                    },
+                    Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                }
+            }
             Command::Scratchpad(command) => {
-                let name = match command {
+                let (name, scratchpad_actions) = match command {
                     ScratchpadCommand::Toggle { name } => {
-                        self.engine.toggle_scratchpad(&name);
-                        name
+                        let actions = self.engine.toggle_scratchpad(&name);
+                        (name, actions)
                     }
                 };
                 self.persist_state();
-                // The core policy mutation (toggle) has committed. The typed
-                // notification describes that committed transition and must be
-                // emitted even if applying it to macOS later fails; the
-                // response/error reports the platform problem separately.
                 let open = self.engine.scratchpads.is_open(&name);
-                let notification = Notification::ScratchpadToggled { name, open };
+                let notification = Notification::ScratchpadToggled {
+                    name: name.clone(),
+                    open,
+                };
+                // First execute scratchpad show/hide actions (minimize, move, frame, focus)
+                let scratchpad_result = self.execute_and_refresh(scratchpad_actions);
                 match self.platform.snapshot() {
                     Ok(snapshot) => {
                         let actions = self.engine.apply_event(Event::Snapshot(snapshot));
-                        match self.execute_and_refresh(actions) {
+                        let combined = match scratchpad_result {
+                            Ok(()) => self.execute_and_refresh(actions),
+                            Err(e) => Err(e),
+                        };
+                        match combined {
                             Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
                                 .with_notifications(vec![notification.clone()]),
                             Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
@@ -556,9 +659,10 @@ impl Daemon {
                     }
                     match Config::load(&raw) {
                         Ok(config) => {
-                            self.engine.config = config.clone();
-                            self.config = config;
+                            self.config = config.clone();
                             self.config_path = raw;
+                            self.engine.reload_config(config);
+                            self.persist_state();
                             HandleResult::ok(id, json!({ "reloaded": true }))
                                 .with_notifications(vec![Notification::ConfigReloaded])
                         }

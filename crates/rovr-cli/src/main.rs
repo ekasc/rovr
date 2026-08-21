@@ -10,7 +10,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
-    Response, ResponseOutcome, ScratchpadCommand, SpaceCommand, WindowCommand,
+    Response, ResponseOutcome, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
@@ -29,11 +29,13 @@ struct Cli {
 enum TopCommand {
     Ping,
     Doctor,
+    Sa(SaArgs),
     Query(QueryArgs),
     Window(WindowArgs),
     Space(SpaceArgs),
     Layout(LayoutArgs),
     Scratchpad(ScratchpadArgs),
+    Workspace(WorkspaceArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
     Subscribe,
@@ -85,6 +87,14 @@ enum WindowSubcommand {
         window: u32,
         space: u64,
     },
+    #[command(
+        name = "move-to-workspace",
+        about = "Move window to named workspace (logical)"
+    )]
+    MoveToWorkspace {
+        window: u32,
+        workspace: String,
+    },
     SetLayer {
         window: u32,
         layer: i32,
@@ -106,6 +116,14 @@ enum WindowSubcommand {
     },
     Pip {
         window: u32,
+    },
+    Swap {
+        a: u32,
+        b: u32,
+    },
+    Warp {
+        window: u32,
+        target: u32,
     },
 }
 
@@ -182,6 +200,8 @@ struct LayoutArgs {
 enum LayoutSubcommand {
     Rotate { space: u64 },
     Mirror { space: u64 },
+    Balance { space: u64 },
+    SetRatio { space: u64, ratio: f64 },
 }
 #[derive(Debug, Args)]
 struct ScratchpadArgs {
@@ -194,6 +214,40 @@ enum ScratchpadSubcommand {
     Toggle { name: String },
 }
 
+#[derive(Debug, Args)]
+struct WorkspaceArgs {
+    #[command(subcommand)]
+    command: WorkspaceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceSubcommand {
+    Focus {
+        name: String,
+    },
+    #[command(name = "move-window", about = "Move window to named workspace")]
+    MoveWindow {
+        window: u32,
+        workspace: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SaArgs {
+    #[command(subcommand)]
+    command: SaSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SaSubcommand {
+    /// Show Rovr SA socket, payload version, compatibility and per-capability status.
+    Status,
+    /// Install / update the Rovr scripting-addition payload into Dock (requires SIP party disabled for injection).
+    Install,
+    /// Uninstall the Rovr scripting-addition payload.
+    Uninstall,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let TopCommand::Completions { shell } = cli.command {
@@ -204,6 +258,9 @@ fn main() -> Result<()> {
         if let ConfigSubcommand::GenSkhd { path } = &args.command {
             return run_gen_skhd(path.as_deref());
         }
+    }
+    if let TopCommand::Sa(args) = &cli.command {
+        return run_sa(args);
     }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     if matches!(cli.command, TopCommand::Subscribe) {
@@ -313,6 +370,12 @@ fn map_command(command: TopCommand) -> Command {
                 window: WindowId(window),
                 space: SpaceId(space),
             },
+            WindowSubcommand::MoveToWorkspace { window, workspace } => {
+                WindowCommand::MoveToWorkspace {
+                    window: WindowId(window),
+                    workspace,
+                }
+            }
             WindowSubcommand::SetLayer { window, layer } => WindowCommand::SetLayer {
                 window: WindowId(window),
                 layer,
@@ -336,6 +399,14 @@ fn map_command(command: TopCommand) -> Command {
             },
             WindowSubcommand::Pip { window } => WindowCommand::Pip {
                 window: WindowId(window),
+            },
+            WindowSubcommand::Swap { a, b } => WindowCommand::Swap {
+                a: WindowId(a),
+                b: WindowId(b),
+            },
+            WindowSubcommand::Warp { window, target } => WindowCommand::Warp {
+                window: WindowId(window),
+                target: WindowId(target),
             },
         }),
         TopCommand::Space(args) => Command::Space(match args.command {
@@ -370,10 +441,25 @@ fn map_command(command: TopCommand) -> Command {
             LayoutSubcommand::Mirror { space } => LayoutCommand::Mirror {
                 space: SpaceId(space),
             },
+            LayoutSubcommand::Balance { space } => LayoutCommand::Balance {
+                space: SpaceId(space),
+            },
+            LayoutSubcommand::SetRatio { space, ratio } => LayoutCommand::SetRatio {
+                space: SpaceId(space),
+                ratio,
+            },
         }),
         TopCommand::Scratchpad(args) => Command::Scratchpad(match args.command {
             ScratchpadSubcommand::Toggle { name } => ScratchpadCommand::Toggle { name },
         }),
+        TopCommand::Workspace(args) => Command::Workspace(match args.command {
+            WorkspaceSubcommand::Focus { name } => WorkspaceCommand::Focus { name },
+            WorkspaceSubcommand::MoveWindow { window, workspace } => WorkspaceCommand::MoveWindow {
+                window: WindowId(window),
+                workspace,
+            },
+        }),
+        TopCommand::Sa(_) => unreachable!("sa is handled in main() before map_command"),
         TopCommand::Completions { .. } => {
             unreachable!("completions are handled in main() before map_command is called")
         }
@@ -381,6 +467,86 @@ fn map_command(command: TopCommand) -> Command {
             unreachable!("subscribe is handled in main() before map_command is called")
         }
     }
+}
+
+fn run_sa(args: &SaArgs) -> Result<()> {
+    match &args.command {
+        SaSubcommand::Status => run_sa_status(),
+        SaSubcommand::Install => run_sa_install(),
+        SaSubcommand::Uninstall => run_sa_uninstall(),
+    }
+}
+
+fn run_sa_status() -> Result<()> {
+    // Probe SA directly (without daemon) and also query daemon doctor for its view.
+    #[cfg(target_os = "macos")]
+    {
+        use rovr_platform::macos::sa::{SaClient, ROVR_SA_VERSION_PREFIX};
+        let client = SaClient::new();
+        let socket = client.socket_path().clone();
+        println!("socket: {}", socket.display());
+        println!("expected_prefix: {}", ROVR_SA_VERSION_PREFIX);
+        match client.probe() {
+            Some(info) => {
+                println!("present: true");
+                println!("version: {}", info.version);
+                println!("compatible: {}", info.is_compatible());
+                println!("attribs: 0x{:08x}", info.attribs);
+                let add = (info.attribs & 0x04) != 0;
+                let rem = (info.attribs & 0x08) != 0;
+                let mov_ = (info.attribs & 0x10) != 0;
+                println!("capabilities:");
+                println!("  create_space: {}", add);
+                println!("  destroy_space: {}", rem);
+                println!("  reorder_space: {}", mov_);
+                println!("  layer/sticky/shadow/opacity/scale: true (when present)");
+            }
+            None => {
+                println!("present: false");
+                println!("hint: run `rovr sa install` then restart Dock, or check SIP / payload injection");
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("sa status is only available on macOS");
+    }
+    // Also print daemon's view if reachable (best-effort).
+    let socket = default_socket_path();
+    if let Ok(resp) = send(
+        &socket,
+        &Request::new(
+            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            Command::Doctor,
+        ),
+    ) {
+        println!("-- daemon doctor --");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn run_sa_install() -> Result<()> {
+    // Phase-1 slice: document and verify. Full payload injection ships next.
+    // We intentionally do NOT weaken SIP beyond what the payload needs: see
+    // docs/SA_SIP.md for the scoped requirement (see SA.md for payload scope).
+    println!("rovr sa install: Rovr-owned payload injection is not yet bundled in this build.");
+    println!("This command will, when the payload ships:");
+    println!("  1) install the Rovr SA payload to a privileged location,");
+    println!("  2) inject it into Dock (requires SIP with `csrutil enable --without debug` / `filesystem` relaxation depending on macOS),");
+    println!("  3) create the Rovr socket at /tmp/rovr-sa_<uid>.sock (never /tmp/yabai-sa_*).");
+    println!("See docs/SA_SIP.md (to be added) and `rovr sa status` for diagnostics.");
+    println!("For now, verify: yabai must NOT be required; SA socket must be Rovr-owned.");
+    anyhow::bail!("sa install: payload not yet bundled — see `rovr sa status` and TODO.md Phase 1");
+}
+
+fn run_sa_uninstall() -> Result<()> {
+    println!("rovr sa uninstall: payload not yet bundled; nothing to remove in this build.");
+    println!("When bundled, this will remove the Rovr payload and restore Dock.");
+    Ok(())
 }
 
 fn run_gen_skhd(path: Option<&str>) -> Result<()> {
