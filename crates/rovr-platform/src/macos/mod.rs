@@ -81,6 +81,7 @@ extern "C" {
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
     fn rovr_bridge_focus_space(space_id: u64) -> i32;
+    fn rovr_bridge_current_space_id() -> u64;
     fn rovr_bridge_dock_pid() -> i32;
 }
 
@@ -89,6 +90,10 @@ pub struct MacPlatform {
     sa: SaClient,
     sa_info: std::cell::RefCell<Option<SaInfo>>,
     last_dock_pid: std::cell::Cell<Option<i32>>,
+    /// Target of the most recently posted focus gesture (0 = none pending).
+    /// Used to detect that the previous Mission Control swipe animation has
+    /// landed before posting another one.
+    last_focus_target: std::cell::Cell<u64>,
     last_sa_present: std::cell::Cell<bool>,
     /// Blocker 2: ONE platform worker thread for all observation. AX/SkyLight
     /// hangs can never leak threads — repeated timeouts fail fast against the
@@ -131,6 +136,7 @@ impl MacPlatform {
             sa_info: std::cell::RefCell::new(sa_info),
             last_dock_pid,
             last_sa_present,
+            last_focus_target: std::cell::Cell::new(0),
             snapshot_worker: BoundedWorker::new(
                 crate::bounded_worker::DEFAULT_JOB_TIMEOUT,
                 crate::bounded_worker::DEFAULT_RETRY_INTERVAL,
@@ -178,10 +184,26 @@ impl MacPlatform {
         // Prefer the SA's clean focus (no gesture, no animation) when the
         // payload is live; fall back to gesture synthesis otherwise.
         if self.sa_info.borrow().is_some() && self.sa.focus_space(space.0).is_ok() {
+            self.last_focus_target.set(space.0);
             return Ok(());
+        }
+        // Gesture path: posting a swipe sequence while the previous Mission
+        // Control animation is still in flight leaves WindowServer between
+        // Spaces (blank screen). Wait — bounded — until the previously
+        // requested Space has actually landed before posting another one.
+        let last = self.last_focus_target.get();
+        if last != 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+            while unsafe { rovr_bridge_current_space_id() } != last {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
         let status = unsafe { rovr_bridge_focus_space(space.0) };
         if status == 0 {
+            self.last_focus_target.set(space.0);
             Ok(())
         } else {
             Err(PlatformError::Operation(format!(

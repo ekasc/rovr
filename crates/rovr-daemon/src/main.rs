@@ -609,8 +609,25 @@ impl Daemon {
                 }
             }
             Command::Workspace(command) => {
+                // Focus-only fast path: focusing a Space mutates no window
+                // geometry, so the synchronous verify snapshot (plus its
+                // followup reconcile snapshot) only adds ~200 ms of latency
+                // to rapid switching. The periodic state loop observes the
+                // focus within one reconcile interval anyway.
+                if let WorkspaceCommand::Focus { name } = &command {
+                    return match self.engine.focus_workspace(name) {
+                        Ok(actions) => match execute_actions_result(&mut *self.platform, actions) {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => {
+                                HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                            }
+                        },
+                        Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                    };
+                }
                 let result = match command {
-                    WorkspaceCommand::Focus { name } => self.engine.focus_workspace(&name),
+                    WorkspaceCommand::Focus { .. } => unreachable!("handled above"),
                     WorkspaceCommand::MoveWindow { window, workspace } => {
                         self.engine.move_window_to_workspace(window, &workspace)
                     }
