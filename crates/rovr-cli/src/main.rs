@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use rovr_protocol::{
-    Command, ConfigCommand, DebugCommand, LayoutCommand, QueryCommand, Request, Response,
-    ScratchpadCommand, SpaceCommand, WindowCommand,
+    Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
+    Response, ResponseOutcome, ScratchpadCommand, SpaceCommand, WindowCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
@@ -36,6 +36,7 @@ enum TopCommand {
     Scratchpad(ScratchpadArgs),
     Config(ConfigArgs),
     Debug(DebugArgs),
+    Subscribe,
     #[command(about = "Generate shell completion scripts (bash/zsh/fish/powershell/elvish)")]
     Completions {
         shell: Shell,
@@ -192,6 +193,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
+    if matches!(cli.command, TopCommand::Subscribe) {
+        return run_subscribe(&socket);
+    }
     let command = map_command(cli.command);
     let request = Request::new(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed), command);
     let response = send(&socket, &request)?;
@@ -203,6 +207,58 @@ fn generate_completions(shell: Shell) {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
     generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+fn run_subscribe(socket: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect to rovr daemon at {}", socket.display()))?;
+    let request = Request::new(
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        Command::Subscribe,
+    );
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    consume_subscribe_stream(&mut reader, &mut handle)
+}
+
+/// Reads a subscription stream: consumes the first line as the ACK `Response`
+/// (returning an error if it is not `ok`), then prints each subsequent
+/// notification line. Unknown/future notification variants are silently skipped
+/// so the client stays forward-compatible.
+fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -> Result<()> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(anyhow::anyhow!("subscription stream closed before ACK"));
+    }
+    let ack: Response = serde_json::from_str(line.trim()).context("decode subscription ACK")?;
+    if !matches!(ack.outcome, ResponseOutcome::Ok { .. }) {
+        let msg = match &ack.outcome {
+            ResponseOutcome::Error { error } => error.message.clone(),
+            ResponseOutcome::Ok { .. } => String::new(),
+        };
+        return Err(anyhow::anyhow!("subscription rejected: {msg}"));
+    }
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        match serde_json::from_str::<Notification>(buf.trim()) {
+            Ok(Notification::Unknown) => continue,
+            Ok(_) => {
+                out.write_all(buf.trim().as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 fn map_command(command: TopCommand) -> Command {
@@ -305,6 +361,9 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Completions { .. } => {
             unreachable!("completions are handled in main() before map_command is called")
         }
+        TopCommand::Subscribe => {
+            unreachable!("subscribe is handled in main() before map_command is called")
+        }
     }
 }
 
@@ -346,5 +405,80 @@ mod tests {
                 "completion script missing subcommand `{expected}`"
             );
         }
+    }
+    /// M4b: `rovr subscribe` consumes the subscription ACK (and errors if it is
+    /// not ok) before printing only notification lines.
+    #[test]
+    fn m4b_cli_consumes_subscription_ack_before_printing_notifications() {
+        use std::io::Cursor;
+
+        let ack =
+            serde_json::to_string(&Response::ok(1, serde_json::json!({ "subscribed": true })))
+                .unwrap();
+        let hello = serde_json::to_string(&Notification::Hello {
+            protocol_version: rovr_protocol::PROTOCOL_VERSION,
+        })
+        .unwrap();
+        let changed = serde_json::to_string(&Notification::StateChanged).unwrap();
+        let stream = format!("{ack}\n{hello}\n{changed}\n");
+
+        let mut input = Cursor::new(stream.into_bytes());
+        let mut out = Vec::new();
+        consume_subscribe_stream(&mut input, &mut out).expect("consume stream");
+
+        let printed = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            printed.contains(&hello),
+            "hello notification must be printed"
+        );
+        assert!(printed.contains(&changed), "state_changed must be printed");
+        assert!(
+            !printed.contains(&ack),
+            "subscription ACK must not be printed as a notification"
+        );
+    }
+
+    #[test]
+    fn m4b_cli_subscription_ack_error_aborts() {
+        use std::io::Cursor;
+        let err = serde_json::to_string(&Response::error(
+            1,
+            "PROTOCOL_VERSION_MISMATCH",
+            "bad version",
+        ))
+        .unwrap();
+        let mut input = Cursor::new(format!("{err}\n").into_bytes());
+        let mut out = Vec::new();
+        let result = consume_subscribe_stream(&mut input, &mut out);
+        assert!(result.is_err(), "non-ok ACK must abort the subscription");
+        assert!(out.is_empty(), "nothing should be printed on ACK error");
+    }
+
+    /// M4b: a malformed notification frame must terminate the stream with an
+    /// error rather than disappearing silently.
+    #[test]
+    fn m4b_cli_malformed_notification_frame_aborts() {
+        use std::io::Cursor;
+        let ack =
+            serde_json::to_string(&Response::ok(1, serde_json::json!({ "subscribed": true })))
+                .unwrap();
+        let hello = serde_json::to_string(&Notification::Hello {
+            protocol_version: rovr_protocol::PROTOCOL_VERSION,
+        })
+        .unwrap();
+        // Garbage line after a valid Hello: the stream must error out.
+        let stream = format!("{ack}\n{hello}\nnot-json\n");
+        let mut input = Cursor::new(stream.into_bytes());
+        let mut out = Vec::new();
+        let result = consume_subscribe_stream(&mut input, &mut out);
+        assert!(
+            result.is_err(),
+            "malformed notification frame must abort the stream"
+        );
+        let printed = String::from_utf8(out).expect("utf-8 output");
+        assert!(
+            printed.contains(&hello),
+            "valid frames before the corruption must still be printed"
+        );
     }
 }

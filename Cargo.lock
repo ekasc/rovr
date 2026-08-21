@@ -332,6 +332,7 @@ dependencies = [
  "rovr-platform",
  "rovr-protocol",
  "rovr-types",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
