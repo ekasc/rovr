@@ -9,6 +9,8 @@ members = [
   "crates/rovr-platform",
   "crates/rovr-daemon",
   "crates/rovr-cli",
+  "crates/rovr-sa-payload",
+  "crates/rovr-sa-loader",
 ]
 resolver = "2"
 

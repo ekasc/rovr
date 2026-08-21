@@ -1,8 +1,6 @@
 pub mod sa;
 
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::mpsc;
-use std::time::Duration;
 
 use rovr_core::Action;
 use rovr_types::{
@@ -10,6 +8,7 @@ use rovr_types::{
     SpaceSnapshot, WindowId, WindowSnapshot,
 };
 
+use crate::bounded_worker::BoundedWorker;
 use crate::{Platform, PlatformError};
 
 use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE};
@@ -91,6 +90,10 @@ pub struct MacPlatform {
     sa_info: std::cell::RefCell<Option<SaInfo>>,
     last_dock_pid: std::cell::Cell<Option<i32>>,
     last_sa_present: std::cell::Cell<bool>,
+    /// Blocker 2: ONE platform worker thread for all observation. AX/SkyLight
+    /// hangs can never leak threads — repeated timeouts fail fast against the
+    /// same lone worker and recovery is an explicit retry on it.
+    snapshot_worker: BoundedWorker<Result<PlatformSnapshot, PlatformError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +131,18 @@ impl MacPlatform {
             sa_info: std::cell::RefCell::new(sa_info),
             last_dock_pid,
             last_sa_present,
+            snapshot_worker: BoundedWorker::new(
+                crate::bounded_worker::DEFAULT_JOB_TIMEOUT,
+                crate::bounded_worker::DEFAULT_RETRY_INTERVAL,
+            ),
         })
+    }
+
+    /// How long the observation worker has been wedged, if it has.
+    pub fn snapshot_wedged_ms(&self) -> Option<u64> {
+        self.snapshot_worker
+            .wedged_since()
+            .map(|since| since.elapsed().as_millis() as u64)
     }
 
     pub fn sa_status(&self) -> SaStatus {
@@ -184,12 +198,20 @@ impl MacPlatform {
             let window = *window;
             let windows = &mut *(context as *mut Vec<WindowSnapshot>);
             let bundle_id = c_string(&window.bundle_id);
-            let minimized = matches!(window.minimized, 1);
-            let fullscreen = matches!(window.fullscreen, 1);
+            let minimized = match window.minimized {
+                0 => rovr_types::ObservedBool::No,
+                1 => rovr_types::ObservedBool::Yes,
+                _ => rovr_types::ObservedBool::Unknown,
+            };
+            let fullscreen = match window.fullscreen {
+                0 => rovr_types::ObservedBool::No,
+                1 => rovr_types::ObservedBool::Yes,
+                _ => rovr_types::ObservedBool::Unknown,
+            };
             let managed = match window.managed {
-                0 => false,
-                1 => true,
-                _ => false,
+                0 => rovr_types::ObservedBool::No,
+                1 => rovr_types::ObservedBool::Yes,
+                _ => rovr_types::ObservedBool::Unknown,
             };
             windows.push(WindowSnapshot {
                 id: WindowId(window.id),
@@ -306,20 +328,20 @@ impl Platform for MacPlatform {
     }
 
     fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
-        // Hardened snapshot with bounded wait: AX and SkyLight can hang (e.g., app dying mid-call,
-        // Dock restart). We run the actual enumeration in a thread and bound it by 2s.
-        // This keeps the daemon responsive even when platform hangs.
+        // Blocker 2: bounded observation through the SINGLE platform worker.
+        // A hung AX/SkyLight call wedges exactly one thread; callers time out
+        // (2 s) or fail fast, and periodic reconciliation can never spawn
+        // additional workers. Recovery retries on the same worker after the
+        // retry interval; stale responses are discarded by epoch.
         let bridge_capabilities = self.bridge_capabilities;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let res = Self::snapshot_inner(bridge_capabilities);
-            let _ = tx.send(res);
-        });
-        match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(res) => res,
-            Err(_) => Err(PlatformError::Operation(
-                "snapshot timeout (AX/SkyLight hung)".into(),
-            )),
+        match self
+            .snapshot_worker
+            .run(move || Self::snapshot_inner(bridge_capabilities))
+        {
+            Ok(inner) => inner,
+            Err(err) => Err(PlatformError::Operation(format!(
+                "snapshot unavailable: {err}"
+            ))),
         }
     }
 

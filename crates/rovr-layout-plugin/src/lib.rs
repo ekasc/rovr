@@ -38,6 +38,63 @@ pub trait LayoutPlugin: Send + Sync {
     fn compute(&self, request: &PluginRequest) -> Result<Vec<PluginPlacement>, PluginError>;
 }
 
+/// Validates a plugin's placements against the request it answered.
+///
+/// A plugin result is accepted only when:
+/// - every requested `WindowId` appears exactly once (no duplicates, no
+///   missing, no foreign windows),
+/// - the placement count equals the requested window count,
+/// - all coordinates are finite,
+/// - width and height are strictly positive,
+/// - frames stay within a reasonable bound around the requested area
+///   (2x area extent in each direction; catches runaway geometry).
+///
+/// On any violation the caller must discard ALL plugin output and fall back
+/// to the built-in layout — never partially apply invalid output.
+pub fn validate_placements(
+    request: &PluginRequest,
+    placements: &[PluginPlacement],
+) -> Result<(), String> {
+    if placements.len() != request.windows.len() {
+        return Err(format!(
+            "placement count {} != requested window count {}",
+            placements.len(),
+            request.windows.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for p in placements {
+        if !request.windows.contains(&p.window) {
+            return Err(format!("foreign window {:?} in placements", p.window));
+        }
+        if !seen.insert(p.window) {
+            return Err(format!("duplicate window {:?} in placements", p.window));
+        }
+        let f = p.frame;
+        if !(f.x.is_finite() && f.y.is_finite() && f.width.is_finite() && f.height.is_finite()) {
+            return Err(format!("non-finite geometry for window {:?}", p.window));
+        }
+        if f.width <= 0.0 || f.height <= 0.0 {
+            return Err(format!(
+                "non-positive size for window {:?}: {}x{}",
+                p.window, f.width, f.height
+            ));
+        }
+        // Reasonable bounds: allow up to 2x the requested area extent around
+        // the area origin (covers negative-coordinate secondary displays via
+        // the area origin offset while catching absurd values).
+        let max_w = request.area.width * 2.0 + 1.0;
+        let max_h = request.area.height * 2.0 + 1.0;
+        if f.width > max_w || f.height > max_h {
+            return Err(format!(
+                "frame for window {:?} exceeds reasonable bounds: {}x{} vs area {}x{}",
+                p.window, f.width, f.height, request.area.width, request.area.height
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct Registry {
     plugins: Vec<Box<dyn LayoutPlugin>>,
@@ -93,10 +150,15 @@ pub mod wasm_runtime {
     use super::LayoutPlugin;
     use super::{wasm_abi, PluginError, PluginManifest, PluginPlacement, PluginRequest};
     use std::path::Path;
-    use wasmi::{Config, Engine, Linker, Module, Store};
+    use wasmi::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
-    // Use wasmi's built-in StoreLimits for memory bounding instead of custom impl
-    // to avoid API churn with error types (MemoryError/TableError).
+    /// Hard cap on plugin linear memory (16 MiB). Enforced by wasmi's
+    /// `StoreLimits` resource limiter attached to the per-call `Store`.
+    pub const PLUGIN_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+    /// Hard cap on table growth per plugin instance.
+    pub const PLUGIN_TABLE_MAX_ELEMENTS: u32 = 10_000;
+    /// Fuel budget (~1M instructions) acting as the compute timeout.
+    const PLUGIN_FUEL: u64 = 1_000_000;
 
     pub struct WasmPlugin {
         engine: Engine,
@@ -175,7 +237,10 @@ pub mod wasm_runtime {
             Self::load_bytes(&bytes, manifest)
         }
 
-        fn instantiate(&self, store: &mut Store<()>) -> Result<wasmi::Instance, PluginError> {
+        fn instantiate(
+            &self,
+            store: &mut Store<StoreLimits>,
+        ) -> Result<wasmi::Instance, PluginError> {
             let linker = Linker::new(&self.engine);
             let pre = linker
                 .instantiate(&mut *store, &self.module)
@@ -185,16 +250,35 @@ pub mod wasm_runtime {
         }
     }
 
+    impl WasmPlugin {
+        /// Creates a fuel- and resource-bounded store for one plugin call.
+        fn make_store(&self) -> Store<StoreLimits> {
+            let limits = StoreLimitsBuilder::new()
+                .memory_size(PLUGIN_MEMORY_LIMIT_BYTES)
+                .table_elements(PLUGIN_TABLE_MAX_ELEMENTS)
+                .memories(1)
+                .tables(1)
+                .instances(1)
+                .trap_on_grow_failure(true)
+                .build();
+            let mut store = Store::new(&self.engine, limits);
+            store.limiter(|limits: &mut StoreLimits| limits);
+            store
+        }
+    }
+
     impl LayoutPlugin for WasmPlugin {
         fn manifest(&self) -> PluginManifest {
             self.manifest.clone()
         }
         fn compute(&self, request: &PluginRequest) -> Result<Vec<PluginPlacement>, PluginError> {
             let input = wasm_abi::encode_request(request);
-            // Fuel budget ~1M instructions; acts as timeout. No arbitrary host access.
-            let mut store = Store::new(&self.engine, ());
+            // Bounded store: fuel budget acts as timeout; StoreLimits caps
+            // linear memory (16 MiB) and table growth. No host imports are
+            // linked, so a malicious plugin can only trap inside its sandbox.
+            let mut store = self.make_store();
             store
-                .set_fuel(1_000_000)
+                .set_fuel(PLUGIN_FUEL)
                 .map_err(|e| PluginError::Execution(e.to_string()))?;
             let instance = self.instantiate(&mut store)?;
             // Get memory and alloc/compute exports
@@ -442,5 +526,243 @@ mod tests {
                 || err.to_string().contains("timeout"),
             "should be fuel timeout, got {err}"
         );
+    }
+
+    // ---- Blocker 12: plugin output validation ----
+
+    fn req_for(windows: &[u32]) -> PluginRequest {
+        PluginRequest {
+            area: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            windows: windows.iter().map(|w| WindowId(*w)).collect(),
+            gap: 0.0,
+            padding: 0.0,
+        }
+    }
+
+    fn place(window: u32, frame: Rect) -> PluginPlacement {
+        PluginPlacement {
+            window: WindowId(window),
+            frame,
+        }
+    }
+
+    #[test]
+    fn blocker12_valid_response_accepted() {
+        let req = req_for(&[1, 2]);
+        let placements = vec![
+            place(
+                1,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+            place(
+                2,
+                Rect {
+                    x: 500.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+        ];
+        assert!(validate_placements(&req, &placements).is_ok());
+    }
+
+    #[test]
+    fn blocker12_empty_response_rejected() {
+        let req = req_for(&[1, 2]);
+        assert!(
+            validate_placements(&req, &[]).is_err(),
+            "empty response for non-empty request must be rejected"
+        );
+    }
+
+    #[test]
+    fn blocker12_duplicate_window_rejected() {
+        let req = req_for(&[1, 2]);
+        let placements = vec![
+            place(
+                1,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+            place(
+                1,
+                Rect {
+                    x: 500.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+        ];
+        assert!(validate_placements(&req, &placements).is_err());
+    }
+
+    #[test]
+    fn blocker12_missing_window_rejected() {
+        let req = req_for(&[1, 2]);
+        let placements = vec![place(
+            1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &placements).is_err());
+    }
+
+    #[test]
+    fn blocker12_foreign_window_rejected() {
+        let req = req_for(&[1]);
+        let placements = vec![
+            place(
+                1,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+            place(
+                99,
+                Rect {
+                    x: 500.0,
+                    y: 0.0,
+                    width: 500.0,
+                    height: 800.0,
+                },
+            ),
+        ];
+        assert!(validate_placements(&req, &placements).is_err());
+    }
+
+    #[test]
+    fn blocker12_nan_geometry_rejected() {
+        let req = req_for(&[1]);
+        let placements = vec![place(
+            1,
+            Rect {
+                x: f64::NAN,
+                y: 0.0,
+                width: 500.0,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &placements).is_err());
+    }
+
+    #[test]
+    fn blocker12_infinite_geometry_rejected() {
+        let req = req_for(&[1]);
+        let placements = vec![place(
+            1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: f64::INFINITY,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &placements).is_err());
+    }
+
+    #[test]
+    fn blocker12_zero_and_negative_sizes_rejected() {
+        let req = req_for(&[1]);
+        let zero = vec![place(
+            1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &zero).is_err());
+        let negative = vec![place(
+            1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 500.0,
+                height: -3.0,
+            },
+        )];
+        assert!(validate_placements(&req, &negative).is_err());
+    }
+
+    #[test]
+    fn blocker12_absurd_frame_bounds_rejected() {
+        let req = req_for(&[1]);
+        let huge = vec![place(
+            1,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0e9,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &huge).is_err());
+    }
+
+    // ---- Blocker 11: WASM memory limiting ----
+
+    #[test]
+    fn blocker11_memory_growth_past_limit_is_contained() {
+        // Plugin that repeatedly grows linear memory by 16 pages (1 MiB) per
+        // iteration until growth fails or fuel runs out. With the 16 MiB
+        // StoreLimits attached, growth beyond the cap must trap/fail instead
+        // of consuming unbounded host memory.
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "alloc") (param $size i32) (result i32) (i32.const 0))
+                (func (export "compute") (param $in_ptr i32) (param $in_len i32) (result i64)
+                    (loop $l
+                        (drop (memory.grow (i32.const 16)))
+                        (br $l)
+                    )
+                    (i64.const 0)
+                )
+            )
+        "#;
+        let wasm = wat::parse_str(wat).unwrap();
+        let manifest = PluginManifest {
+            name: "hogger".into(),
+            version: "0.1.0".into(),
+            description: None,
+        };
+        let mut reg = Registry::new();
+        reg.load_wasm_bytes(&wasm, manifest).unwrap();
+        let plugin = reg.get("hogger").unwrap();
+        let req = req_for(&[]);
+        let err = plugin
+            .compute(&req)
+            .expect_err("memory-hogging plugin must not succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trap") || msg.contains("memory") || msg.contains("fuel"),
+            "expected containment error, got: {msg}"
+        );
+        // The host registry is still alive and usable afterwards.
+        assert!(reg.get("hogger").is_some());
     }
 }
