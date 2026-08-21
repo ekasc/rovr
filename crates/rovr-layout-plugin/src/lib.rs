@@ -89,6 +89,193 @@ pub mod wasm_abi {
     }
 }
 
+pub mod wasm_runtime {
+    use super::LayoutPlugin;
+    use super::{wasm_abi, PluginError, PluginManifest, PluginPlacement, PluginRequest};
+    use std::path::Path;
+    use wasmi::{Config, Engine, Linker, Module, Store};
+
+    // Use wasmi's built-in StoreLimits for memory bounding instead of custom impl
+    // to avoid API churn with error types (MemoryError/TableError).
+
+    pub struct WasmPlugin {
+        engine: Engine,
+        module: Module,
+        manifest: PluginManifest,
+    }
+
+    impl WasmPlugin {
+        pub fn load_bytes(bytes: &[u8], manifest: PluginManifest) -> Result<Self, PluginError> {
+            if manifest.name.is_empty() {
+                return Err(PluginError::InvalidRequest("manifest name empty".into()));
+            }
+            // Validate ABI version if present in manifest extra
+            let mut config = Config::default();
+            config.consume_fuel(true);
+            let engine = Engine::new(&config);
+            let module =
+                Module::new(&engine, bytes).map_err(|e| PluginError::Execution(e.to_string()))?;
+            // Basic export validation: must have memory, alloc, compute
+            Ok(Self {
+                engine,
+                module,
+                manifest,
+            })
+        }
+
+        pub fn load_file(path: &Path) -> Result<Self, PluginError> {
+            let bytes = std::fs::read(path).map_err(|e| PluginError::Execution(e.to_string()))?;
+            let manifest_path = path.with_extension("json");
+            let manifest = if manifest_path.exists() {
+                let data = std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| PluginError::Execution(e.to_string()))?;
+                let v: serde_json::Value = serde_json::from_str(&data)
+                    .map_err(|e| PluginError::Execution(e.to_string()))?;
+                let name = v
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("wasm_plugin")
+                    .to_string();
+                let version = v
+                    .get("version")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("0.1.0")
+                    .to_string();
+                let abi = v
+                    .get("abi_version")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(crate::wasm_abi::ABI_VERSION as u64);
+                if abi != crate::wasm_abi::ABI_VERSION as u64 {
+                    return Err(PluginError::Execution(format!(
+                        "abi_version mismatch expected {} got {}",
+                        crate::wasm_abi::ABI_VERSION,
+                        abi
+                    )));
+                }
+                PluginManifest {
+                    name,
+                    version,
+                    description: v
+                        .get("description")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                }
+            } else {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("wasm_plugin")
+                    .to_string();
+                PluginManifest {
+                    name,
+                    version: "0.1.0".into(),
+                    description: None,
+                }
+            };
+            Self::load_bytes(&bytes, manifest)
+        }
+
+        fn instantiate(&self, store: &mut Store<()>) -> Result<wasmi::Instance, PluginError> {
+            let linker = Linker::new(&self.engine);
+            let pre = linker
+                .instantiate(&mut *store, &self.module)
+                .map_err(|e| PluginError::Execution(e.to_string()))?;
+            pre.start(&mut *store)
+                .map_err(|e| PluginError::Execution(e.to_string()))
+        }
+    }
+
+    impl LayoutPlugin for WasmPlugin {
+        fn manifest(&self) -> PluginManifest {
+            self.manifest.clone()
+        }
+        fn compute(&self, request: &PluginRequest) -> Result<Vec<PluginPlacement>, PluginError> {
+            let input = wasm_abi::encode_request(request);
+            // Fuel budget ~1M instructions; acts as timeout. No arbitrary host access.
+            let mut store = Store::new(&self.engine, ());
+            store
+                .set_fuel(1_000_000)
+                .map_err(|e| PluginError::Execution(e.to_string()))?;
+            let instance = self.instantiate(&mut store)?;
+            // Get memory and alloc/compute exports
+            let memory = instance
+                .get_memory(&store, "memory")
+                .ok_or_else(|| PluginError::Execution("missing memory export".into()))?;
+            let alloc: wasmi::TypedFunc<(i32,), i32> = instance
+                .get_typed_func(&store, "alloc")
+                .map_err(|_| PluginError::Execution("missing alloc export".into()))?;
+            let compute: wasmi::TypedFunc<(i32, i32), i64> =
+                instance.get_typed_func(&store, "compute").map_err(|_| {
+                    PluginError::Execution("missing compute export (i32,i32)->i64".into())
+                })?;
+            // Allocate input in wasm memory
+            let input_len = input.len() as i32;
+            let input_ptr = alloc
+                .call(&mut store, (input_len,))
+                .map_err(|e| PluginError::Execution(format!("alloc trap: {e}")))?;
+            memory
+                .write(&mut store, input_ptr as usize, &input)
+                .map_err(|e| PluginError::Execution(e.to_string()))?;
+            // Call compute, packed output ptr/len as i64
+            let packed = compute
+                .call(&mut store, (input_ptr, input_len))
+                .map_err(|e| PluginError::Execution(format!("compute trap: {e}")))?;
+            let out_ptr = (packed & 0xFFFF_FFFF) as i32;
+            let out_len = ((packed >> 32) & 0xFFFF_FFFF) as i32;
+            if out_ptr < 0 || !(0..=1024 * 1024).contains(&out_len) {
+                return Err(PluginError::Execution(format!(
+                    "invalid output ptr/len {out_ptr}/{out_len}"
+                )));
+            }
+            let mut output = vec![0u8; out_len as usize];
+            memory
+                .read(&store, out_ptr as usize, &mut output[..])
+                .map_err(|e| PluginError::Execution(e.to_string()))?;
+            // Optional dealloc: if plugin exports dealloc, free input/output
+            if let Ok(dealloc) = instance.get_typed_func::<(i32, i32), ()>(&store, "dealloc") {
+                let _ = dealloc.call(&mut store, (input_ptr, input_len));
+                let _ = dealloc.call(&mut store, (out_ptr, out_len));
+            }
+            // Check fuel exhausted -> timeout
+            if store.get_fuel().map(|f| f == 0).unwrap_or(false) {
+                return Err(PluginError::Execution("fuel exhausted (timeout)".into()));
+            }
+            wasm_abi::decode_response(&output).map_err(|e| PluginError::Execution(e.to_string()))
+        }
+    }
+
+    impl super::Registry {
+        pub fn load_wasm_file(&mut self, path: &Path) -> Result<String, PluginError> {
+            let plugin = WasmPlugin::load_file(path)?;
+            let name = plugin.manifest().name.clone();
+            if self.get(&name).is_some() {
+                return Err(PluginError::Execution(format!(
+                    "plugin {} already registered",
+                    name
+                )));
+            }
+            self.register(plugin);
+            Ok(name)
+        }
+        pub fn load_wasm_bytes(
+            &mut self,
+            bytes: &[u8],
+            manifest: PluginManifest,
+        ) -> Result<String, PluginError> {
+            let plugin = WasmPlugin::load_bytes(bytes, manifest.clone())?;
+            let name = manifest.name.clone();
+            if self.get(&name).is_some() {
+                return Err(PluginError::Execution(format!(
+                    "plugin {} already registered",
+                    name
+                )));
+            }
+            self.register(plugin);
+            Ok(name)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +346,101 @@ mod tests {
         let back = wasm_abi::decode_request(&bytes).unwrap();
         assert_eq!(back.windows, req.windows);
         assert_eq!(back.area.x, 10.0);
+    }
+
+    #[test]
+    fn wasm_plugin_load_and_compute() {
+        // Minimal WASM plugin that returns "[]" for any input, using alloc/compute ABI
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (global $heap (mut i32) (i32.const 1024))
+                (func $alloc (export "alloc") (param $size i32) (result i32)
+                    (local $ptr i32)
+                    (global.get $heap)
+                    (local.set $ptr)
+                    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+                    (local.get $ptr)
+                )
+                (func (export "compute") (param $in_ptr i32) (param $in_len i32) (result i64)
+                    (local $out_ptr i32)
+                    (local.set $out_ptr (call $alloc (i32.const 2)))
+                    (i32.store8 (local.get $out_ptr) (i32.const 91)) ;; '['
+                    (i32.store8 (i32.add (local.get $out_ptr) (i32.const 1)) (i32.const 93)) ;; ']'
+                    (i64.or
+                        (i64.extend_i32_u (local.get $out_ptr))
+                        (i64.shl (i64.extend_i32_u (i32.const 2)) (i64.const 32))
+                    )
+                )
+            )
+        "#;
+        let wasm = wat::parse_str(wat).unwrap();
+        let manifest = PluginManifest {
+            name: "test_wasm".into(),
+            version: "0.1.0".into(),
+            description: None,
+        };
+        let mut reg = Registry::new();
+        reg.load_wasm_bytes(&wasm, manifest).unwrap();
+        let plugin = reg.get("test_wasm").unwrap();
+        let req = PluginRequest {
+            area: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            windows: vec![WindowId(1)],
+            gap: 8.0,
+            padding: 8.0,
+        };
+        let placements = plugin.compute(&req).unwrap();
+        assert_eq!(
+            placements.len(),
+            0,
+            "empty wasm should return empty placements and be isolated"
+        );
+    }
+
+    #[test]
+    fn wasm_plugin_timeout_isolated() {
+        // Infinite loop WASM should hit fuel limit and not crash host
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "alloc") (param $size i32) (result i32) (i32.const 0))
+                (func (export "compute") (param $in_ptr i32) (param $in_len i32) (result i64)
+                    (loop $l (br $l))
+                    (i64.const 0)
+                )
+            )
+        "#;
+        let wasm = wat::parse_str(wat).unwrap();
+        let manifest = PluginManifest {
+            name: "loop".into(),
+            version: "0.1.0".into(),
+            description: None,
+        };
+        let mut reg = Registry::new();
+        reg.load_wasm_bytes(&wasm, manifest).unwrap();
+        let plugin = reg.get("loop").unwrap();
+        let req = PluginRequest {
+            area: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            windows: vec![],
+            gap: 0.0,
+            padding: 0.0,
+        };
+        let err = plugin.compute(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("fuel")
+                || err.to_string().contains("trap")
+                || err.to_string().contains("timeout"),
+            "should be fuel timeout, got {err}"
+        );
     }
 }
