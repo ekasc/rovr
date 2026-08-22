@@ -697,6 +697,13 @@ impl Daemon {
                     let engine_ms = t0.elapsed().as_millis() as u64;
                     return match result {
                         Ok(actions) => {
+                            // Record at dispatch so focus-recent and repeated
+                            // hotkeys see the new current space immediately.
+                            if let Some(Action::FocusSpace { space }) =
+                                actions.iter().find(|a| matches!(a, Action::FocusSpace { .. }))
+                            {
+                                self.note_space_switched_to(*space);
+                            }
                             let t1 = std::time::Instant::now();
                             let exec = execute_actions_result(&mut *self.platform, actions);
                             tracing::debug!(
@@ -768,7 +775,11 @@ impl Daemon {
             Command::Space(command) => {
                 if let SpaceCommand::FocusRecent = command {
                     return match self.focus_recent_space() {
-                        Some(result) => {
+                        Some((result, previous)) => {
+                            // Record the toggle NOW: the second press must see
+                            // this space as "previous" even if observation has
+                            // not caught up yet.
+                            self.note_space_switched_to(previous);
                             match self.execute_and_refresh(result) {
                                 Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
                                     .with_notifications(vec![Notification::StateChanged]),
@@ -782,12 +793,24 @@ impl Daemon {
                         ),
                     };
                 }
+                if let SpaceCommand::Focus { space } = command {
+                    // Deliberate focus: record at dispatch (see FocusRecent).
+                    self.note_space_switched_to(space);
+                    let result = self.engine.focus_space(space);
+                    match result {
+                        Ok(actions) => match self.execute_and_refresh(actions) {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                        },
+                        Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                    }
+                } else {
                 let result = match command {
-                    SpaceCommand::Focus { space } => self.engine.focus_space(space),
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                     SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
-                    SpaceCommand::FocusRecent => unreachable!("handled above"),
+                    SpaceCommand::FocusRecent | SpaceCommand::Focus { .. } => unreachable!("handled above"),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -796,6 +819,7 @@ impl Daemon {
                         Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                }
                 }
             }
             Command::Config(command) => match command {
@@ -909,6 +933,20 @@ impl Daemon {
         self.current_space_cell.get()
     }
 
+    /// Record a deliberate Space switch AT DISPATCH TIME. Observation-based
+    /// tracking (in `refresh_observation`) only catches up on a later tick;
+    /// without this, two quick `focus-recent` presses both read the same
+    /// stale "previous" and toggle stops being two-way.
+    fn note_space_switched_to(&self, new_current: SpaceId) {
+        if self.current_space_cell.get() == Some(new_current) {
+            return;
+        }
+        if let Some(old) = self.current_space_cell.get() {
+            self.previous_space.set(Some(old));
+        }
+        self.current_space_cell.set(Some(new_current));
+    }
+
     /// Resolve an optional Space id against the currently focused one.
     /// `Some(id)` passes through (caller validates existence downstream).
     fn resolve_space_or_focused(&self, space: Option<SpaceId>) -> Option<SpaceId> {
@@ -916,12 +954,15 @@ impl Daemon {
     }
 
     /// Actions to focus the previous space, if one is known and still exists.
-    fn focus_recent_space(&mut self) -> Option<Vec<Action>> {
+    /// Also returns the space being focused so the caller can record the
+    /// switch immediately (two-way toggle without waiting for observation).
+    fn focus_recent_space(&mut self) -> Option<(Vec<Action>, SpaceId)> {
         let previous = self.previous_space.get()?;
         if !self.engine.observed.spaces.contains_key(&previous) {
             return None;
         }
-        self.engine.focus_space(previous).ok()
+        let actions = self.engine.focus_space(previous).ok()?;
+        Some((actions, previous))
     }
 
     /// Result envelope for layout-tree mutations (swap/warp): they rewrite BSP
@@ -1266,7 +1307,46 @@ mod tests {
     /// from observation. Without a tracked previous Space it errors cleanly.
     #[test]
     fn space_focus_recent_swaps_to_previous_space() {
-        let mut daemon = test_daemon();
+        // The mock's verify snapshots must keep both spaces observable,
+        // otherwise execute_and_refresh clobbers observed state mid-test.
+        let platform = MockPlatform {
+            snapshot: PlatformSnapshot {
+                windows: vec![],
+                spaces: vec![
+                    rovr_types::SpaceSnapshot {
+                        id: SpaceId(3),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: true,
+                        generation: 1,
+                        position: 0,
+                    },
+                    rovr_types::SpaceSnapshot {
+                        id: SpaceId(7),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: false,
+                        generation: 1,
+                        position: 1,
+                    },
+                ],
+                displays: vec![],
+                complete: true,
+            },
+            executed: vec![],
+        };
+        let mut daemon = Daemon {
+            previous_space: std::cell::Cell::new(None),
+            current_space_cell: std::cell::Cell::new(None),
+            engine: Engine::new(Config::default()),
+            platform: Box::new(platform),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        };
+        // Mirror the mock snapshot into observed state (as warm-up would).
+        let snap = daemon.platform.snapshot().unwrap();
+        daemon.engine.apply_event(Event::Snapshot(snap));
         // No history yet: clean error, no actions executed.
         let result = daemon.handle(Request::new(1, Command::Space(SpaceCommand::FocusRecent)));
         assert!(matches!(
@@ -1274,27 +1354,25 @@ mod tests {
             ResponseOutcome::Error { .. }
         ));
 
-        // Simulate observation: Space 7 was current before Space 3, and
-        // Space 7 still exists in observed state.
         daemon.current_space_cell.set(Some(SpaceId(3)));
         daemon.previous_space.set(Some(SpaceId(7)));
-        daemon.engine.observed.spaces.insert(
-            SpaceId(7),
-            rovr_types::SpaceSnapshot {
-                id: SpaceId(7),
-                display_id: DisplayId(1),
-                label: None,
-                focused: false,
-                generation: 1,
-                position: 1,
-            },
-        );
 
         let result = daemon.handle(Request::new(2, Command::Space(SpaceCommand::FocusRecent)));
         assert!(matches!(
             result.response.outcome,
             ResponseOutcome::Ok { .. }
         ));
+
+        // Two-way WITHOUT any observation tick in between: the first press
+        // must have recorded Space 3 as previous, so the second press goes
+        // back to it. (Regression: stale tracking made the toggle one-way.)
+        let result = daemon.handle(Request::new(3, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+        assert_eq!(daemon.current_space(), Some(SpaceId(3)));
+        assert_eq!(daemon.previous_space.get(), Some(SpaceId(7)));
 
         // A tracked previous Space that no longer exists errors instead of
         // emitting an action against a ghost Space.
