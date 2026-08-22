@@ -15,7 +15,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rovr_config::Config;
-use rovr_core::{Action, Engine, Event};
+use rovr_core::{Action, Engine, EngineError, Event};
 #[cfg(target_os = "macos")]
 use rovr_platform::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -25,6 +25,7 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
+use rovr_types::SpaceId;
 
 mod hotkey;
 use serde_json::json;
@@ -48,6 +49,10 @@ struct Args {
 struct Envelope {
     request: Request,
     response: Sender<Response>,
+    /// Wall-clock instant the request was accepted off the socket — used to
+    /// measure state-loop queueing delay (head-of-line blocking behind
+    /// periodic observation work).
+    queued_at: std::time::Instant,
 }
 
 struct Daemon {
@@ -56,6 +61,11 @@ struct Daemon {
     config: Config,
     config_path: PathBuf,
     state_path: PathBuf,
+    /// The space that was current before the current one; updated whenever
+    /// observation sees a change. Backs `space focus-recent`.
+    previous_space: std::cell::Cell<Option<SpaceId>>,
+    /// The currently focused Space as of the last observation.
+    current_space_cell: std::cell::Cell<Option<SpaceId>>,
 }
 
 fn main() -> Result<()> {
@@ -71,7 +81,22 @@ fn main() -> Result<()> {
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
+    let event_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync> =
+        std::sync::Arc::new(|_window_id| {
+            if let Some(event_tx) = EVENT_TX.get() {
+                let (response, response_rx) = mpsc::channel();
+                let request = Request::new(0, Command::Refresh);
+                let _ = event_tx.try_send(Envelope {
+                    request,
+                    response,
+                    queued_at: std::time::Instant::now(),
+                });
+                drop(response_rx);
+            }
+        });
+    platform.set_event_watcher(event_watcher);
     let mut engine = Engine::new(config.clone());
+    engine.capabilities = platform.capabilities();
     if let Err(err) = engine.load_state(&state_path) {
         warn!(%err, "no persisted state (first run expected)");
     }
@@ -91,9 +116,11 @@ fn main() -> Result<()> {
         config,
         config_path,
         state_path,
+        previous_space: std::cell::Cell::new(None),
+        current_space_cell: std::cell::Cell::new(None),
     };
 
-    run_socket_server(socket_path, daemon)
+    run_daemon(socket_path, daemon)
 }
 
 #[cfg(target_os = "macos")]
@@ -106,7 +133,12 @@ fn make_platform() -> Result<Box<dyn Platform>> {
     Ok(Box::new(MockPlatform::default()))
 }
 
-fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
+/// Binds the IPC socket, then splits work across threads (blocker 6):
+/// - MAIN thread: creates the global hotkey manager (Carbon event target
+///   requires the main thread) and runs the AppKit event loop so hotkeys fire.
+/// - accept thread: UnixListener::incoming + per-client handler threads.
+/// - state thread: the single owner of engine/platform mutable state.
+fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(&path) {
         let ft = meta.file_type();
         if ft.is_symlink() {
@@ -131,36 +163,60 @@ fn run_socket_server(path: PathBuf, daemon: Daemon) -> Result<()> {
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!(socket = %path.display(), "rovr daemon listening");
 
-    // Built-in hotkey backend — separate from core policy, communicates only via public IPC.
-    // Keeps `GlobalHotKeyManager` alive for daemon lifetime; if no binds, this is a no-op.
-    let _hotkey_manager = hotkey::spawn_hotkey_listener(daemon.config.clone(), path.clone());
+    // Built-in hotkey manager MUST be created on the main thread. It is kept
+    // alive by the AppKit event loop below for the daemon's lifetime.
+    let hotkey_manager = hotkey::create_hotkey_manager(daemon.config.clone(), path.clone());
 
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
-    let (tx, rx) = mpsc::channel::<Envelope>();
+    // Bounded request queue: a flood of clients applies backpressure at the
+    // socket instead of growing memory without limit while the state loop is
+    // busy (256 in-flight requests is far beyond any real session).
+    let (tx, rx) = mpsc::sync_channel::<Envelope>(256);
+
+    // AX event trampolines push a Refresh envelope through this so the state
+    // loop wakes instantly instead of waiting for the next tick. try_send
+    // only: a full queue must never block the AppKit event loop.
+    let _ = EVENT_TX.set(tx.clone());
+
+    // State loop on its own thread (single owner of daemon state).
     let subs_for_loop = subscribers.clone();
     thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let tx = tx.clone();
-                let subs = subscribers.clone();
-                thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, tx, subs) {
-                        error!(%err, "IPC client failed");
-                    }
-                });
+    // Socket accept loop off the main thread.
+    let subs_for_accept = subscribers.clone();
+    let _accept_handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let tx = tx.clone();
+                    let subs = subs_for_accept.clone();
+                    thread::spawn(move || {
+                        if let Err(err) = handle_client(stream, tx, subs) {
+                            error!(%err, "IPC client failed");
+                        }
+                    });
+                }
+                Err(err) => error!(%err, "socket accept failed"),
             }
-            Err(err) => error!(%err, "socket accept failed"),
         }
-    }
+    });
 
+    // Main thread: pump the AppKit/CFRunLoop event loop forever so global
+    // hotkeys are delivered. Never returns while the daemon lives.
+    #[cfg(target_os = "macos")]
+    hotkey::run_appkit_event_loop(hotkey_manager);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = hotkey_manager;
+        let _ = _accept_handle.join();
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(())
 }
 
 fn handle_client(
     mut stream: UnixStream,
-    tx: Sender<Envelope>,
+    tx: SyncSender<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -250,6 +306,7 @@ fn handle_client(
     tx.send(Envelope {
         request,
         response: response_tx,
+        queued_at: std::time::Instant::now(),
     })?;
 
     let response = response_rx.recv()?;
@@ -265,20 +322,74 @@ fn state_loop(
     rx: Receiver<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) {
+    // Startup warm-up: run the first observation immediately instead of
+    // waiting for the first tick. This establishes the AX/SkyLight per-app
+    // connections while the daemon is idle, so the user's FIRST switch is as
+    // fast as every other one (cold-start stall regression).
+    let t_warm = std::time::Instant::now();
+    if daemon.refresh_observation() {
+        deliver_notification(&subscribers, &Notification::StateChanged);
+    }
+    tracing::debug!(
+        warmup_ms = t_warm.elapsed().as_millis() as u64,
+        "startup observation warm-up complete"
+    );
+    // Fixed cadence. Deliberately NOT adaptive: faster polling during
+    // activity hammers WindowServer with SLS/AX work exactly while the
+    // user is switching Spaces, which visibly stutters animations
+    // (regression verified live). Observation is serialized here instead.
+    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
+    // Absolute observation deadline. recv_timeout restarts after every
+    // request, so a steady request stream (rapid hotkeys) would otherwise
+    // postpone observation indefinitely and commands would resolve "the
+    // focused window" against stale state (wrong-window regression).
+    let mut last_observed_at = std::time::Instant::now();
     loop {
-        let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
         match rx.recv_timeout(interval) {
             Ok(envelope) => {
+                // Observe BEFORE handling so the request sees state no older
+                // than one interval, even mid-burst.
+                if last_observed_at.elapsed() >= interval {
+                    let t_obs = std::time::Instant::now();
+                    if daemon.refresh_observation() {
+                        deliver_notification(&subscribers, &Notification::StateChanged);
+                    }
+                    let obs_ms = t_obs.elapsed().as_millis() as u64;
+                    if obs_ms > 100 {
+                        tracing::info!(obs_ms, "slow periodic observation");
+                    }
+                    last_observed_at = std::time::Instant::now();
+                }
+                let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
+                if queue_wait_ms > 50 {
+                    tracing::info!(
+                        queue_wait_ms,
+                        id = envelope.request.id,
+                        "request waited on busy state loop"
+                    );
+                }
+                let t_handle = std::time::Instant::now();
                 let result = daemon.handle(envelope.request);
+                tracing::debug!(
+                    handle_ms = t_handle.elapsed().as_millis() as u64,
+                    queue_wait_ms,
+                    "envelope handled"
+                );
                 let _ = envelope.response.send(result.response);
                 for notif in &result.notifications {
                     deliver_notification(&subscribers, notif);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                let t_obs = std::time::Instant::now();
                 if daemon.refresh_observation() {
                     deliver_notification(&subscribers, &Notification::StateChanged);
                 }
+                let obs_ms = t_obs.elapsed().as_millis() as u64;
+                if obs_ms > 100 {
+                    tracing::info!(obs_ms, "slow periodic observation");
+                }
+                last_observed_at = std::time::Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -339,6 +450,24 @@ fn validate_request(request: &Request) -> Option<Response> {
     }
 }
 
+/// Whether this command may resolve a None window id as "the focused window".
+/// Those commands need observation to be current at resolution time (see the
+/// Command::Window arm in `handle`).
+fn window_command_defaults_to_focus(command: &WindowCommand) -> bool {
+    match command {
+        WindowCommand::FocusDirection { from, .. }
+        | WindowCommand::SetLayer { window: from, .. }
+        | WindowCommand::MoveToWorkspace { window: from, .. }
+        | WindowCommand::Close { window: from }
+        | WindowCommand::ToggleFullscreen { window: from }
+        | WindowCommand::ToggleFloat { window: from }
+        | WindowCommand::SwapDirection { window: from, .. }
+        | WindowCommand::WarpDirection { window: from, .. }
+        | WindowCommand::Resize { window: from, .. } => from.is_none(),
+        _ => false,
+    }
+}
+
 /// The result of handling one request: the one-shot Response plus any
 /// notifications describing state transitions that actually committed.
 struct HandleResult {
@@ -369,6 +498,17 @@ impl Daemon {
         let id = request.id;
         match request.command {
             Command::Ping => HandleResult::ok(id, json!({ "pong": true })),
+            Command::Refresh => {
+                // Internal wake from the AX event trampoline: run one
+                // observation pass immediately so newly created windows tile
+                // without waiting for the periodic tick.
+                let changed = self.refresh_observation();
+                let result = HandleResult::ok(id, json!({ "refreshed": changed }));
+                if changed {
+                    return result.with_notifications(vec![Notification::StateChanged]);
+                }
+                result
+            }
             Command::Doctor => {
                 #[cfg(target_os = "macos")]
                 let sa_diagnostics = {
@@ -389,12 +529,30 @@ impl Daemon {
                 };
                 #[cfg(not(target_os = "macos"))]
                 let sa_diagnostics = json!({ "available": false, "reason": "not_macos" });
+                // Automatic reinjection lifecycle (Dock change → one bounded
+                // privileged request per generation).
+                let sa_reinject = self.platform.sa_reinject_diagnostics();
+                #[cfg(not(target_os = "macos"))]
+                let sa_reinject = None;
+                let snapshot_wedged_ms = self.platform.snapshot_wedged_ms();
                 HandleResult::ok(
                 id,
                 json!({
                     "protocol": PROTOCOL_VERSION,
                     "capabilities": self.platform.capabilities(),
                     "sa": sa_diagnostics,
+                    "sa_reinject": sa_reinject.map(|d| json!({
+                        "phase": d.phase,
+                        "generation": d.generation,
+                        "dock_pid": d.dock_pid,
+                        "attempts_this_generation": d.attempts_this_generation,
+                        "retry_in_secs": d.retry_in_secs,
+                        "pending": d.pending,
+                        "last_result": d.last_result,
+                        "last_error": d.last_error,
+                        "helper_socket": d.helper_socket,
+                    })),
+                    "snapshot_wedged_ms": snapshot_wedged_ms,
                     "generation": self.engine.observed.generation,
                     "refresh_required": self.engine.observed.refresh_required,
                     "windows": self.engine.observed.windows.len(),
@@ -455,44 +613,35 @@ impl Daemon {
                 }
             },
             Command::Window(command) => {
-                match command {
+                // Focus-defaulting commands resolve "the focused window"
+                // against observed state. Observe NOW, at resolution time:
+                // the previous command's post-action verification snapshot can
+                // predate macOS finishing its focus transition, so the next
+                // bind in a quick sequence would otherwise target the stale
+                // focus and move the WRONG window (regression verified live).
+                // Explicit-id commands need no observation.
+                if window_command_defaults_to_focus(&command) {
+                    self.refresh_observation();
+                }
+                // Layout-mutating ops (swap/warp) change BSP structure without
+                // producing actions; they need snapshot → reconcile → verify.
+                let layout_change = match command {
                     WindowCommand::Swap { a, b } => {
-                        return match self.engine.swap_windows(a, b) {
-                            Ok(()) => {
-                                self.persist_state();
-                                match self.platform.snapshot() {
-                                    Ok(snap) => {
-                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
-                                        match self.execute_and_refresh(actions) {
-                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
-                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
-                                        }
-                                    }
-                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
-                                }
-                            }
-                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
-                        };
+                        Some(self.engine.swap_windows(a, b))
                     }
                     WindowCommand::Warp { window, target } => {
-                        return match self.engine.warp_window(window, target) {
-                            Ok(()) => {
-                                self.persist_state();
-                                match self.platform.snapshot() {
-                                    Ok(snap) => {
-                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
-                                        match self.execute_and_refresh(actions) {
-                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
-                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
-                                        }
-                                    }
-                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
-                                }
-                            }
-                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
-                        };
+                        Some(self.engine.warp_window(window, target))
                     }
-                    _ => {}
+                    WindowCommand::SwapDirection { direction, window } => {
+                        Some(self.engine.swap_windows_direction(direction, window))
+                    }
+                    WindowCommand::WarpDirection { direction, window } => {
+                        Some(self.engine.warp_window_direction(direction, window))
+                    }
+                    _ => None,
+                };
+                if let Some(result) = layout_change {
+                    return self.layout_change_result(id, result);
                 }
                 let result = match command {
                     WindowCommand::Focus { window } => self.engine.focus_window(window),
@@ -523,7 +672,22 @@ impl Daemon {
                         duration_ms,
                     } => self.engine.set_window_opacity(window, opacity, duration_ms),
                     WindowCommand::Pip { window } => self.engine.toggle_window_pip(window),
-                    WindowCommand::Swap { .. } | WindowCommand::Warp { .. } => unreachable!(),
+                    WindowCommand::Close { window } => self.engine.close_window(window),
+                    WindowCommand::ToggleFullscreen { window } => {
+                        self.engine.toggle_fullscreen(window)
+                    }
+                    WindowCommand::ToggleFloat { window } => {
+                        self.engine.toggle_float(window).map(|()| vec![])
+                    }
+                    WindowCommand::Resize {
+                        window,
+                        edge,
+                        delta,
+                    } => self.engine.resize_window_edge(window, edge, delta),
+                    WindowCommand::Swap { .. }
+                    | WindowCommand::Warp { .. }
+                    | WindowCommand::SwapDirection { .. }
+                    | WindowCommand::WarpDirection { .. } => unreachable!(),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -535,20 +699,34 @@ impl Daemon {
                 }
             }
             Command::Layout(command) => {
+                // All layout commands default to the focused Space when no
+                // explicit id is given.
                 let space = match command {
                     LayoutCommand::Rotate { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.rotate_layout(space);
                         space
                     }
                     LayoutCommand::Mirror { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.mirror_layout(space);
                         space
                     }
                     LayoutCommand::Balance { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.balance_layout(space);
                         space
                     }
                     LayoutCommand::SetRatio { space, ratio } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         let res = self.engine.set_split_ratio(space, ratio);
                         if let Err(e) = res {
                             return HandleResult::err(id, "ENGINE_ERROR", e.to_string());
@@ -585,8 +763,46 @@ impl Daemon {
                 }
             }
             Command::Workspace(command) => {
+                // Focus-only fast path: focusing a Space mutates no window
+                // geometry, so the synchronous verify snapshot (plus its
+                // followup reconcile snapshot) only adds ~200 ms of latency
+                // to rapid switching. The periodic state loop observes the
+                // focus within one reconcile interval anyway.
+                if let WorkspaceCommand::Focus { name } = &command {
+                    let t0 = std::time::Instant::now();
+                    let result = self.engine.focus_workspace(name);
+                    let engine_ms = t0.elapsed().as_millis() as u64;
+                    return match result {
+                        Ok(actions) => {
+                            // Record at dispatch so focus-recent and repeated
+                            // hotkeys see the new current space immediately.
+                            if let Some(Action::FocusSpace { space }) =
+                                actions.iter().find(|a| matches!(a, Action::FocusSpace { .. }))
+                            {
+                                self.note_space_switched_to(*space);
+                            }
+                            let t1 = std::time::Instant::now();
+                            let exec = execute_actions_result(&mut *self.platform, actions);
+                            tracing::debug!(
+                                workspace = %name,
+                                engine_ms,
+                                execute_ms = t1.elapsed().as_millis() as u64,
+                                total_ms = t0.elapsed().as_millis() as u64,
+                                "workspace focus timing"
+                            );
+                            match exec {
+                                Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => {
+                                    HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                }
+                            }
+                        }
+                        Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                    };
+                }
                 let result = match command {
-                    WorkspaceCommand::Focus { name } => self.engine.focus_workspace(&name),
+                    WorkspaceCommand::Focus { .. } => unreachable!("handled above"),
                     WorkspaceCommand::MoveWindow { window, workspace } => {
                         self.engine.move_window_to_workspace(window, &workspace)
                     }
@@ -634,11 +850,69 @@ impl Daemon {
                 }
             }
             Command::Space(command) => {
+                if let SpaceCommand::FocusRecent = command {
+                    return match self.focus_recent_space() {
+                        Some((result, previous)) => {
+                            // Record the toggle NOW: the second press must see
+                            // this space as "previous" even if observation has
+                            // not caught up yet.
+                            self.note_space_switched_to(previous);
+                            match self.execute_and_refresh(result) {
+                                Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                            }
+                        }
+                        None => HandleResult::err(
+                            id,
+                            "ENGINE_ERROR",
+                            "no previous space to focus (need at least one observed switch)",
+                        ),
+                    };
+                }
+                if let SpaceCommand::Focus { space } = command {
+                    // Deliberate focus: record at dispatch (see FocusRecent).
+                    self.note_space_switched_to(space);
+                    let result = self.engine.focus_space(space);
+                    match result {
+                        Ok(actions) => match self.execute_and_refresh(actions) {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                        },
+                        Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                    }
+                } else {
+                if let SpaceCommand::ToggleInsets = command {
+                    // Session-scoped collapse of gap+padding; the next layout
+                    // pass re-frames every tiled window with the new insets.
+                    self.engine.insets_off = !self.engine.insets_off;
+                    return match self
+                        .platform
+                        .snapshot()
+                        .map_err(|err| (id, err.to_string()))
+                    {
+                        Ok(snap) => {
+                            let actions = self.engine.apply_event(Event::Snapshot(snap));
+                            match self.execute_and_refresh(actions) {
+                                Ok(()) => HandleResult::ok(
+                                    id,
+                                    json!({ "accepted": true, "insets_off": self.engine.insets_off }),
+                                )
+                                .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => {
+                                    HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                }
+                            }
+                        }
+                        Err((id, msg)) => HandleResult::err(id, "SNAPSHOT_ERROR", msg),
+                    };
+                }
                 let result = match command {
-                    SpaceCommand::Focus { space } => self.engine.focus_space(space),
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                     SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
+                    SpaceCommand::ToggleInsets | SpaceCommand::Focus { .. } | SpaceCommand::FocusRecent => unreachable!("handled above"),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -647,6 +921,7 @@ impl Daemon {
                         Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                     },
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                }
                 }
             }
             Command::Config(command) => match command {
@@ -709,17 +984,22 @@ impl Daemon {
             changed = true;
         }
 
+        // Deliberately SYNCHRONOUS and serialized with actions: observation
+        // must never overlap Mission Control animations or SLS mutations —
+        // concurrent enumeration during a Space switch makes animations
+        // visibly stutter (regression verified live). Snapshots are cheap
+        // since per-app AX caching landed, so head-of-line blocking here is
+        // bounded by one cheap cycle rather than reintroduced.
         match self.platform.snapshot() {
             Ok(snapshot) => {
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                 if !actions.is_empty() {
-                    changed = true;
-                }
-                if let Err(err) = execute_actions_result(&mut *self.platform, actions) {
-                    self.engine
-                        .flight_recorder
-                        .record("platform.error", err.to_string());
-                    warn!(%err, "periodic reconciliation failed");
+                    execute_actions_result(&mut *self.platform, actions).unwrap_or_else(|err| {
+                        self.engine
+                            .flight_recorder
+                            .record("platform.error", err.to_string());
+                        warn!(%err, "periodic reconciliation failed");
+                    });
                     changed = true;
                 }
             }
@@ -730,7 +1010,85 @@ impl Daemon {
                 warn!(%err, "periodic snapshot failed");
             }
         }
+        // Track the previous Space for `space focus-recent`: whenever
+        // observation sees the current Space change, the old one becomes
+        // "previous". Focused-space lookup mirrors QueryCommand::Current.
+        let current_space = self
+            .engine
+            .observed
+            .spaces
+            .values()
+            .find(|s| s.focused)
+            .map(|s| s.id);
+        if let (Some(prev_current), Some(new_current)) = (self.current_space(), current_space) {
+            if new_current != prev_current {
+                self.previous_space.set(Some(prev_current));
+            }
+        }
+        if let Some(cs) = current_space {
+            self.current_space_cell.set(Some(cs));
+        }
         changed
+    }
+
+    fn current_space(&self) -> Option<SpaceId> {
+        self.current_space_cell.get()
+    }
+
+    /// Record a deliberate Space switch AT DISPATCH TIME. Observation-based
+    /// tracking (in `refresh_observation`) only catches up on a later tick;
+    /// without this, two quick `focus-recent` presses both read the same
+    /// stale "previous" and toggle stops being two-way.
+    fn note_space_switched_to(&self, new_current: SpaceId) {
+        if self.current_space_cell.get() == Some(new_current) {
+            return;
+        }
+        if let Some(old) = self.current_space_cell.get() {
+            self.previous_space.set(Some(old));
+        }
+        self.current_space_cell.set(Some(new_current));
+    }
+
+    /// Resolve an optional Space id against the currently focused one.
+    /// `Some(id)` passes through (caller validates existence downstream).
+    fn resolve_space_or_focused(&self, space: Option<SpaceId>) -> Option<SpaceId> {
+        space.or_else(|| self.current_space())
+    }
+
+    /// Actions to focus the previous space, if one is known and still exists.
+    /// Also returns the space being focused so the caller can record the
+    /// switch immediately (two-way toggle without waiting for observation).
+    fn focus_recent_space(&mut self) -> Option<(Vec<Action>, SpaceId)> {
+        let previous = self.previous_space.get()?;
+        if !self.engine.observed.spaces.contains_key(&previous) {
+            return None;
+        }
+        let actions = self.engine.focus_space(previous).ok()?;
+        Some((actions, previous))
+    }
+
+    /// Result envelope for layout-tree mutations (swap/warp): they rewrite BSP
+    /// structure directly, so the flow is persist → snapshot → reconcile →
+    /// verify. Shared by the explicit-id and directional variants.
+    fn layout_change_result(&mut self, id: u64, result: Result<(), EngineError>) -> HandleResult {
+        match result {
+            Ok(()) => {
+                self.persist_state();
+                match self.platform.snapshot() {
+                    Ok(snap) => {
+                        let actions = self.engine.apply_event(Event::Snapshot(snap));
+                        match self.execute_and_refresh(actions) {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                .with_notifications(vec![Notification::StateChanged]),
+                        }
+                    }
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                }
+            }
+            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+        }
     }
 
     fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
@@ -776,9 +1134,14 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
     }
 }
 
+/// Handle for AX-event trampolines to wake the state loop immediately.
+/// Set once in run_daemon before any thread that could trigger events.
+static EVENT_TX: std::sync::OnceLock<mpsc::SyncSender<Envelope>> = std::sync::OnceLock::new();
+
 fn default_socket_path() -> PathBuf {
-    let uid = std::env::var("UID").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/rovr-{uid}.sock"))
+    // Keyed on the REAL uid (getuid), never $UID: a daemon started from one
+    // environment and a CLI spawned by skhd/launchd from another must agree.
+    PathBuf::from(format!("/tmp/rovr-{}.sock", rovr_platform::unix_uid()))
 }
 
 fn default_config_path() -> PathBuf {
@@ -915,6 +1278,8 @@ mod tests {
 
     fn test_daemon() -> Daemon {
         Daemon {
+            previous_space: std::cell::Cell::new(None),
+            current_space_cell: std::cell::Cell::new(None),
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -943,9 +1308,9 @@ mod tests {
                 space_id: Some(SpaceId(1)),
                 display_id: Some(DisplayId(1)),
                 focused: true,
-                minimized: false,
-                fullscreen: false,
-                managed: true,
+                minimized: rovr_types::ObservedBool::No,
+                fullscreen: rovr_types::ObservedBool::No,
+                managed: rovr_types::ObservedBool::Yes,
                 generation: 1,
             }],
             spaces: vec![SpaceSnapshot {
@@ -1027,6 +1392,102 @@ mod tests {
             result.notifications.is_empty(),
             "failed command must not emit StateChanged"
         );
+    }
+
+    /// Doctor exposes the automatic SA reinjection lifecycle under
+    /// `result.sa_reinject`, even when the platform reports none (null).
+    #[test]
+    fn sa_doctor_exposes_reinject_lifecycle() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(6, Command::Doctor));
+        let value = serde_json::to_value(&result.response).expect("serialize doctor response");
+        assert!(
+            value
+                .get("result")
+                .is_some_and(|r| r.get("sa_reinject").is_some()),
+            "doctor must include the sa_reinject lifecycle section: {value}"
+        );
+    }
+
+    /// `space focus-recent` focuses the previously current Space, tracked
+    /// from observation. Without a tracked previous Space it errors cleanly.
+    #[test]
+    fn space_focus_recent_swaps_to_previous_space() {
+        // The mock's verify snapshots must keep both spaces observable,
+        // otherwise execute_and_refresh clobbers observed state mid-test.
+        let platform = MockPlatform {
+            snapshot: PlatformSnapshot {
+                windows: vec![],
+                spaces: vec![
+                    rovr_types::SpaceSnapshot {
+                        id: SpaceId(3),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: true,
+                        generation: 1,
+                        position: 0,
+                    },
+                    rovr_types::SpaceSnapshot {
+                        id: SpaceId(7),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: false,
+                        generation: 1,
+                        position: 1,
+                    },
+                ],
+                displays: vec![],
+                complete: true,
+            },
+            executed: vec![],
+        };
+        let mut daemon = Daemon {
+            previous_space: std::cell::Cell::new(None),
+            current_space_cell: std::cell::Cell::new(None),
+            engine: Engine::new(Config::default()),
+            platform: Box::new(platform),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        };
+        // Mirror the mock snapshot into observed state (as warm-up would).
+        let snap = daemon.platform.snapshot().unwrap();
+        daemon.engine.apply_event(Event::Snapshot(snap));
+        // No history yet: clean error, no actions executed.
+        let result = daemon.handle(Request::new(1, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
+
+        daemon.current_space_cell.set(Some(SpaceId(3)));
+        daemon.previous_space.set(Some(SpaceId(7)));
+
+        let result = daemon.handle(Request::new(2, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+
+        // Two-way WITHOUT any observation tick in between: the first press
+        // must have recorded Space 3 as previous, so the second press goes
+        // back to it. (Regression: stale tracking made the toggle one-way.)
+        let result = daemon.handle(Request::new(3, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+        assert_eq!(daemon.current_space(), Some(SpaceId(3)));
+        assert_eq!(daemon.previous_space.get(), Some(SpaceId(7)));
+
+        // A tracked previous Space that no longer exists errors instead of
+        // emitting an action against a ghost Space.
+        daemon.previous_space.set(Some(SpaceId(999)));
+        let result = daemon.handle(Request::new(3, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
     }
 
     /// M4b: a successful Window mutation emits StateChanged so subscribers learn

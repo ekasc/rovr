@@ -1,10 +1,24 @@
+//! Built-in global hotkey backend (macOS).
+//!
+//! Architecture (blocker 6): the macOS global-hotkey backend installs a
+//! Carbon event handler on `GetApplicationEventTarget()` and a CGEvent tap on
+//! the MAIN run loop. Both are only serviced while the main thread runs an
+//! AppKit/CFRunLoop event loop — so the daemon's MAIN thread runs that event
+//! loop (`run_appkit_event_loop`), while socket accept and state processing
+//! run on worker threads. The manager is created on the main thread.
+//!
+//! This component contains no window-management policy: it parses key strings,
+//! maps them to commands via the ONE shared parser
+//! (`rovr_protocol::command_parser`), and dispatches them over public IPC to
+//! the daemon's own socket. An invalid command is logged and executes NOTHING
+//! (blocker 8) — it is never substituted with another command; invalid binds
+//! are already rejected at config load/reload time.
 #![allow(clippy::question_mark)]
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use rovr_config::Config;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(target_os = "macos")]
 use {
@@ -12,16 +26,17 @@ use {
         hotkey::{Code, HotKey, Modifiers},
         GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     },
-    rovr_protocol::{Command, Request},
+    rovr_protocol::{command_parser::parse_command, Request},
     std::io::Write,
     std::os::unix::net::UnixStream,
 };
 
-/// Spawn optional built-in hotkey listener. Returns manager handle to keep alive.
-/// If no binds or on non-macOS, returns None and does nothing (skhd remains the supported path).
+/// Create and register the global hotkey manager. MUST be called on the main
+/// thread (Carbon event target + main-run-loop event tap). Returns the manager
+/// which the caller must keep alive for the daemon's lifetime. If no binds or
+/// on non-macOS, returns None and does nothing (skhd remains supported).
 #[cfg(target_os = "macos")]
-#[allow(clippy::question_mark)]
-pub fn spawn_hotkey_listener(config: Config, socket_path: PathBuf) -> Option<GlobalHotKeyManager> {
+pub fn create_hotkey_manager(config: Config, socket_path: PathBuf) -> Option<GlobalHotKeyManager> {
     if config.binds.is_empty() {
         info!("hotkey: no [[bind]] entries, built-in hotkey disabled");
         return None;
@@ -33,7 +48,8 @@ pub fn spawn_hotkey_listener(config: Config, socket_path: PathBuf) -> Option<Glo
             return None;
         }
     };
-    let mut id_to_command: HashMap<u32, String> = HashMap::new();
+    let mut id_to_command: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
     for bind in &config.binds {
         match parse_skhd_hotkey(&bind.key) {
             Some(hotkey) => {
@@ -60,8 +76,18 @@ pub fn spawn_hotkey_listener(config: Config, socket_path: PathBuf) -> Option<Glo
             if event.state == HotKeyState::Pressed {
                 if let Some(cmd_str) = id_to_command.get(&event.id) {
                     info!(id=event.id, cmd=%cmd_str, "hotkey: triggered");
-                    if let Err(e) = dispatch_via_ipc(&socket, cmd_str) {
-                        warn!(%e, cmd=%cmd_str, "hotkey: dispatch failed");
+                    // Blocker 7+8: parse with the ONE shared parser. An
+                    // invalid command logs an error and executes NOTHING —
+                    // never a substitute command like Ping.
+                    match parse_command(cmd_str) {
+                        Ok(command) => {
+                            if let Err(e) = dispatch_via_ipc(&socket, command) {
+                                warn!(%e, cmd=%cmd_str, "hotkey: dispatch failed");
+                            }
+                        }
+                        Err(parse_err) => {
+                            error!(cmd=%cmd_str, reason=%parse_err, "hotkey: invalid bind command — executing nothing");
+                        }
                     }
                 }
             }
@@ -71,117 +97,44 @@ pub fn spawn_hotkey_listener(config: Config, socket_path: PathBuf) -> Option<Glo
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn spawn_hotkey_listener(_config: Config, _socket_path: PathBuf) -> Option<()> {
+pub fn create_hotkey_manager(_config: Config, _socket_path: PathBuf) -> Option<()> {
     None
 }
 
+/// Run the AppKit application event loop on the MAIN thread. This pumps the
+/// Carbon/CGEventTap machinery global-hotkey installed, so registered hotkeys
+/// actually fire. Never returns under normal operation.
 #[cfg(target_os = "macos")]
-fn dispatch_via_ipc(socket_path: &PathBuf, command_str: &str) -> Result<()> {
-    // Parse `command_str` like "window --focus 1" or "workspace focus code"
-    // by feeding it through the CLI's clap parser in-process would require
-    // linking rovr-cli. Instead we do minimal string→Command mapping here.
-    // Supported: window/space/layout/scratchpad/workspace/query/ping/doctor.
-    // Fallback: try to connect and send raw, daemon will return BAD_REQUEST if unknown.
-    let cmd = parse_bind_command(command_str).unwrap_or_else(|| {
-        warn!(cmd=%command_str, "hotkey: unknown command syntax, sending as ping");
-        // Use Ping as fallback so we at least exercise IPC
-        rovr_protocol::Command::Ping
-    });
-    let req = Request::new(1, cmd);
-    let mut stream = UnixStream::connect(socket_path)?;
-    serde_json::to_writer(&mut stream, &req)?;
-    stream.write_all(b"\n")?;
-    Ok(())
+pub fn run_appkit_event_loop(manager: Option<GlobalHotKeyManager>) -> ! {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    // Keep the manager alive for the lifetime of the daemon; dropping it
+    // unregisters the hotkeys.
+    let _manager = manager;
+    let mtm =
+        MainThreadMarker::new().expect("run_appkit_event_loop must be called on the main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    info!("main: running AppKit event loop for global hotkeys");
+    app.run();
+    unreachable!("NSApplication::run returned");
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_appkit_event_loop(_manager: Option<()>) -> ! {
+    unreachable!("non-macOS builds never run the AppKit loop")
 }
 
 #[cfg(target_os = "macos")]
-fn parse_bind_command(s: &str) -> Option<Command> {
-    // Very small hand-rolled parser for hotkey binds. We accept the same
-    // strings as `rovr config gen-skhd` emits: "window --focus 1", "layout --rotate 1", etc.
-    // For full fidelity we delegate to `clap` by constructing a fake `rovr` CLI invocation.
-    // To avoid depending on rovr-cli crate, we parse manually for common cases.
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
-    }
-    // Use rovr-cli's Cli parsing if available via feature - for now manual:
-    match parts[0] {
-        "window" if parts.len() >= 3 && parts[1] == "--focus" => {
-            let id = parts[2].parse::<u32>().ok()?;
-            Some(Command::Window(rovr_protocol::WindowCommand::Focus {
-                window: rovr_types::WindowId(id),
-            }))
-        }
-        "window" if parts.len() >= 5 && parts[1] == "--focus-direction" => {
-            // e.g. window --focus-direction --from 1 --direction east
-            // Minimal: find --from and --direction
-            let from = parts
-                .iter()
-                .position(|&p| p == "--from")
-                .and_then(|i| parts.get(i + 1))?
-                .parse::<u32>()
-                .ok()?;
-            let dir = parts
-                .iter()
-                .position(|&p| p == "--direction")
-                .and_then(|i| parts.get(i + 1))?;
-            let direction = match *dir {
-                "north" => rovr_types::Direction::North,
-                "south" => rovr_types::Direction::South,
-                "east" => rovr_types::Direction::East,
-                "west" => rovr_types::Direction::West,
-                _ => return None,
-            };
-            Some(Command::Window(
-                rovr_protocol::WindowCommand::FocusDirection {
-                    from: rovr_types::WindowId(from),
-                    direction,
-                },
-            ))
-        }
-        "window" if parts.len() >= 4 && parts[1] == "move-to-workspace" => {
-            let win = parts[2].parse::<u32>().ok()?;
-            let ws = parts[3].to_string();
-            Some(Command::Window(
-                rovr_protocol::WindowCommand::MoveToWorkspace {
-                    window: rovr_types::WindowId(win),
-                    workspace: ws,
-                },
-            ))
-        }
-        "workspace" if parts.len() >= 3 && parts[1] == "focus" => {
-            Some(Command::Workspace(rovr_protocol::WorkspaceCommand::Focus {
-                name: parts[2].to_string(),
-            }))
-        }
-        "workspace" if parts.len() >= 4 && parts[1] == "move-window" => {
-            let win = parts[2].parse::<u32>().ok()?;
-            let ws = parts[3].to_string();
-            Some(Command::Workspace(
-                rovr_protocol::WorkspaceCommand::MoveWindow {
-                    window: rovr_types::WindowId(win),
-                    workspace: ws,
-                },
-            ))
-        }
-        "scratchpad" if parts.len() >= 3 && parts[1] == "toggle" => Some(Command::Scratchpad(
-            rovr_protocol::ScratchpadCommand::Toggle {
-                name: parts[2].to_string(),
-            },
-        )),
-        "layout" if parts.len() >= 3 && parts[1] == "--rotate" => {
-            let sid = parts[2].parse::<u64>().ok()?;
-            Some(Command::Layout(rovr_protocol::LayoutCommand::Rotate {
-                space: rovr_types::SpaceId(sid),
-            }))
-        }
-        "query" if parts.len() >= 2 && parts[1] == "--windows" => {
-            Some(Command::Query(rovr_protocol::QueryCommand::Windows))
-        }
-        "ping" => Some(Command::Ping),
-        "doctor" => Some(Command::Doctor),
-        _ => None,
-    }
+fn dispatch_via_ipc(socket_path: &PathBuf, command: rovr_protocol::Command) -> Result<()> {
+    let req = Request::new(1, command);
+    let mut stream = UnixStream::connect(socket_path)?;
+    serde_json::to_writer(&mut stream, &req)?;
+    stream.write_all(b"\n")?;
+    // Read the response (content ignored): without this the daemon's reply
+    // write hits a half-closed socket and logs spurious "IPC client failed"
+    // noise on every hotkey press.
+    let _ = std::io::Read::read_to_end(&mut stream, &mut Vec::new());
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -278,10 +231,4 @@ fn parse_code(s: &str) -> Option<Code> {
         "f12" => Some(Code::F12),
         _ => None,
     }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn hotkey_id_for_test(key: &str) -> Option<u32> {
-    parse_skhd_hotkey(key).map(|h| h.id())
 }

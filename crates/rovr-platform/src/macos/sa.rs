@@ -37,6 +37,9 @@ pub const SA_SOCKET_PATH_FMT: &str = "/tmp/rovr-sa_{}.sock";
 pub const ROVR_SA_VERSION_PREFIX: &str = "rovr-sa-1.";
 const SA_SOCKET_BUFF_LEN: usize = 0x1000;
 const SA_DEADLINE: Duration = Duration::from_secs(2);
+/// Deadline for PERIODIC health probes: a wedged payload must never hold the
+/// state loop longer than this. Operational paths keep the full SA_DEADLINE.
+const SA_PROBE_DEADLINE: Duration = Duration::from_millis(250);
 
 const SA_OPCODE_HANDSHAKE: u8 = 0x01;
 const SA_OPCODE_SPACE_FOCUS: u8 = 0x02;
@@ -53,6 +56,21 @@ const SA_OPCODE_WINDOW_SCALE: u8 = 0x0D;
 pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
 pub const OSAX_ATTRIB_MOV_SPACE: u32 = 0x10;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn libc_getuid() -> u32 {
+    getuid()
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn libc_getuid() -> u32 {
+    0
+}
 
 #[derive(Debug, Error)]
 pub enum SaError {
@@ -92,15 +110,11 @@ impl SaClient {
     }
 
     pub fn default_socket_path() -> PathBuf {
-        // Prefer UID (stable, matches daemon's launchd env) over $USER.
-        let uid = std::env::var("UID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                // Fallback: derive from $USER when UID unset (e.g. tests / non-login shells).
-                std::env::var("USER").unwrap_or_else(|_| "unknown".into())
-            });
-        Self::socket_path_for_uid(&uid)
+        // The payload keys its socket on getuid(); the client must use the
+        // SAME value. ($USER is not consulted: macOS does not set a UID env
+        // var, so a username fallback would never match the payload.)
+        let uid = unsafe { libc_getuid() };
+        Self::socket_path_for_uid(&uid.to_string())
     }
 
     pub fn new() -> Self {
@@ -121,8 +135,23 @@ impl SaClient {
     /// means SA capabilities are unavailable; the caller decides whether to
     /// fall back to non-SA paths.
     pub fn probe(&self) -> Option<SaInfo> {
-        let mut stream = self.connect().ok()?;
-        stream.write_all(&[0x01, 0x00, SA_OPCODE_HANDSHAKE]).ok()?;
+        self.probe_with_deadline(SA_DEADLINE)
+    }
+
+    /// Short-deadline probe for PERIODIC health checks: a wedged payload must
+    /// never hold a caller longer than this. Operational paths (install,
+    /// explicit status) keep the full `SA_DEADLINE` via `probe`.
+    pub fn probe_health(&self) -> Option<SaInfo> {
+        self.probe_with_deadline(SA_PROBE_DEADLINE)
+    }
+
+    /// Probe with an explicit I/O deadline. Operational paths (install,
+    /// explicit status) use the full `SA_DEADLINE`; the periodic health check
+    /// uses the short one so a hung payload cannot monopolize the state loop.
+    pub fn probe_with_deadline(&self, deadline: Duration) -> Option<SaInfo> {
+        let mut stream = self.connect_with_deadline(deadline).ok()?;
+        // Frame: len = 3 + payload_len (payload empty for handshake).
+        stream.write_all(&[0x03, 0x00, SA_OPCODE_HANDSHAKE]).ok()?;
 
         let mut buffer = [0u8; SA_SOCKET_BUFF_LEN];
         let mut length = 0usize;
@@ -164,18 +193,25 @@ impl SaClient {
     }
 
     fn connect(&self) -> Result<UnixStream, SaError> {
+        self.connect_with_deadline(SA_DEADLINE)
+    }
+
+    fn connect_with_deadline(&self, deadline: Duration) -> Result<UnixStream, SaError> {
         let stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             SaError::Unavailable(format!("{}: {err}", self.socket_path.display()))
         })?;
         stream
-            .set_read_timeout(Some(SA_DEADLINE))
-            .and_then(|()| stream.set_write_timeout(Some(SA_DEADLINE)))
+            .set_read_timeout(Some(deadline))
+            .and_then(|()| stream.set_write_timeout(Some(deadline)))
             .map_err(|err| SaError::Operation(format!("set timeout: {err}")))?;
         Ok(stream)
     }
 
     fn send_op(&self, opcode: u8, payload: &[u8]) -> Result<(), SaError> {
-        let length = (1 + payload.len()) as i16;
+        // Framing matches the payload's reader (and upstream's): `len` counts
+        // 2 bytes of length field + 1 opcode byte + payload; the reader
+        // consumes `len - 2` bytes after the prefix.
+        let length = (3 + payload.len()) as i16;
         let mut bytes = Vec::with_capacity(2 + 1 + payload.len());
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.push(opcode);

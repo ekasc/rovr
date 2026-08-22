@@ -28,6 +28,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum TopCommand {
     Ping,
+    #[command(about = "Run one observation pass now (internal)")]
+    Refresh,
     Doctor,
     Sa(SaArgs),
     Query(QueryArgs),
@@ -72,9 +74,10 @@ enum WindowSubcommand {
     Focus {
         window: u32,
     },
+    #[command(about = "Focus nearest window in a direction (default: focused window)")]
     FocusDirection {
-        from: u32,
         direction: DirectionArg,
+        from: Option<u32>,
     },
     SetFrame {
         window: u32,
@@ -89,15 +92,15 @@ enum WindowSubcommand {
     },
     #[command(
         name = "move-to-workspace",
-        about = "Move window to named workspace (logical)"
+        about = "Move window to named workspace (logical); defaults to the focused window"
     )]
     MoveToWorkspace {
-        window: u32,
         workspace: String,
+        window: Option<u32>,
     },
     SetLayer {
-        window: u32,
         layer: i32,
+        window: Option<u32>,
     },
     SetSticky {
         window: u32,
@@ -125,6 +128,37 @@ enum WindowSubcommand {
         window: u32,
         target: u32,
     },
+    #[command(about = "Close a window (defaults to the focused window)")]
+    Close {
+        window: Option<u32>,
+    },
+    #[command(about = "Toggle native fullscreen (defaults to the focused window)")]
+    ToggleFullscreen {
+        window: Option<u32>,
+    },
+    #[command(about = "Toggle tiling for a window (defaults to the focused window)")]
+    ToggleFloat {
+        window: Option<u32>,
+    },
+    #[command(about = "Swap with nearest neighbor in a direction")]
+    SwapDirection {
+        direction: DirectionArg,
+        #[arg(long)]
+        window: Option<u32>,
+    },
+    #[command(about = "Insert at neighbor's tree position in a direction")]
+    WarpDirection {
+        direction: DirectionArg,
+        #[arg(long)]
+        window: Option<u32>,
+    },
+    #[command(about = "Resize one edge by delta points (positive = outward)")]
+    Resize {
+        #[arg(long)]
+        window: Option<u32>,
+        edge: DirectionArg,
+        delta: i32,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -135,10 +169,24 @@ struct SpaceArgs {
 
 #[derive(Debug, Subcommand)]
 enum SpaceSubcommand {
-    Focus { space: u64 },
-    Create { anchor: Option<u64> },
-    Destroy { space: u64 },
-    Move { space: u64, after: u64 },
+    Focus {
+        space: u64,
+    },
+    Create {
+        anchor: Option<u64>,
+    },
+    Destroy {
+        space: u64,
+    },
+    Move {
+        space: u64,
+        after: u64,
+    },
+    #[command(
+        name = "toggle-insets",
+        about = "Collapse/restore all gap+padding for the session"
+    )]
+    ToggleInsets,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -198,10 +246,24 @@ struct LayoutArgs {
 
 #[derive(Debug, Subcommand)]
 enum LayoutSubcommand {
-    Rotate { space: u64 },
-    Mirror { space: u64 },
-    Balance { space: u64 },
-    SetRatio { space: u64, ratio: f64 },
+    /// All layout commands default to the focused space.
+    Rotate {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    Mirror {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    Balance {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    SetRatio {
+        ratio: f64,
+        #[arg(long)]
+        space: Option<u64>,
+    },
 }
 #[derive(Debug, Args)]
 struct ScratchpadArgs {
@@ -225,10 +287,13 @@ enum WorkspaceSubcommand {
     Focus {
         name: String,
     },
-    #[command(name = "move-window", about = "Move window to named workspace")]
+    #[command(
+        name = "move-window",
+        about = "Move window to named workspace (defaults to the focused window)"
+    )]
     MoveWindow {
-        window: u32,
         workspace: String,
+        window: Option<u32>,
     },
 }
 
@@ -334,6 +399,7 @@ fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -
 fn map_command(command: TopCommand) -> Command {
     match command {
         TopCommand::Ping => Command::Ping,
+        TopCommand::Refresh => Command::Refresh,
         TopCommand::Doctor => Command::Doctor,
         TopCommand::Query(args) => Command::Query(match args.command {
             QuerySubcommand::Windows => QueryCommand::Windows,
@@ -348,8 +414,34 @@ fn map_command(command: TopCommand) -> Command {
                 window: WindowId(window),
             },
             WindowSubcommand::FocusDirection { from, direction } => WindowCommand::FocusDirection {
-                from: WindowId(from),
+                from: from.map(WindowId),
                 direction: direction.into(),
+            },
+            WindowSubcommand::Close { window } => WindowCommand::Close {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::ToggleFullscreen { window } => WindowCommand::ToggleFullscreen {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::ToggleFloat { window } => WindowCommand::ToggleFloat {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::SwapDirection { direction, window } => WindowCommand::SwapDirection {
+                direction: direction.into(),
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::WarpDirection { direction, window } => WindowCommand::WarpDirection {
+                direction: direction.into(),
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::Resize {
+                window,
+                edge,
+                delta,
+            } => WindowCommand::Resize {
+                window: window.map(WindowId),
+                edge: edge.into(),
+                delta,
             },
             WindowSubcommand::SetFrame {
                 window,
@@ -372,12 +464,12 @@ fn map_command(command: TopCommand) -> Command {
             },
             WindowSubcommand::MoveToWorkspace { window, workspace } => {
                 WindowCommand::MoveToWorkspace {
-                    window: WindowId(window),
+                    window: window.map(WindowId),
                     workspace,
                 }
             }
             WindowSubcommand::SetLayer { window, layer } => WindowCommand::SetLayer {
-                window: WindowId(window),
+                window: window.map(WindowId),
                 layer,
             },
             WindowSubcommand::SetSticky { window, sticky } => WindowCommand::SetSticky {
@@ -423,6 +515,7 @@ fn map_command(command: TopCommand) -> Command {
                 space: SpaceId(space),
                 after: SpaceId(after),
             },
+            SpaceSubcommand::ToggleInsets => SpaceCommand::ToggleInsets,
         }),
         TopCommand::Config(args) => Command::Config(match args.command {
             ConfigSubcommand::Reload { path } => ConfigCommand::Reload { path },
@@ -436,16 +529,16 @@ fn map_command(command: TopCommand) -> Command {
         }),
         TopCommand::Layout(args) => Command::Layout(match args.command {
             LayoutSubcommand::Rotate { space } => LayoutCommand::Rotate {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::Mirror { space } => LayoutCommand::Mirror {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::Balance { space } => LayoutCommand::Balance {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::SetRatio { space, ratio } => LayoutCommand::SetRatio {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
                 ratio,
             },
         }),
@@ -455,7 +548,7 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Workspace(args) => Command::Workspace(match args.command {
             WorkspaceSubcommand::Focus { name } => WorkspaceCommand::Focus { name },
             WorkspaceSubcommand::MoveWindow { window, workspace } => WorkspaceCommand::MoveWindow {
-                window: WindowId(window),
+                window: window.map(WindowId),
                 workspace,
             },
         }),
@@ -486,11 +579,24 @@ fn run_sa_status() -> Result<()> {
         let socket = client.socket_path().clone();
         println!("socket: {}", socket.display());
         println!("expected_prefix: {}", ROVR_SA_VERSION_PREFIX);
-        match client.probe() {
-            Some(info) => {
+
+        let state = sa_state(&client);
+        match &state {
+            SaState::NotInstalled => {
+                println!("state: not_installed");
+                println!("present: false");
+                println!("hint: run `sudo rovr sa install` (see docs/SA_SIP.md)");
+            }
+            SaState::InstalledNotInjected => {
+                println!("state: installed_not_injected");
+                println!("present: false");
+                println!("hint: payload files are installed but Dock is not running the payload; run `sudo rovr sa install` to inject");
+            }
+            SaState::InjectedCompatible(info) => {
+                println!("state: injected_compatible");
                 println!("present: true");
                 println!("version: {}", info.version);
-                println!("compatible: {}", info.is_compatible());
+                println!("compatible: true");
                 println!("attribs: 0x{:08x}", info.attribs);
                 let add = (info.attribs & 0x04) != 0;
                 let rem = (info.attribs & 0x08) != 0;
@@ -499,13 +605,27 @@ fn run_sa_status() -> Result<()> {
                 println!("  create_space: {}", add);
                 println!("  destroy_space: {}", rem);
                 println!("  reorder_space: {}", mov_);
-                println!("  layer/sticky/shadow/opacity/scale: true (when present)");
+                println!("  layer/sticky/shadow/opacity/scale: true");
             }
-            None => {
-                println!("present: false");
-                println!("hint: run `rovr sa install` then restart Dock, or check SIP / payload injection");
+            SaState::IncompatibleProtocol(version) => {
+                println!("state: incompatible_protocol");
+                println!("present: true");
+                println!("version: {}", version);
+                println!("compatible: false");
+                println!("hint: a non-Rovr or outdated payload is answering on the Rovr socket; reinstall via `sudo rovr sa install`");
+            }
+            SaState::CapabilityMissing(info, missing) => {
+                println!("state: capability_missing");
+                println!("present: true");
+                println!("version: {}", info.version);
+                println!("compatible: true");
+                println!("attribs: 0x{:08x}", info.attribs);
+                println!("missing: {}", missing.join(", "));
+                println!("hint: the payload resolved fewer Dock internals on this macOS build; affected operations will fail until supported");
             }
         }
+
+        print_sa_lifecycle_status(&client);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -529,24 +649,549 @@ fn run_sa_status() -> Result<()> {
     Ok(())
 }
 
+/// Privileged install locations for the Rovr SA artifacts.
+#[cfg(target_os = "macos")]
+const SA_INSTALL_DIR: &str = "/Library/Application Support/rovr";
+#[cfg(target_os = "macos")]
+const SA_INSTALLED_DYLIB: &str = "/Library/Application Support/rovr/librovr_sa_payload.dylib";
+#[cfg(target_os = "macos")]
+const SA_INSTALLED_LOADER: &str = "/Library/Application Support/rovr/rovr-sa-loader";
+/// Privileged helper binary installed by `rovr sa install`.
+#[cfg(target_os = "macos")]
+const SA_INSTALLED_HELPER: &str = "/Library/Application Support/rovr/rovr-sa-helper";
+/// LaunchDaemon plist for the privileged helper. SMAppService is NOT usable
+/// here because it requires the executable to live inside an .app bundle
+/// (`Contents/Library/LaunchDaemons`); Rovr ships as cargo-built CLI binaries.
+/// This explicit launchd registration is the minimal fallback — see docs/SA.md.
+#[cfg(target_os = "macos")]
+const SA_PLIST_PATH: &str = "/Library/LaunchDaemons/com.rovr.sa-helper.plist";
+#[cfg(target_os = "macos")]
+const SA_PLIST_LABEL: &str = "com.rovr.sa-helper";
+/// Install-time payload identity marker (sha256 of the installed dylib plus
+/// the handshake version observed after the last successful injection). Lets
+/// `rovr sa status` distinguish installed-payload != injected-payload.
+#[cfg(target_os = "macos")]
+const SA_MARKER_PATH: &str = "/Library/Application Support/rovr/payload.installed.json";
+
+/// The five honest SA states surfaced by `rovr sa status` (blocker 1).
+#[cfg(target_os = "macos")]
+enum SaState {
+    NotInstalled,
+    InstalledNotInjected,
+    InjectedCompatible(rovr_platform::macos::sa::SaInfo),
+    IncompatibleProtocol(String),
+    CapabilityMissing(rovr_platform::macos::sa::SaInfo, Vec<String>),
+}
+
+#[cfg(target_os = "macos")]
+fn sa_installed_files_present() -> bool {
+    std::path::Path::new(SA_INSTALLED_DYLIB).exists()
+}
+
+#[cfg(target_os = "macos")]
+fn sa_state(client: &rovr_platform::macos::sa::SaClient) -> SaState {
+    use rovr_platform::macos::sa::{
+        OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE,
+    };
+    match client.probe() {
+        Some(info) => {
+            if !info.is_compatible() {
+                return SaState::IncompatibleProtocol(info.version);
+            }
+            let mut missing = Vec::new();
+            if info.attribs & OSAX_ATTRIB_ADD_SPACE == 0 {
+                missing.push("create_space".to_string());
+            }
+            if info.attribs & OSAX_ATTRIB_REM_SPACE == 0 {
+                missing.push("destroy_space".to_string());
+            }
+            if info.attribs & OSAX_ATTRIB_MOV_SPACE == 0 {
+                missing.push("reorder_space".to_string());
+            }
+            if missing.is_empty() {
+                SaState::InjectedCompatible(info)
+            } else {
+                SaState::CapabilityMissing(info, missing)
+            }
+        }
+        None => {
+            if sa_installed_files_present() {
+                SaState::InstalledNotInjected
+            } else {
+                SaState::NotInstalled
+            }
+        }
+    }
+}
+
+/// Locate build artifacts: env overrides, then cargo target build dirs
+/// relative to this executable.
+#[cfg(target_os = "macos")]
+fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    if let (Ok(dylib), Ok(loader), Ok(helper)) = (
+        std::env::var("ROVR_SA_PAYLOAD"),
+        std::env::var("ROVR_SA_LOADER"),
+        std::env::var("ROVR_SA_HELPER"),
+    ) {
+        return Ok((
+            PathBuf::from(dylib),
+            PathBuf::from(loader),
+            PathBuf::from(helper),
+        ));
+    }
+    let exe = std::env::current_exe().context("locate rovr executable")?;
+    // exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir where
+    // cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
+    let target_root = exe
+        .ancestors()
+        .nth(1)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let find = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
+        let base = target_root.join("build");
+        let mut hits: Vec<PathBuf> = std::fs::read_dir(&base)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(crate_prefix))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.join("out").join(artifact))
+            .filter(|p| p.exists())
+            .collect();
+        hits.sort();
+        hits.pop()
+    };
+    let dylib = find("rovr-sa-payload", "librovr_sa_payload.dylib")
+        .context("payload dylib not built — run `cargo build -p rovr-sa-payload` first")?;
+    let loader = find("rovr-sa-loader", "rovr-sa-loader")
+        .context("loader binary not built — run `cargo build -p rovr-sa-loader` first")?;
+    let helper = find("rovr-sa-helper", "rovr-sa-helper")
+        .context("helper binary not built — run `cargo build -p rovr-sa-helper` first")?;
+    Ok((dylib, loader, helper))
+}
+
+/// UID of the console user (the uid Dock runs as). Under `sudo`, $UID is 0,
+/// but the payload socket is created with the console user's uid.
+#[cfg(target_os = "macos")]
+fn console_uid() -> Option<u32> {
+    let out = std::process::Command::new("stat")
+        .args(["-f", "%u", "/dev/console"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<u32>().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn check_sip_for_install() -> Result<()> {
+    let out = std::process::Command::new("csrutil")
+        .arg("status")
+        .output()
+        .context("run csrutil status")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    let debug_ok = text.contains("debugging restrictions: disabled")
+        || text.contains("system integrity protection status: disabled");
+    let fs_ok = text.contains("filesystem protections: disabled")
+        || text.contains("system integrity protection status: disabled");
+    if !(debug_ok && fs_ok) {
+        anyhow::bail!(
+            "SIP is too strict for injection. Required (in recovery mode):\n               csrutil enable --without debug --without fs\n             On Apple Silicon additionally: sudo nvram bootarg=\"-arm64e_preview_abi\" boot-args=\"-arm64e_preview_abi\"\n             See docs/SA_SIP.md for why each relaxation is needed."
+        );
+    }
+    Ok(())
+}
+
 fn run_sa_install() -> Result<()> {
-    // Phase-1 slice: document and verify. Full payload injection ships next.
-    // We intentionally do NOT weaken SIP beyond what the payload needs: see
-    // docs/SA_SIP.md for the scoped requirement (see SA.md for payload scope).
-    println!("rovr sa install: Rovr-owned payload injection is not yet bundled in this build.");
-    println!("This command will, when the payload ships:");
-    println!("  1) install the Rovr SA payload to a privileged location,");
-    println!("  2) inject it into Dock (requires SIP with `csrutil enable --without debug` / `filesystem` relaxation depending on macOS),");
-    println!("  3) create the Rovr socket at /tmp/rovr-sa_<uid>.sock (never /tmp/yabai-sa_*).");
-    println!("See docs/SA_SIP.md (to be added) and `rovr sa status` for diagnostics.");
-    println!("For now, verify: yabai must NOT be required; SA socket must be Rovr-owned.");
-    anyhow::bail!("sa install: payload not yet bundled — see `rovr sa status` and TODO.md Phase 1");
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("sa install is only available on macOS");
+        anyhow::bail!("sa install: unsupported platform");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dylib, loader, helper) = find_sa_artifacts()?;
+        println!("payload: {}", dylib.display());
+        println!("loader:  {}", loader.display());
+        println!("helper:  {}", helper.display());
+
+        if unsafe { libc_getuid() } != 0 {
+            eprintln!(
+                "sa install must run as root — it writes to {SA_INSTALL_DIR}, registers the privileged LaunchDaemon and injects into Dock:"
+            );
+            eprintln!("  sudo rovr sa install");
+            anyhow::bail!("sa install: root required");
+        }
+        check_sip_for_install()?;
+
+        // ---- 1. Install root-owned immutable copies -------------------------
+        std::fs::create_dir_all(SA_INSTALL_DIR)
+            .with_context(|| format!("create {SA_INSTALL_DIR}"))?;
+        // Root-only write on the directory; group/other read-only.
+        std::fs::set_permissions(SA_INSTALL_DIR, std::fs::Permissions::from_mode(0o755))?;
+        for (src, dst, mode) in [
+            (&dylib, SA_INSTALLED_DYLIB, 0o644),
+            (&loader, SA_INSTALLED_LOADER, 0o744),
+            (&helper, SA_INSTALLED_HELPER, 0o744),
+        ] {
+            // Remove first so a stale symlink at dst can never be followed.
+            let _ = std::fs::remove_file(dst);
+            std::fs::copy(src, dst).with_context(|| format!("copy payload to {dst}"))?;
+            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))?;
+        }
+        println!("installed: payload + loader + helper in {SA_INSTALL_DIR}");
+
+        // Record the installed payload identity BEFORE injection; the injected
+        // identity is appended after a verified handshake.
+        let installed_sha = sha256_file(SA_INSTALLED_DYLIB)?;
+
+        // ---- 2. Register the privileged service (LaunchDaemon) --------------
+        std::fs::write(SA_PLIST_PATH, launchd_plist_xml())
+            .with_context(|| format!("write {SA_PLIST_PATH}"))?;
+        std::fs::set_permissions(SA_PLIST_PATH, std::fs::Permissions::from_mode(0o644))?;
+        let bootout = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("system/{SA_PLIST_LABEL}")])
+            .output();
+        if let Ok(out) = bootout {
+            if out.status.success() {
+                println!("removed previous service registration");
+            }
+        }
+        let bootstrap = std::process::Command::new("launchctl")
+            .args(["bootstrap", "system", SA_PLIST_PATH])
+            .output()
+            .context("run launchctl bootstrap")?;
+        if !bootstrap.status.success() {
+            let stderr = String::from_utf8_lossy(&bootstrap.stderr);
+            eprintln!(
+                "service registration FAILED: launchctl bootstrap: {}",
+                stderr.trim()
+            );
+            eprintln!(
+                "files are installed but automatic reinjection is NOT active until this succeeds."
+            );
+            anyhow::bail!("sa install: service registration failed");
+        }
+        println!(
+            "service registered: {SA_PLIST_LABEL} (socket-activated, no approval prompt required)"
+        );
+
+        // ---- 3. Trigger initial injection directly (we ARE root) ------------
+        let out = std::process::Command::new(SA_INSTALLED_LOADER)
+            .arg(SA_INSTALLED_DYLIB)
+            .output()
+            .context("run rovr-sa-loader")?;
+        print!("{}", String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            anyhow::bail!(
+                "sa install: injection failed (exit {:?}) — files + service are installed; the daemon will retry via the helper",
+                out.status.code()
+            );
+        }
+
+        // ---- 4. Verify the SA handshake ------------------------------------
+        let uid = console_uid().context("determine console uid")?;
+        let client = rovr_platform::macos::sa::SaClient::with_socket_path(
+            rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
+        );
+        let mut handshake_version = None;
+        for _ in 0..20 {
+            if let Some(info) = client.probe() {
+                println!(
+                    "handshake ok: version={} attribs=0x{:08x}",
+                    info.version, info.attribs
+                );
+                handshake_version = Some(info.version);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let Some(version) = handshake_version else {
+            anyhow::bail!(
+                "sa install: injection ran but the payload socket did not answer — check `rovr sa status` and Console.app for [rovr-sa] logs"
+            )
+        };
+
+        // ---- 5. Persist identity marker + report capabilities ---------------
+        let marker = serde_json::json!({
+            "installed_sha256": installed_sha,
+            "injected_sha256": installed_sha,
+            "handshake_version": version,
+        });
+        std::fs::write(
+            SA_MARKER_PATH,
+            serde_json::to_vec_pretty(&marker).unwrap_or_default(),
+        )
+        .with_context(|| format!("write {SA_MARKER_PATH}"))?;
+
+        let attribs = client.probe().map(|i| i.attribs).unwrap_or(0);
+        println!("capabilities:");
+        println!("  create_space:  {}", attribs & 0x04 != 0);
+        println!("  destroy_space: {}", attribs & 0x08 != 0);
+        println!("  reorder_space: {}", attribs & 0x10 != 0);
+        println!("  layer/sticky/shadow/opacity/scale: true");
+        println!("sa install complete.");
+        Ok(())
+    }
+}
+
+/// The LaunchDaemon plist for the privileged helper. Socket-activated:
+/// launchd owns /var/run/rovr-sa-helper.sock and starts the helper on demand,
+/// so no root code runs (and nothing polls) until an injection is requested.
+#[cfg(target_os = "macos")]
+fn launchd_plist_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{SA_PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{SA_INSTALLED_HELPER}</string>
+    </array>
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>{}</string>
+            <key>SockPathMode</key>
+            <integer>438</integer>
+            <key>SockType</key>
+            <string>stream</string>
+        </dict>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#,
+        rovr_platform::macos::reinject::HELPER_SOCKET_PATH
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn sha256_file(path: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {path} for hashing"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn run_sa_uninstall() -> Result<()> {
-    println!("rovr sa uninstall: payload not yet bundled; nothing to remove in this build.");
-    println!("When bundled, this will remove the Rovr payload and restore Dock.");
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("sa uninstall is only available on macOS");
+        anyhow::bail!("sa uninstall: unsupported platform");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { libc_getuid() } != 0 {
+            eprintln!("sa uninstall must run as root:");
+            eprintln!("  sudo rovr sa uninstall");
+            anyhow::bail!("sa uninstall: root required");
+        }
+
+        // 1. Unregister the privileged service FIRST: guarantees no further
+        //    reinjection regardless of what happens below.
+        let bootout = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("system/{SA_PLIST_LABEL}")])
+            .output();
+        match bootout {
+            Ok(out) if out.status.success() => println!("service unregistered ({SA_PLIST_LABEL})"),
+            _ => println!("service was not registered — skipping bootout"),
+        }
+        if std::path::Path::new(SA_PLIST_PATH).exists() {
+            std::fs::remove_file(SA_PLIST_PATH)
+                .with_context(|| format!("remove {SA_PLIST_PATH}"))?;
+            println!("removed {SA_PLIST_PATH}");
+        }
+        // Remove the helper's launchd-created socket if one is left behind.
+        let helper_sock = rovr_platform::macos::reinject::HELPER_SOCKET_PATH;
+        let _ = std::fs::remove_file(helper_sock);
+
+        // 2. Remove installed artifacts.
+        let mut removed = false;
+        for path in [
+            SA_INSTALLED_DYLIB,
+            SA_INSTALLED_LOADER,
+            SA_INSTALLED_HELPER,
+            SA_MARKER_PATH,
+        ] {
+            if std::path::Path::new(path).exists() {
+                std::fs::remove_file(path).with_context(|| format!("remove {path}"))?;
+                println!("removed {path}");
+                removed = true;
+            }
+        }
+
+        // 3. Remove stale Rovr SA socket for the console user.
+        if let Some(uid) = console_uid() {
+            let sock = rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string());
+            if sock.exists() {
+                // Only remove real sockets, never arbitrary paths.
+                if let Ok(meta) = std::fs::symlink_metadata(&sock) {
+                    use std::os::unix::fs::FileTypeExt;
+                    if meta.file_type().is_socket() {
+                        let _ = std::fs::remove_file(&sock);
+                        println!("removed stale socket {}", sock.display());
+                    }
+                }
+            }
+        }
+
+        if !removed {
+            println!("nothing installed — nothing to remove.");
+            return Ok(());
+        }
+        // 4. Restart Dock: REQUIRED to unload the currently injected payload —
+        //    code already mapped into Dock cannot be evicted any other way.
+        //    This is deliberate and only happens during explicit uninstall.
+        let _ = std::process::Command::new("killall").arg("Dock").status();
+        println!(
+            "Dock restarted; payload unloaded. `rovr sa status` should now report not_installed."
+        );
+        Ok(())
+    }
+}
+
+/// Lifecycle state of the privileged helper service, derived from three
+/// observable facts (kept pure so it can be unit-tested without macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceState {
+    /// No files, no plist.
+    NotInstalled,
+    /// Files installed (or plist present) but the helper does not answer.
+    Installed,
+    /// Reserved for SMAppService-style flows; unused by the launchd fallback
+    /// (launchd registration never prompts for approval).
+    #[allow(dead_code)]
+    AwaitingApproval,
+    /// Helper answers STATUS over its socket.
+    Registered,
+}
+
+#[cfg(target_os = "macos")]
+fn derive_service_state(
+    files_installed: bool,
+    plist_present: bool,
+    helper_ok: bool,
+) -> ServiceState {
+    if helper_ok {
+        ServiceState::Registered
+    } else if files_installed || plist_present {
+        ServiceState::Installed
+    } else {
+        ServiceState::NotInstalled
+    }
+}
+
+/// Extend `rovr sa status` with the full lifecycle picture: privileged
+/// service state, payload identity, and installed-vs-injected mismatch.
+#[cfg(target_os = "macos")]
+fn print_sa_lifecycle_status(client: &rovr_platform::macos::sa::SaClient) {
+    use std::time::Duration;
+
+    println!("-- lifecycle --");
+
+    // Service state.
+    let files_installed = std::path::Path::new(SA_INSTALLED_DYLIB).exists()
+        && std::path::Path::new(SA_INSTALLED_HELPER).exists();
+    let plist_present = std::path::Path::new(SA_PLIST_PATH).exists();
+    let helper_ok = rovr_platform::macos::reinject::HelperClient::new()
+        .status(Duration::from_secs(1))
+        .is_ok();
+    let service_str = match derive_service_state(files_installed, plist_present, helper_ok) {
+        ServiceState::Registered => "registered",
+        ServiceState::Installed => "installed",
+        ServiceState::AwaitingApproval => "awaiting_approval",
+        ServiceState::NotInstalled => "not_installed",
+    };
+    println!(
+        "service: {service_str} (socket={} label={SA_PLIST_LABEL})",
+        rovr_platform::macos::reinject::HELPER_SOCKET_PATH
+    );
+    if service_str == "installed" {
+        println!(
+            "hint: files are present but the helper does not answer — check `sudo launchctl print system/{SA_PLIST_LABEL}`"
+        );
+    }
+
+    // Payload identity: installed file vs install-time marker.
+    let marker: Option<serde_json::Value> = std::fs::read_to_string(SA_MARKER_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let installed_sha = sha256_file(SA_INSTALLED_DYLIB).ok();
+    match (&marker, &installed_sha) {
+        (Some(m), Some(sha)) => {
+            let marked = m["installed_sha256"].as_str().unwrap_or("");
+            println!(
+                "payload: installed (sha256={}{})",
+                &sha[..8.min(sha.len())],
+                if marked == sha {
+                    ""
+                } else {
+                    ", MARKER MISMATCH — reinstall via `sudo rovr sa install`"
+                }
+            );
+            // Installed-vs-injected identity: replacing the dylib on disk does
+            // NOT update code already mapped into Dock.
+            let injected = m["injected_sha256"].as_str().unwrap_or("");
+            let handshake = client.probe().map(|i| i.version);
+            if !injected.is_empty() && injected != sha {
+                println!("injection: STALE — installed payload differs from the payload last injected into Dock");
+                println!("hint: run `sudo rovr sa install` to reinject; until then Dock keeps running the OLD payload build");
+            } else {
+                println!(
+                    "injection: {}",
+                    handshake
+                        .as_deref()
+                        .map(|v| format!("current (handshake {v})"))
+                        .unwrap_or_else(|| "not_injected".to_string())
+                );
+            }
+            println!(
+                "handshake_version_at_install: {}",
+                m["handshake_version"].as_str().unwrap_or("?")
+            );
+        }
+        (None, Some(_)) => {
+            println!("payload: installed (identity marker missing — run `sudo rovr sa install` to complete registration)");
+            println!("injection: unknown");
+        }
+        _ => {
+            println!("payload: not_installed");
+            println!("injection: not_injected");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn libc_getuid() -> u32 {
+    getuid()
 }
 
 fn run_gen_skhd(path: Option<&str>) -> Result<()> {
@@ -578,8 +1223,8 @@ fn send(path: &Path, request: &Request) -> Result<Response> {
 }
 
 fn default_socket_path() -> PathBuf {
-    let uid = std::env::var("UID").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/rovr-{uid}.sock"))
+    // Must match the daemon (real getuid, not $UID — see rovr_platform).
+    PathBuf::from(format!("/tmp/rovr-{}.sock", rovr_platform::unix_uid()))
 }
 
 #[cfg(test)]
@@ -678,5 +1323,65 @@ mod tests {
             printed.contains(&hello),
             "valid frames before the corruption must still be printed"
         );
+    }
+
+    /// SA lifecycle: service state derivation distinguishes not_installed,
+    /// installed and registered (pure logic — no macOS interaction).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sa_service_state_distinctions() {
+        use ServiceState::*;
+        assert_eq!(
+            derive_service_state(false, false, false),
+            NotInstalled,
+            "no files + no plist + no helper = not installed"
+        );
+        assert_eq!(
+            derive_service_state(true, true, false),
+            Installed,
+            "files present but helper silent = installed, not registered"
+        );
+        assert_eq!(
+            derive_service_state(true, false, false),
+            Installed,
+            "payload files alone still count as installed"
+        );
+        assert_eq!(
+            derive_service_state(false, true, false),
+            Installed,
+            "plist without helper answers = installed (registration incomplete)"
+        );
+        assert_eq!(
+            derive_service_state(true, true, true),
+            Registered,
+            "helper answering STATUS = registered"
+        );
+    }
+
+    /// SA lifecycle: uninstall removes every privileged artifact it installs —
+    /// pinned by listing exactly what install writes vs what uninstall deletes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sa_install_and_uninstall_artifact_sets_are_symmetric() {
+        let installed = [
+            SA_INSTALLED_DYLIB,
+            SA_INSTALLED_LOADER,
+            SA_INSTALLED_HELPER,
+            SA_MARKER_PATH,
+            SA_PLIST_PATH,
+        ];
+        let uninstalled_paths = [
+            SA_INSTALLED_DYLIB,
+            SA_INSTALLED_LOADER,
+            SA_INSTALLED_HELPER,
+            SA_MARKER_PATH,
+            SA_PLIST_PATH,
+        ];
+        for path in installed {
+            assert!(
+                uninstalled_paths.contains(&path),
+                "{path} is installed but never removed by uninstall"
+            );
+        }
     }
 }

@@ -62,5 +62,11 @@ int rovr_bridge_needs_refresh(void);
 int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context);
 int rovr_bridge_move_window_to_space(uint32_t window_id, uint64_t space_id);
 int rovr_bridge_focus_space(uint64_t space_id);
+uint64_t rovr_bridge_current_space_id(void);
 int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);
 int32_t rovr_bridge_dock_pid(void);
+
+// AX event trampoline registration (rovr-platform calls this once at init;
+// the callback is invoked on the main thread for created/focused events).
+typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
+void rovr_bridge_install_event_handlers(rovr_ax_event_trampoline_fn callback);
