@@ -104,6 +104,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     let args = &parts[1..];
     match *head {
         "ping" if args.is_empty() => Ok(Command::Ping),
+        "refresh" if args.is_empty() => Ok(Command::Refresh),
         "doctor" if args.is_empty() => Ok(Command::Doctor),
         "query" => parse_query(args),
         "window" => parse_window(args),
