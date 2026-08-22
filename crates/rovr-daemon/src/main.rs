@@ -334,14 +334,32 @@ fn state_loop(
         warmup_ms = t_warm.elapsed().as_millis() as u64,
         "startup observation warm-up complete"
     );
+    // Fixed cadence. Deliberately NOT adaptive: faster polling during
+    // activity hammers WindowServer with SLS/AX work exactly while the
+    // user is switching Spaces, which visibly stutters animations
+    // (regression verified live). Observation is serialized here instead.
+    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
+    // Absolute observation deadline. recv_timeout restarts after every
+    // request, so a steady request stream (rapid hotkeys) would otherwise
+    // postpone observation indefinitely and commands would resolve "the
+    // focused window" against stale state (wrong-window regression).
+    let mut last_observed_at = std::time::Instant::now();
     loop {
-        // Fixed cadence. Deliberately NOT adaptive: faster polling during
-        // activity hammers WindowServer with SLS/AX work exactly while the
-        // user is switching Spaces, which visibly stutters animations
-        // (regression verified live). Observation is serialized here instead.
-        let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
         match rx.recv_timeout(interval) {
             Ok(envelope) => {
+                // Observe BEFORE handling so the request sees state no older
+                // than one interval, even mid-burst.
+                if last_observed_at.elapsed() >= interval {
+                    let t_obs = std::time::Instant::now();
+                    if daemon.refresh_observation() {
+                        deliver_notification(&subscribers, &Notification::StateChanged);
+                    }
+                    let obs_ms = t_obs.elapsed().as_millis() as u64;
+                    if obs_ms > 100 {
+                        tracing::info!(obs_ms, "slow periodic observation");
+                    }
+                    last_observed_at = std::time::Instant::now();
+                }
                 let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
                 if queue_wait_ms > 50 {
                     tracing::info!(
@@ -371,6 +389,7 @@ fn state_loop(
                 if obs_ms > 100 {
                     tracing::info!(obs_ms, "slow periodic observation");
                 }
+                last_observed_at = std::time::Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -428,6 +447,24 @@ fn validate_request(request: &Request) -> Option<Response> {
         ))
     } else {
         None
+    }
+}
+
+/// Whether this command may resolve a None window id as "the focused window".
+/// Those commands need observation to be current at resolution time (see the
+/// Command::Window arm in `handle`).
+fn window_command_defaults_to_focus(command: &WindowCommand) -> bool {
+    match command {
+        WindowCommand::FocusDirection { from, .. }
+        | WindowCommand::SetLayer { window: from, .. }
+        | WindowCommand::MoveToWorkspace { window: from, .. }
+        | WindowCommand::Close { window: from }
+        | WindowCommand::ToggleFullscreen { window: from }
+        | WindowCommand::ToggleFloat { window: from }
+        | WindowCommand::SwapDirection { window: from, .. }
+        | WindowCommand::WarpDirection { window: from, .. }
+        | WindowCommand::Resize { window: from, .. } => from.is_none(),
+        _ => false,
     }
 }
 
@@ -576,6 +613,16 @@ impl Daemon {
                 }
             },
             Command::Window(command) => {
+                // Focus-defaulting commands resolve "the focused window"
+                // against observed state. Observe NOW, at resolution time:
+                // the previous command's post-action verification snapshot can
+                // predate macOS finishing its focus transition, so the next
+                // bind in a quick sequence would otherwise target the stale
+                // focus and move the WRONG window (regression verified live).
+                // Explicit-id commands need no observation.
+                if window_command_defaults_to_focus(&command) {
+                    self.refresh_observation();
+                }
                 // Layout-mutating ops (swap/warp) change BSP structure without
                 // producing actions; they need snapshot → reconcile → verify.
                 let layout_change = match command {
