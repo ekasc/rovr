@@ -63,6 +63,17 @@
   - Fixed: per-app AX resolution in enumerate_windows (O(apps+windows)); async periodic snapshots via new `BoundedWorker::submit/poll` (`request_periodic_snapshot`/`poll_periodic_snapshot` trait methods; verification paths keep the synchronous worker); adaptive reconcile cadence (100 ms burst for ~2 s after activity, configured interval when idle); timestamp-paced gesture gate replacing SLS busy-poll; throttled short-deadline SA health probes (wedged payload can't stall the loop); cross-display Space focus (cursor warp to target display + `SLSSetActiveMenuBarDisplayIdentifier`, mirroring yabai); IPC socket keyed on real `getuid()` not `$UID`; hotkey dispatch reads its response (no EPIPE noise); bounded envelope channel.
   - Verified live: 12 rapid switches at 250 ms spacing complete in ≤240 ms each with ZERO queue waits; one-time cold-start cost only. fmt/clippy/tests clean.
 
+- [x] 14c. yabai-parity window commands + focused-window defaults
+  - New commands: window close / toggle-fullscreen / toggle-float / swap-dir /
+    warp-dir / resize <edge> <delta>; focus-direction, move-to-workspace,
+    set-layer accept optional ids; layout commands default to focused space;
+    space focus-recent. Close/fullscreen via AX button presses.
+  - Float state persists in desired state; directional ops resolve neighbors
+    from observed geometry then mutate the BSP.
+  - All rovr-expressible binds migrated to in-process [[bind]] config (39
+    registered); skhd keeps app launches, reload, chained resizes, space
+    destroy. Tests: parser/engine/daemon coverage added (112 total).
+
 ## Full checks
 
 - `git diff --check` — clean; `cargo fmt --all -- --check` — clean
