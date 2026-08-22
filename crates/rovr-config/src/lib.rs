@@ -40,8 +40,8 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             layout: LayoutKind::Bsp,
-            gap: 8,
-            padding: 8,
+            gap: 0,
+            padding: 0,
             reconcile_on_wake: true,
             reconcile_interval_ms: 1000,
             plugin: None,
