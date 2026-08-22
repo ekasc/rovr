@@ -169,9 +169,20 @@ pub fn apply_layout(
     plugins: &PluginRegistry,
     scratchpads: &ScratchpadState,
     rules: &[CompiledRule],
+    // Runtime gap/padding toggle (space toggle-insets): true collapses all
+    // configured insets to zero for the session, false uses config values.
+    insets_off: bool,
 ) {
-    let gap = config.general.gap as f64;
-    let padding = config.general.padding as f64;
+    let gap = if insets_off {
+        0.0
+    } else {
+        config.general.gap as f64
+    };
+    let padding = if insets_off {
+        0.0
+    } else {
+        config.general.padding as f64
+    };
 
     desired
         .windows
@@ -414,6 +425,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &[],
+            false,
         );
 
         // Managed windows are tiled.
@@ -529,6 +541,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &[],
+            false,
         );
 
         assert!(
@@ -639,6 +652,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &[],
+            false,
         );
 
         for id in [WindowId(1), WindowId(2), WindowId(3)] {
@@ -727,6 +741,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &config.compile_rules().unwrap(),
+            false,
         );
 
         assert_eq!(
@@ -817,6 +832,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &config.compile_rules().unwrap(),
+            false,
         );
 
         assert_eq!(
@@ -903,6 +919,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &[],
+            false,
         );
 
         assert!(
@@ -1031,6 +1048,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &rules,
+            false,
         );
         assert_eq!(
             desired.windows[&WindowId(1)].space,
@@ -1051,6 +1069,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &rules,
+            false,
         );
         assert_eq!(
             desired2.windows[&WindowId(1)].space,
@@ -1082,6 +1101,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &rules,
+            false,
         );
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -1116,6 +1136,7 @@ mod tests {
                 &rovr_layout_plugin::Registry::new(),
                 &ScratchpadState::new(),
                 &rules,
+                false,
             );
             assert_eq!(
                 desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -1137,6 +1158,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &ScratchpadState::new(),
             &rules,
+            false,
         );
         assert!(
             desired
@@ -1321,6 +1343,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &pads,
             &[],
+            false,
         );
 
         assert_eq!(
@@ -1405,6 +1428,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &pads,
             &[],
+            false,
         );
 
         assert!(
@@ -1504,6 +1528,7 @@ mod tests {
             &rovr_layout_plugin::Registry::new(),
             &pads,
             &[],
+            false,
         );
 
         assert_eq!(
