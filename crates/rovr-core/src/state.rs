@@ -49,4 +49,8 @@ pub struct WindowTarget {
     pub frame: Option<Rect>,
     pub space: Option<SpaceId>,
     pub focused: Option<bool>,
+    /// User-requested float: excluded from tiling until toggled back.
+    /// Persists with the rest of desired state across daemon restarts.
+    #[serde(default)]
+    pub floating: bool,
 }

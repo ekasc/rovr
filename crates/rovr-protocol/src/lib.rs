@@ -57,7 +57,8 @@ pub enum WindowCommand {
         window: WindowId,
     },
     FocusDirection {
-        from: WindowId,
+        /// None = the currently focused window.
+        from: Option<WindowId>,
         direction: Direction,
     },
     SetFrame {
@@ -69,7 +70,8 @@ pub enum WindowCommand {
         space: SpaceId,
     },
     SetLayer {
-        window: WindowId,
+        /// None = the currently focused window.
+        window: Option<WindowId>,
         layer: i32,
     },
     SetSticky {
@@ -97,26 +99,77 @@ pub enum WindowCommand {
         target: WindowId,
     },
     MoveToWorkspace {
-        window: WindowId,
+        /// None = the currently focused window.
+        window: Option<WindowId>,
         workspace: String,
+    },
+    /// Close a window (None = the focused one).
+    Close {
+        window: Option<WindowId>,
+    },
+    /// Toggle the native (green-button) fullscreen state.
+    ToggleFullscreen {
+        window: Option<WindowId>,
+    },
+    /// Pull a managed window out of the tiling layout, or tile it again.
+    ToggleFloat {
+        window: Option<WindowId>,
+    },
+    /// Swap the focused (or given) window with its nearest neighbor in
+    /// `direction` inside the BSP tree.
+    SwapDirection {
+        direction: Direction,
+        window: Option<WindowId>,
+    },
+    /// Insert the focused (or given) window at the neighbor's tree position.
+    WarpDirection {
+        direction: Direction,
+        window: Option<WindowId>,
+    },
+    /// Move one window edge by `delta` points (positive = outward).
+    Resize {
+        window: Option<WindowId>,
+        edge: Direction,
+        delta: i32,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpaceCommand {
-    Focus { space: SpaceId },
-    Create { anchor: Option<SpaceId> },
-    Destroy { space: SpaceId },
-    Move { space: SpaceId, after: SpaceId },
+    Focus {
+        space: SpaceId,
+    },
+    Create {
+        anchor: Option<SpaceId>,
+    },
+    Destroy {
+        space: SpaceId,
+    },
+    Move {
+        space: SpaceId,
+        after: SpaceId,
+    },
+    /// Switch to the space that was current before this one.
+    FocusRecent,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayoutCommand {
-    Rotate { space: SpaceId },
-    Mirror { space: SpaceId },
-    Balance { space: SpaceId },
-    SetRatio { space: SpaceId, ratio: f64 },
+    /// None = the currently focused space.
+    Rotate {
+        space: Option<SpaceId>,
+    },
+    Mirror {
+        space: Option<SpaceId>,
+    },
+    Balance {
+        space: Option<SpaceId>,
+    },
+    SetRatio {
+        space: Option<SpaceId>,
+        ratio: f64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -127,8 +180,14 @@ pub enum ScratchpadCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceCommand {
-    Focus { name: String },
-    MoveWindow { window: WindowId, workspace: String },
+    Focus {
+        name: String,
+    },
+    MoveWindow {
+        /// None = the currently focused window.
+        window: Option<WindowId>,
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

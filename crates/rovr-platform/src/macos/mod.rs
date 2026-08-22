@@ -105,6 +105,8 @@ extern "C" {
         -> i32;
     fn rovr_bridge_focus_window(window_id: u32) -> i32;
     fn rovr_bridge_set_window_minimized(window_id: u32, minimized: i32) -> i32;
+    fn rovr_bridge_close_window(window_id: u32) -> i32;
+    fn rovr_bridge_toggle_fullscreen(window_id: u32) -> i32;
     fn rovr_bridge_needs_refresh() -> i32;
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
@@ -489,6 +491,10 @@ impl Platform for MacPlatform {
             Action::FocusWindow { window } => unsafe { rovr_bridge_focus_window(window.0) },
             Action::SetWindowMinimized { window, minimized } => unsafe {
                 rovr_bridge_set_window_minimized(window.0, if *minimized { 1 } else { 0 })
+            },
+            Action::CloseWindow { window } => unsafe { rovr_bridge_close_window(window.0) },
+            Action::ToggleNativeFullscreen { window } => unsafe {
+                rovr_bridge_toggle_fullscreen(window.0)
             },
             Action::MoveWindowToSpace { window, space } => unsafe {
                 rovr_bridge_move_window_to_space(window.0, space.0)
