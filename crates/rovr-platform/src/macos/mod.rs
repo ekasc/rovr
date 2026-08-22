@@ -1,6 +1,8 @@
+pub mod reinject;
 pub mod sa;
 
 use std::ffi::{c_char, c_void, CStr};
+use std::time::{Duration, Instant};
 
 use rovr_core::Action;
 use rovr_types::{
@@ -11,11 +13,37 @@ use rovr_types::{
 use crate::bounded_worker::BoundedWorker;
 use crate::{Platform, PlatformError};
 
+use reinject::{HelperClient, InjectionJob, ReinjectionPhase, Reinjector, TickAction};
 use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE};
 
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
 const ROVR_BUNDLE_MAX: usize = 256;
+
+/// Maximum time the gesture path waits for a PREVIOUS swipe animation to
+/// land before posting the next sequence. Waiting for actual landing (not a
+/// fixed sleep) keeps successive switching fast: the gate exits as soon as
+/// WindowServer reports the previous Space as current, typically ~250-350 ms
+/// after the post. Posting mid-animation leaves WindowServer between Spaces
+/// (blank screen), which is what this prevents.
+const GESTURE_LAND_CAP: Duration = Duration::from_millis(450);
+/// Poll interval while waiting for the previous animation to land.
+const GESTURE_LAND_POLL: Duration = Duration::from_millis(40);
+/// A previous post older than this is stale (idle-then-switch, manual Space
+/// change): its animation landed long ago or will never be confirmed - never
+/// wait on it.
+const GESTURE_STALE_AGE: Duration = Duration::from_millis(1200);
+
+/// Periodic SA health probes are throttled to this interval; freshness is
+/// forced by clearing the throttle on Dock change / reinjection completion.
+const SA_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether the next gesture must wait for the previous one to land: only when
+/// a post is recorded AND recent.
+fn gesture_settle_needed(posted_at: Option<Instant>, now: Instant) -> bool {
+    posted_at.is_some_and(|at| now.duration_since(at) < GESTURE_STALE_AGE)
+}
+
 const ROVR_CAP_OBSERVE_WINDOWS: u64 = 1 << 0;
 const ROVR_CAP_SET_WINDOW_FRAME: u64 = 1 << 1;
 const ROVR_CAP_FOCUS_WINDOW: u64 = 1 << 2;
@@ -94,7 +122,19 @@ pub struct MacPlatform {
     /// Used to detect that the previous Mission Control swipe animation has
     /// landed before posting another one.
     last_focus_target: std::cell::Cell<u64>,
+    /// When that gesture was posted. The settle gate only applies while this
+    /// is recent — see `focus_gate_should_wait`.
+    last_focus_posted_at: std::cell::Cell<Option<Instant>>,
     last_sa_present: std::cell::Cell<bool>,
+    /// When the SA was last probed. Probes are throttled so a hung payload
+    /// cannot be re-contacted every tick; cleared whenever freshness matters
+    /// (Dock change, reinjection finished).
+    last_sa_probe_at: std::cell::Cell<Option<Instant>>,
+    /// Automatic SA reinjection lifecycle (Dock change / handshake loss → one
+    /// bounded privileged request per generation). Decision logic lives in
+    /// `reinject::Reinjector`; the privileged helper does the injection.
+    reinjector: std::cell::RefCell<Reinjector>,
+    injection_job: InjectionJob,
     /// Blocker 2: ONE platform worker thread for all observation. AX/SkyLight
     /// hangs can never leak threads — repeated timeouts fail fast against the
     /// same lone worker and recovery is an explicit retry on it.
@@ -136,7 +176,11 @@ impl MacPlatform {
             sa_info: std::cell::RefCell::new(sa_info),
             last_dock_pid,
             last_sa_present,
+            last_sa_probe_at: std::cell::Cell::new(None),
             last_focus_target: std::cell::Cell::new(0),
+            last_focus_posted_at: std::cell::Cell::new(None),
+            reinjector: std::cell::RefCell::new(Reinjector::new()),
+            injection_job: InjectionJob::default(),
             snapshot_worker: BoundedWorker::new(
                 crate::bounded_worker::DEFAULT_JOB_TIMEOUT,
                 crate::bounded_worker::DEFAULT_RETRY_INTERVAL,
@@ -149,6 +193,57 @@ impl MacPlatform {
         self.snapshot_worker
             .wedged_since()
             .map(|since| since.elapsed().as_millis() as u64)
+    }
+
+    /// Diagnostics for the automatic SA reinjection lifecycle (`rovr doctor`).
+    pub fn sa_reinject_diagnostics(&self) -> crate::SaReinjectDiag {
+        let st = self.reinjector.borrow().status();
+        crate::SaReinjectDiag {
+            phase: st.phase.as_str(),
+            generation: st.generation,
+            dock_pid: st.dock_pid,
+            attempts_this_generation: st.attempts_this_generation,
+            retry_in_secs: st.retry_in_secs,
+            pending: matches!(
+                st.phase,
+                ReinjectionPhase::Injecting | ReinjectionPhase::Verifying
+            ),
+            last_result: st.last_result,
+            last_error: st.last_error,
+            helper_socket: reinject::HELPER_SOCKET_PATH.to_string(),
+        }
+    }
+
+    /// One reinjection-lifecycle tick: consume any finished background job,
+    /// feed Dock PID + SA health into the pure state machine, and dispatch at
+    /// most ONE privileged request when it asks for one (single-flight guard).
+    /// Everything here is bounded; failures degrade to backoff, never to a
+    /// tight loop or an unbounded thread pile-up.
+    fn drive_reinjection(&self, dock_pid: Option<i32>, sa_alive: bool) {
+        let now = Instant::now();
+        if !self.injection_job.is_inflight() {
+            if let Some(result) = self.injection_job.poll() {
+                self.reinjector.borrow_mut().injection_finished(now, result);
+                // Freshness matters after a reinjection: probe immediately.
+                self.last_sa_probe_at.set(None);
+            }
+        }
+        let action = self
+            .reinjector
+            .borrow_mut()
+            .observe(now, dock_pid, sa_alive);
+        if action == TickAction::RequestInjection && !self.injection_job.is_inflight() {
+            let client = HelperClient::new();
+            let spawned =
+                self.injection_job
+                    .spawn(move || match client.inject(Duration::from_secs(15)) {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(err.to_string()),
+                    });
+            if spawned {
+                self.reinjector.borrow_mut().injection_started();
+            }
+        }
     }
 
     pub fn sa_status(&self) -> SaStatus {
@@ -189,21 +284,39 @@ impl MacPlatform {
         }
         // Gesture path: posting a swipe sequence while the previous Mission
         // Control animation is still in flight leaves WindowServer between
-        // Spaces (blank screen). Wait — bounded — until the previously
-        // requested Space has actually landed before posting another one.
-        let last = self.last_focus_target.get();
-        if last != 0 {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
-            while unsafe { rovr_bridge_current_space_id() } != last {
-                if std::time::Instant::now() >= deadline {
-                    break;
+        // Spaces (blank screen). Wait — bounded — until the previous target
+        // has actually landed, exiting the moment it does. A stale previous
+        // post (idle-then-switch, manual Space change) never waits.
+        let now = Instant::now();
+        let t_start = now;
+        let mut settled_ms = 0u64;
+        if gesture_settle_needed(self.last_focus_posted_at.get(), now) {
+            let target = self.last_focus_target.get();
+            if target != 0 {
+                let deadline = now + GESTURE_LAND_CAP;
+                while unsafe { rovr_bridge_current_space_id() } != target {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(GESTURE_LAND_POLL);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                settled_ms = t_start.elapsed().as_millis() as u64;
             }
         }
+        let t_pre_post = Instant::now();
         let status = unsafe { rovr_bridge_focus_space(space.0) };
+        let post_ms = t_pre_post.elapsed().as_millis() as u64;
+        tracing::debug!(
+            space = space.0,
+            settled_ms,
+            post_ms,
+            status,
+            total_ms = t_start.elapsed().as_millis() as u64,
+            "focus_space timing"
+        );
         if status == 0 {
             self.last_focus_target.set(space.0);
+            self.last_focus_posted_at.set(Some(Instant::now()));
             Ok(())
         } else {
             Err(PlatformError::Operation(format!(
@@ -428,6 +541,16 @@ impl Platform for MacPlatform {
     }
 
     fn needs_refresh(&self) -> bool {
+        self.needs_refresh_inner()
+    }
+
+    fn sa_reinject_diagnostics(&self) -> Option<crate::SaReinjectDiag> {
+        Some(MacPlatform::sa_reinject_diagnostics(self))
+    }
+}
+
+impl MacPlatform {
+    fn needs_refresh_inner(&self) -> bool {
         let mut needs = unsafe { rovr_bridge_needs_refresh() != 0 };
         // Dock restart detection: pid change means spaces/windows were rebuilt
         let current_dock = {
@@ -440,16 +563,52 @@ impl Platform for MacPlatform {
         };
         if current_dock != self.last_dock_pid.get() {
             self.last_dock_pid.set(current_dock);
+            // Freshness matters after a Dock change: probe immediately.
+            self.last_sa_probe_at.set(None);
             needs = true;
         }
-        // SA payload disconnect/reconnect: re-probe and detect change, update cache
-        let current_probe = self.sa.probe();
-        let current_sa = current_probe.is_some();
+        // SA payload probe: refresh the cached identity whenever version or
+        // capability attribs change (not just presence), so capabilities and
+        // reported version follow a reinjection into a new Dock.
+        //
+        // Probes are throttled and use a SHORT deadline: a payload that is
+        // alive answers in microseconds, and one that is wedged must never
+        // monopolize the state loop. Between probes the cached state stands
+        // in, so throttled ticks neither flip presence nor lose capabilities.
+        let now = Instant::now();
+        let probe_due = self
+            .last_sa_probe_at
+            .get()
+            .map_or(true, |at| now.duration_since(at) >= SA_PROBE_MIN_INTERVAL);
+        if probe_due {
+            self.last_sa_probe_at.set(Some(now));
+            if let Some(fresh) = self.sa.probe_health() {
+                let changed = self
+                    .sa_info
+                    .borrow()
+                    .as_ref()
+                    .map(|cached| {
+                        cached.version != fresh.version || cached.attribs != fresh.attribs
+                    })
+                    .unwrap_or(true);
+                if changed {
+                    *self.sa_info.borrow_mut() = Some(fresh);
+                }
+            } else if self.sa_info.borrow().is_some() {
+                // Live cache went stale: the payload disappeared.
+                *self.sa_info.borrow_mut() = None;
+            }
+        }
+        let current_sa = self.sa_info.borrow().is_some();
         if current_sa != self.last_sa_present.get() {
             self.last_sa_present.set(current_sa);
-            *self.sa_info.borrow_mut() = current_probe;
             needs = true;
         }
+        // Automatic reinjection lifecycle: Dock PID change, SA loss or failed
+        // handshake feed the bounded state machine; it requests privileged
+        // injection at most once per generation with backoff. Non-SA Rovr
+        // functionality is unaffected by any failure here.
+        self.drive_reinjection(current_dock, current_sa);
         needs
     }
 }
@@ -460,4 +619,32 @@ fn c_string<const N: usize>(buffer: &[c_char; N]) -> Option<String> {
     }
     let value = unsafe { CStr::from_ptr(buffer.as_ptr()) };
     Some(value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Settle gate: waits only for a RECENT previous post. Successive
+    /// switching exits as soon as the animation lands (bounded), and an
+    /// idle-then-switch never waits at all.
+    #[test]
+    fn gesture_settle_only_for_recent_posts() {
+        let now = Instant::now();
+        // No previous post: never wait (daemon startup path).
+        assert!(!gesture_settle_needed(None, now));
+        // Posted long ago: never wait — the "first switch after idle"
+        // regression; a stale timestamp must not stall anything.
+        let ancient = now - Duration::from_secs(60);
+        assert!(!gesture_settle_needed(Some(ancient), now));
+        // Just past the stale age: no wait.
+        let just_old = now - GESTURE_STALE_AGE - Duration::from_millis(1);
+        assert!(!gesture_settle_needed(Some(just_old), now));
+        // Recent posts DO settle-wait (blank-screen protection).
+        assert!(gesture_settle_needed(
+            Some(now - Duration::from_millis(50)),
+            now
+        ));
+        assert!(gesture_settle_needed(Some(now), now));
+    }
 }

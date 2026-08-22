@@ -25,7 +25,6 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
-
 mod hotkey;
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -48,6 +47,10 @@ struct Args {
 struct Envelope {
     request: Request,
     response: Sender<Response>,
+    /// Wall-clock instant the request was accepted off the socket — used to
+    /// measure state-loop queueing delay (head-of-line blocking behind
+    /// periodic observation work).
+    queued_at: std::time::Instant,
 }
 
 struct Daemon {
@@ -142,7 +145,10 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     let hotkey_manager = hotkey::create_hotkey_manager(daemon.config.clone(), path.clone());
 
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
-    let (tx, rx) = mpsc::channel::<Envelope>();
+    // Bounded request queue: a flood of clients applies backpressure at the
+    // socket instead of growing memory without limit while the state loop is
+    // busy (256 in-flight requests is far beyond any real session).
+    let (tx, rx) = mpsc::sync_channel::<Envelope>(256);
 
     // State loop on its own thread (single owner of daemon state).
     let subs_for_loop = subscribers.clone();
@@ -182,7 +188,7 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
 
 fn handle_client(
     mut stream: UnixStream,
-    tx: Sender<Envelope>,
+    tx: SyncSender<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -272,6 +278,7 @@ fn handle_client(
     tx.send(Envelope {
         request,
         response: response_tx,
+        queued_at: std::time::Instant::now(),
     })?;
 
     let response = response_rx.recv()?;
@@ -287,19 +294,54 @@ fn state_loop(
     rx: Receiver<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) {
+    // Startup warm-up: run the first observation immediately instead of
+    // waiting for the first tick. This establishes the AX/SkyLight per-app
+    // connections while the daemon is idle, so the user's FIRST switch is as
+    // fast as every other one (cold-start stall regression).
+    let t_warm = std::time::Instant::now();
+    if daemon.refresh_observation() {
+        deliver_notification(&subscribers, &Notification::StateChanged);
+    }
+    tracing::debug!(
+        warmup_ms = t_warm.elapsed().as_millis() as u64,
+        "startup observation warm-up complete"
+    );
     loop {
+        // Fixed cadence. Deliberately NOT adaptive: faster polling during
+        // activity hammers WindowServer with SLS/AX work exactly while the
+        // user is switching Spaces, which visibly stutters animations
+        // (regression verified live). Observation is serialized here instead.
         let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
         match rx.recv_timeout(interval) {
             Ok(envelope) => {
+                let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
+                if queue_wait_ms > 50 {
+                    tracing::info!(
+                        queue_wait_ms,
+                        id = envelope.request.id,
+                        "request waited on busy state loop"
+                    );
+                }
+                let t_handle = std::time::Instant::now();
                 let result = daemon.handle(envelope.request);
+                tracing::debug!(
+                    handle_ms = t_handle.elapsed().as_millis() as u64,
+                    queue_wait_ms,
+                    "envelope handled"
+                );
                 let _ = envelope.response.send(result.response);
                 for notif in &result.notifications {
                     deliver_notification(&subscribers, notif);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                let t_obs = std::time::Instant::now();
                 if daemon.refresh_observation() {
                     deliver_notification(&subscribers, &Notification::StateChanged);
+                }
+                let obs_ms = t_obs.elapsed().as_millis() as u64;
+                if obs_ms > 100 {
+                    tracing::info!(obs_ms, "slow periodic observation");
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -411,6 +453,11 @@ impl Daemon {
                 };
                 #[cfg(not(target_os = "macos"))]
                 let sa_diagnostics = json!({ "available": false, "reason": "not_macos" });
+                // Automatic reinjection lifecycle (Dock change → one bounded
+                // privileged request per generation).
+                let sa_reinject = self.platform.sa_reinject_diagnostics();
+                #[cfg(not(target_os = "macos"))]
+                let sa_reinject = None;
                 let snapshot_wedged_ms = self.platform.snapshot_wedged_ms();
                 HandleResult::ok(
                 id,
@@ -418,6 +465,17 @@ impl Daemon {
                     "protocol": PROTOCOL_VERSION,
                     "capabilities": self.platform.capabilities(),
                     "sa": sa_diagnostics,
+                    "sa_reinject": sa_reinject.map(|d| json!({
+                        "phase": d.phase,
+                        "generation": d.generation,
+                        "dock_pid": d.dock_pid,
+                        "attempts_this_generation": d.attempts_this_generation,
+                        "retry_in_secs": d.retry_in_secs,
+                        "pending": d.pending,
+                        "last_result": d.last_result,
+                        "last_error": d.last_error,
+                        "helper_socket": d.helper_socket,
+                    })),
                     "snapshot_wedged_ms": snapshot_wedged_ms,
                     "generation": self.engine.observed.generation,
                     "refresh_required": self.engine.observed.refresh_required,
@@ -615,14 +673,28 @@ impl Daemon {
                 // to rapid switching. The periodic state loop observes the
                 // focus within one reconcile interval anyway.
                 if let WorkspaceCommand::Focus { name } = &command {
-                    return match self.engine.focus_workspace(name) {
-                        Ok(actions) => match execute_actions_result(&mut *self.platform, actions) {
-                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
-                                .with_notifications(vec![Notification::StateChanged]),
-                            Err(err) => {
-                                HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                    let t0 = std::time::Instant::now();
+                    let result = self.engine.focus_workspace(name);
+                    let engine_ms = t0.elapsed().as_millis() as u64;
+                    return match result {
+                        Ok(actions) => {
+                            let t1 = std::time::Instant::now();
+                            let exec = execute_actions_result(&mut *self.platform, actions);
+                            tracing::debug!(
+                                workspace = %name,
+                                engine_ms,
+                                execute_ms = t1.elapsed().as_millis() as u64,
+                                total_ms = t0.elapsed().as_millis() as u64,
+                                "workspace focus timing"
+                            );
+                            match exec {
+                                Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => {
+                                    HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                }
                             }
-                        },
+                        }
                         Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                     };
                 }
@@ -750,17 +822,22 @@ impl Daemon {
             changed = true;
         }
 
+        // Deliberately SYNCHRONOUS and serialized with actions: observation
+        // must never overlap Mission Control animations or SLS mutations —
+        // concurrent enumeration during a Space switch makes animations
+        // visibly stutter (regression verified live). Snapshots are cheap
+        // since per-app AX caching landed, so head-of-line blocking here is
+        // bounded by one cheap cycle rather than reintroduced.
         match self.platform.snapshot() {
             Ok(snapshot) => {
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                 if !actions.is_empty() {
-                    changed = true;
-                }
-                if let Err(err) = execute_actions_result(&mut *self.platform, actions) {
-                    self.engine
-                        .flight_recorder
-                        .record("platform.error", err.to_string());
-                    warn!(%err, "periodic reconciliation failed");
+                    execute_actions_result(&mut *self.platform, actions).unwrap_or_else(|err| {
+                        self.engine
+                            .flight_recorder
+                            .record("platform.error", err.to_string());
+                        warn!(%err, "periodic reconciliation failed");
+                    });
                     changed = true;
                 }
             }
@@ -818,8 +895,9 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
 }
 
 fn default_socket_path() -> PathBuf {
-    let uid = std::env::var("UID").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/rovr-{uid}.sock"))
+    // Keyed on the REAL uid (getuid), never $UID: a daemon started from one
+    // environment and a CLI spawned by skhd/launchd from another must agree.
+    PathBuf::from(format!("/tmp/rovr-{}.sock", rovr_platform::unix_uid()))
 }
 
 fn default_config_path() -> PathBuf {
@@ -1067,6 +1145,21 @@ mod tests {
         assert!(
             result.notifications.is_empty(),
             "failed command must not emit StateChanged"
+        );
+    }
+
+    /// Doctor exposes the automatic SA reinjection lifecycle under
+    /// `result.sa_reinject`, even when the platform reports none (null).
+    #[test]
+    fn sa_doctor_exposes_reinject_lifecycle() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(6, Command::Doctor));
+        let value = serde_json::to_value(&result.response).expect("serialize doctor response");
+        assert!(
+            value
+                .get("result")
+                .is_some_and(|r| r.get("sa_reinject").is_some()),
+            "doctor must include the sa_reinject lifecycle section: {value}"
         );
     }
 

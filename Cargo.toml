@@ -11,6 +11,7 @@ members = [
   "crates/rovr-cli",
   "crates/rovr-sa-payload",
   "crates/rovr-sa-loader",
+  "crates/rovr-sa-helper",
 ]
 resolver = "2"
 
@@ -28,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
