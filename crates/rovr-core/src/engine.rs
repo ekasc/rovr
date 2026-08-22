@@ -59,6 +59,9 @@ pub struct Engine {
     pub scratchpads: ScratchpadState,
     pub workspaces: WorkspaceRegistry,
     pub plugins: PluginRegistry,
+    /// Session-scoped gap/padding collapse (space toggle-insets). Not
+    /// persisted: a daemon restart restores configured insets.
+    pub insets_off: bool,
 }
 
 fn load_plugins_from_disk(registry: &mut PluginRegistry) {
@@ -439,6 +442,7 @@ impl Engine {
             &self.plugins,
             &self.scratchpads,
             &self.rules,
+            self.insets_off,
         );
 
         let mut actions = reconcile(&self.observed, &self.desired);
@@ -1073,6 +1077,7 @@ mod tests {
             &engine.plugins,
             &ScratchpadState::new(),
             &[],
+            false,
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         let f2 = desired.windows[&WindowId(2)].frame.unwrap();
@@ -1097,6 +1102,7 @@ mod tests {
             &engine.plugins,
             &ScratchpadState::new(),
             &[],
+            false,
         );
         let g1 = desired2.windows[&WindowId(1)].frame.unwrap();
         let g2 = desired2.windows[&WindowId(2)].frame.unwrap();
@@ -1551,6 +1557,7 @@ mod tests {
             &engine.plugins,
             &crate::layout_state::ScratchpadState::new(),
             &[],
+            false,
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         assert!(f1.x > 50.0, "window 1 must now be on the right: {f1:?}");

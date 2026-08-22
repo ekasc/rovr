@@ -152,6 +152,8 @@ pub enum SpaceCommand {
     },
     /// Switch to the space that was current before this one.
     FocusRecent,
+    /// Collapse/restore all configured gap+padding for the session.
+    ToggleInsets,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

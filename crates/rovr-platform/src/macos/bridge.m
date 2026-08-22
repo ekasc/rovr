@@ -95,6 +95,28 @@ static uint32_t rovr_focused_window_id(void) {
     return window_id;
 }
 
+// Electron/Chromium accessibility enablement: these apps hide their AX tree
+// until an assistive client sets this flag. Remember which pids we have
+// already asked so each snapshot does not re-send it (bounded table).
+static pid_t g_manual_ax_pids[64] = {0};
+static int g_manual_ax_count = 0;
+
+static bool rovr_manual_ax_already_requested(pid_t pid) {
+    for (int i = 0; i < g_manual_ax_count; ++i) {
+        if (g_manual_ax_pids[i] == pid) return true;
+    }
+    return false;
+}
+
+static void rovr_ax_enable_manual_accessibility(AXUIElementRef app) {
+    AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+    AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+    pid_t pid = 0;
+    if (g_manual_ax_count < 64 && AXUIElementGetPid(app, &pid) == kAXErrorSuccess) {
+        g_manual_ax_pids[g_manual_ax_count++] = pid;
+    }
+}
+
 static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_pid) {
     CFArrayRef window_info = CGWindowListCopyWindowInfo(
         kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
@@ -124,6 +146,16 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
 
     CFTypeRef value = NULL;
     AXError error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
+    // Electron/Chromium: an empty window list usually means their AX tree is
+    // gated; request manual accessibility and retry once.
+    if (error == kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID() &&
+        CFArrayGetCount((CFArrayRef)value) == 0 && !rovr_manual_ax_already_requested(target_pid)) {
+        rovr_ax_enable_manual_accessibility(app);
+        CFRelease(value);
+        value = NULL;
+        usleep(100000); // give the app a moment to build its AX tree
+        error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
+    }
     CFRelease(app);
     if (error != kAXErrorSuccess || !value || CFGetTypeID(value) != CFArrayGetTypeID()) {
         if (value) CFRelease(value);
@@ -439,8 +471,20 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
                 AXUIElementRef app = AXUIElementCreateApplication(pids[p]);
                 if (!app) continue;
                 CFTypeRef value = NULL;
-                if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
-                    value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+                bool got_windows =
+                    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
+                    value && CFGetTypeID(value) == CFArrayGetTypeID();
+                // Electron/Chromium apps gate their ENTIRE accessibility tree
+                // behind this flag until an assistive client asks for it.
+                // Without it their windows are invisible to us (0 windows)
+                // and can never be tiled. Setting it is harmless for apps
+                // that ignore unknown attributes. Enabled once per pid per
+                // process lifetime; the next snapshot picks up the tree.
+                if (got_windows && CFArrayGetCount((CFArrayRef)value) == 0 &&
+                    !rovr_manual_ax_already_requested(pids[p])) {
+                    rovr_ax_enable_manual_accessibility(app);
+                }
+                if (got_windows) {
                     CFArrayRef windows = (CFArrayRef)value;
                     if (dbg) fprintf(stderr, "[rovr-enum] pid %d: %ld ax windows\n", pids[p], (long)CFArrayGetCount(windows));
                     for (CFIndex j = 0; j < CFArrayGetCount(windows) && ax_count < ROVR_ENUM_MAX_WINDOWS; j++) {
@@ -454,8 +498,11 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
                         }
                     }
                     CFRelease(value);
-                } else if (dbg) {
-                    fprintf(stderr, "[rovr-enum] pid %d: kAXWindowsAttribute failed\n", pids[p]);
+                } else {
+                    if (!rovr_manual_ax_already_requested(pids[p])) {
+                        rovr_ax_enable_manual_accessibility(app);
+                    }
+                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: kAXWindowsAttribute failed\n", pids[p]);
                 }
                 CFRelease(app);
             }

@@ -806,11 +806,36 @@ impl Daemon {
                         Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                     }
                 } else {
+                if let SpaceCommand::ToggleInsets = command {
+                    // Session-scoped collapse of gap+padding; the next layout
+                    // pass re-frames every tiled window with the new insets.
+                    self.engine.insets_off = !self.engine.insets_off;
+                    return match self
+                        .platform
+                        .snapshot()
+                        .map_err(|err| (id, err.to_string()))
+                    {
+                        Ok(snap) => {
+                            let actions = self.engine.apply_event(Event::Snapshot(snap));
+                            match self.execute_and_refresh(actions) {
+                                Ok(()) => HandleResult::ok(
+                                    id,
+                                    json!({ "accepted": true, "insets_off": self.engine.insets_off }),
+                                )
+                                .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => {
+                                    HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                }
+                            }
+                        }
+                        Err((id, msg)) => HandleResult::err(id, "SNAPSHOT_ERROR", msg),
+                    };
+                }
                 let result = match command {
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                     SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
-                    SpaceCommand::FocusRecent | SpaceCommand::Focus { .. } => unreachable!("handled above"),
+                    SpaceCommand::ToggleInsets | SpaceCommand::Focus { .. } | SpaceCommand::FocusRecent => unreachable!("handled above"),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
