@@ -160,9 +160,13 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
         return;
     }
     CGWindowID gid = 0;
-    if (g_ax_get_window && g_ax_get_window(element, &gid) == kAXErrorSuccess && gid != 0) {
-        g_event_trampoline(kind, (uint32_t)gid);
-    }
+    bool have_gid = g_ax_get_window &&
+        g_ax_get_window(element, &gid) == kAXErrorSuccess && gid != 0;
+    // The window id only refines WHICH window changed; the refresh signal
+    // itself must fire even when the lookup fails (some apps fail
+    // _AXUIElementGetWindow, e.g. error -25212), otherwise those focus
+    // changes are silently lost and the daemon serves stale state.
+    g_event_trampoline(kind, have_gid ? (uint32_t)gid : 0);
 }
 
 static bool rovr_observer_registered_for_pid(pid_t pid) {
@@ -333,6 +337,12 @@ static uint64_t rovr_space_id_for_window(uint32_t wid) {
     }
     CFRelease(space_list);
     return sid;
+}
+
+// The Space a window lives on, 0 if unknown (SLS unavailable, window
+// minimized or transient). Used for cross-space window focus.
+uint64_t rovr_bridge_window_space_id(uint32_t window_id) {
+    return rovr_space_id_for_window(window_id);
 }
 
 // 0 = false, 1 = true, 2 = unknown (AX unavailable / race / attribute missing).

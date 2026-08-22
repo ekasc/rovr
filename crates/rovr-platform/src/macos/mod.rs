@@ -130,6 +130,7 @@ extern "C" {
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
     fn rovr_bridge_focus_space(space_id: u64) -> i32;
+    fn rovr_bridge_window_space_id(window_id: u32) -> u64;
     fn rovr_bridge_current_space_id() -> u64;
     fn rovr_bridge_dock_pid() -> i32;
 }
@@ -514,7 +515,26 @@ impl Platform for MacPlatform {
             Action::SetWindowFrame { window, frame } => unsafe {
                 rovr_bridge_set_window_frame(window.0, frame.x, frame.y, frame.width, frame.height)
             },
-            Action::FocusWindow { window } => unsafe { rovr_bridge_focus_window(window.0) },
+            Action::FocusWindow { window } => {
+                // A window on a non-current Space cannot take AX focus — the
+                // raise below fails (status 2) unless its Space is current
+                // first. Switch via the normal focus-Space path (SA fast path
+                // or gesture, incl. the settle gate), then wait — bounded —
+                // for WindowServer to report the switch as landed before
+                // raising the window.
+                let target_space = unsafe { rovr_bridge_window_space_id(window.0) };
+                if target_space != 0 && target_space != unsafe { rovr_bridge_current_space_id() } {
+                    self.execute_focus_space(&SpaceId(target_space))?;
+                    let deadline = Instant::now() + GESTURE_LAND_CAP;
+                    while unsafe { rovr_bridge_current_space_id() } != target_space {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(GESTURE_LAND_POLL);
+                    }
+                }
+                unsafe { rovr_bridge_focus_window(window.0) }
+            }
             Action::SetWindowMinimized { window, minimized } => unsafe {
                 rovr_bridge_set_window_minimized(window.0, if *minimized { 1 } else { 0 })
             },
