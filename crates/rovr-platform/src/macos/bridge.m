@@ -11,6 +11,9 @@
 #import <stdatomic.h>
 #import <stdlib.h>
 #import <string.h>
+#import <signal.h>
+#import <errno.h>
+#import <pthread.h>
 
 // _AXUIElementGetWindow is private. Resolve it dynamically so the bridge still
 // links if the symbol disappears. The private capability layer will eventually
@@ -95,6 +98,139 @@ static uint32_t rovr_focused_window_id(void) {
     return window_id;
 }
 
+// yabai's AX_ENHANCED_UI_WORKAROUND: Electron/Chromium set
+// AXEnhancedUserInterface=true on themselves and then misapply position and
+// size writes while it is active. For apps in that state, flip it off around
+// the mutation and restore it afterwards. Apps without the flag are untouched.
+static bool rovr_ax_get_enhanced_ui(AXUIElementRef app) {
+    Boolean result = false;
+    CFTypeRef value = NULL;
+    if (AXUIElementCopyAttributeValue(app, CFSTR("AXEnhancedUserInterface"), &value) == kAXErrorSuccess) {
+        if (value && CFGetTypeID(value) == CFBooleanGetTypeID()) {
+            result = CFBooleanGetValue((CFBooleanRef)value);
+        }
+        if (value) CFRelease(value);
+    }
+    return result;
+}
+
+static void rovr_ax_set_enhanced_ui(AXUIElementRef app, bool on) {
+    AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), on ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+// ---- Push-based window discovery (AXObserver) ---------------------------
+// Per-app AXObserver subscriptions: kAXCreatedNotification fires at window
+// CREATION regardless of which Space it lands on, which is how the daemon
+// learns about windows that kAXWindowsAttribute (space-filtered) hides.
+// Destruction is deliberately NOT subscribed here: the periodic snapshot
+// reconciles removals within one interval, and per-window destroyed
+// notifications would require tracking every AX element lifetime.
+
+enum {
+    ROVR_EVENT_WINDOW_CREATED = 1,
+    ROVR_EVENT_WINDOW_FOCUSED = 2,
+};
+
+typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
+
+static rovr_ax_event_trampoline_fn g_event_trampoline = NULL;
+
+#define ROVR_OBSERVER_MAX 128
+struct observed_app {
+    pid_t pid;
+    AXUIElementRef app;
+    AXObserverRef observer;
+};
+static struct observed_app g_observed_apps[ROVR_OBSERVER_MAX];
+static int g_observed_app_count = 0;
+static pthread_mutex_t g_observers_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void rovr_bridge_install_event_handlers(rovr_ax_event_trampoline_fn callback) {
+    g_event_trampoline = callback;
+}
+
+static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void *context) {
+    if (!g_event_trampoline || !element) return;
+    int kind;
+    if (CFStringCompare(notification, kAXCreatedNotification, 0) == kCFCompareEqualTo) {
+        kind = ROVR_EVENT_WINDOW_CREATED;
+    } else if (CFStringCompare(notification, kAXFocusedWindowChangedNotification, 0) == kCFCompareEqualTo) {
+        kind = ROVR_EVENT_WINDOW_FOCUSED;
+    } else {
+        return;
+    }
+    CGWindowID gid = 0;
+    if (g_ax_get_window && g_ax_get_window(element, &gid) == kAXErrorSuccess && gid != 0) {
+        g_event_trampoline(kind, (uint32_t)gid);
+    }
+}
+
+static bool rovr_observer_registered_for_pid(pid_t pid) {
+    pthread_mutex_lock(&g_observers_lock);
+    for (int i = 0; i < g_observed_app_count; ++i) {
+        if (g_observed_apps[i].pid == pid) {
+            pthread_mutex_unlock(&g_observers_lock);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_observers_lock);
+    return false;
+}
+
+// Idempotent; called from the observation worker. The observer's run-loop
+// source is attached to the MAIN thread's loop, where the AppKit event loop
+// already runs, so callbacks are delivered there.
+static void rovr_observe_app(pid_t pid) {
+    if (rovr_observer_registered_for_pid(pid)) return;
+    pthread_mutex_lock(&g_observers_lock);
+    if (g_observed_app_count >= ROVR_OBSERVER_MAX) {
+        pthread_mutex_unlock(&g_observers_lock);
+        return;
+    }
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    AXObserverRef observer = NULL;
+    if (!app || AXObserverCreate(pid, rovr_ax_notification_handler, &observer) != kAXErrorSuccess || !observer) {
+        if (app) CFRelease(app);
+        pthread_mutex_unlock(&g_observers_lock);
+        return;
+    }
+    bool any = false;
+    const CFStringRef notifications[] = { kAXCreatedNotification, kAXFocusedWindowChangedNotification };
+    for (unsigned long i = 0; i < sizeof(notifications) / sizeof(notifications[0]); ++i) {
+        AXError err = AXObserverAddNotification(observer, app, notifications[i], (void *)(intptr_t)pid);
+        if (err == kAXErrorSuccess || err == kAXErrorNotificationAlreadyRegistered) any = true;
+    }
+    if (!any) {
+        CFRelease(observer);
+        CFRelease(app);
+        pthread_mutex_unlock(&g_observers_lock);
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), kCFRunLoopDefaultMode);
+    g_observed_apps[g_observed_app_count++] = (struct observed_app){
+        .pid = pid, .app = app, .observer = observer,
+    };
+    pthread_mutex_unlock(&g_observers_lock);
+}
+
+// Drop observer entries whose process has exited (called each snapshot).
+static void rovr_prune_observers(void) {
+    pthread_mutex_lock(&g_observers_lock);
+    for (int i = g_observed_app_count - 1; i >= 0; --i) {
+        pid_t pid = g_observed_apps[i].pid;
+        if (kill(pid, 0) == 0 || errno != ESRCH) continue;
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(g_observed_apps[i].observer), kCFRunLoopDefaultMode);
+        CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(g_observed_apps[i].observer));
+        AXObserverRemoveNotification(g_observed_apps[i].observer, g_observed_apps[i].app, kAXCreatedNotification);
+        CFRelease(g_observed_apps[i].observer);
+        CFRelease(g_observed_apps[i].app);
+        g_observed_apps[i] = g_observed_apps[g_observed_app_count - 1];
+        g_observed_app_count--;
+    }
+    pthread_mutex_unlock(&g_observers_lock);
+}
+
+// Electron/Chromium accessibility enablement: these apps hide their AX tree
 // Electron/Chromium accessibility enablement: these apps hide their AX tree
 // until an assistive client sets this flag. Remember which pids we have
 // already asked so each snapshot does not re-send it (bounded table).
@@ -109,8 +245,10 @@ static bool rovr_manual_ax_already_requested(pid_t pid) {
 }
 
 static void rovr_ax_enable_manual_accessibility(AXUIElementRef app) {
+    // NOTE: deliberately NOT setting AXEnhancedUserInterface here — when an
+    // app has it enabled, frame mutations misapply unless toggled off around
+    // the operation (see rovr_bridge_set_window_frame).
     AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
-    AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
     pid_t pid = 0;
     if (g_manual_ax_count < 64 && AXUIElementGetPid(app, &pid) == kAXErrorSuccess) {
         g_manual_ax_pids[g_manual_ax_count++] = pid;
@@ -466,7 +604,9 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
         AXUIElementRef ax_elems[ROVR_ENUM_MAX_WINDOWS];
         int ax_count = 0;
         const BOOL dbg = getenv("ROVR_BRIDGE_DEBUG") != NULL;
+        rovr_prune_observers();
         for (int p = 0; p < pid_count; ++p) {
+            rovr_observe_app(pids[p]);
             @autoreleasepool {
                 AXUIElementRef app = AXUIElementCreateApplication(pids[p]);
                 if (!app) continue;
@@ -601,6 +741,15 @@ int rovr_bridge_set_window_frame(
     AXUIElementRef window = rovr_ax_window_for_id(window_id, NULL);
     if (!window) return 1;
 
+    pid_t window_pid = 0;
+    AXUIElementGetPid(window, &window_pid);
+    __block AXUIElementRef app = window_pid > 0 ? AXUIElementCreateApplication(window_pid) : NULL;
+    bool eui_toggled = false;
+    if (app && rovr_ax_get_enhanced_ui(app)) {
+        rovr_ax_set_enhanced_ui(app, false);
+        eui_toggled = true;
+    }
+
     CGPoint position = CGPointMake(x, y);
     CGSize size = CGSizeMake(width, height);
     AXValueRef position_value = AXValueCreate(kAXValueCGPointType, &position);
@@ -618,6 +767,10 @@ int rovr_bridge_set_window_frame(
     CFRelease(position_value);
     CFRelease(size_value);
     CFRelease(window);
+    if (eui_toggled) {
+        rovr_ax_set_enhanced_ui(app, true);
+    }
+    if (app) CFRelease(app);
     return position_error == kAXErrorSuccess && size_error == kAXErrorSuccess ? 0 : 3;
 }
 

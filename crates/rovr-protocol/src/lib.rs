@@ -28,6 +28,9 @@ impl Request {
 pub enum Command {
     Ping,
     Doctor,
+    /// Internal: run one observation pass now. Used by the AX event
+    /// trampoline to wake the state loop; harmless for clients.
+    Refresh,
     Query(QueryCommand),
     Window(WindowCommand),
     Space(SpaceCommand),

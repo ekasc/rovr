@@ -16,6 +16,24 @@ use crate::{Platform, PlatformError};
 use reinject::{HelperClient, InjectionJob, ReinjectionPhase, Reinjector, TickAction};
 use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE};
 
+// AX event plumbing: the C observer handler runs on the main thread and
+// calls the trampoline below. Events accumulate as a bitmask consumed by
+// needs_refresh(); an optional watcher (registered by the daemon) is invoked
+// synchronously so the state loop can be woken immediately.
+static PENDING_EVENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static EVENT_WATCHER: std::sync::OnceLock<std::sync::Arc<dyn Fn(u32) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+#[allow(non_camel_case_types)]
+pub type rovr_ax_event_trampoline_fn = extern "C" fn(event_kind: i32, window_id: u32);
+
+extern "C" fn rovr_ax_event_trampoline(event_kind: i32, window_id: u32) {
+    PENDING_EVENTS.fetch_or(event_kind as u32, std::sync::atomic::Ordering::SeqCst);
+    if let Some(watcher) = EVENT_WATCHER.get() {
+        watcher(window_id);
+    }
+}
+
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
 const ROVR_BUNDLE_MAX: usize = 256;
@@ -107,6 +125,7 @@ extern "C" {
     fn rovr_bridge_set_window_minimized(window_id: u32, minimized: i32) -> i32;
     fn rovr_bridge_close_window(window_id: u32) -> i32;
     fn rovr_bridge_toggle_fullscreen(window_id: u32) -> i32;
+    fn rovr_bridge_install_event_handlers(callback: Option<rovr_ax_event_trampoline_fn>);
     fn rovr_bridge_needs_refresh() -> i32;
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
@@ -172,6 +191,9 @@ impl MacPlatform {
                 None
             }
         });
+        unsafe {
+            rovr_bridge_install_event_handlers(Some(rovr_ax_event_trampoline));
+        }
         Ok(Self {
             bridge_capabilities,
             sa,
@@ -188,6 +210,10 @@ impl MacPlatform {
                 crate::bounded_worker::DEFAULT_RETRY_INTERVAL,
             ),
         })
+    }
+
+    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        let _ = EVENT_WATCHER.set(watcher);
     }
 
     /// How long the observation worker has been wedged, if it has.
@@ -553,6 +579,10 @@ impl Platform for MacPlatform {
     fn sa_reinject_diagnostics(&self) -> Option<crate::SaReinjectDiag> {
         Some(MacPlatform::sa_reinject_diagnostics(self))
     }
+
+    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        MacPlatform::set_event_watcher(self, watcher);
+    }
 }
 
 impl MacPlatform {
@@ -571,6 +601,12 @@ impl MacPlatform {
             self.last_dock_pid.set(current_dock);
             // Freshness matters after a Dock change: probe immediately.
             self.last_sa_probe_at.set(None);
+            needs = true;
+        }
+        // AX push events (window created / focus changed): any pending event
+        // forces a reconcile this tick so new windows tile immediately
+        // instead of waiting for the periodic snapshot.
+        if PENDING_EVENTS.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
             needs = true;
         }
         // SA payload probe: refresh the cached identity whenever version or

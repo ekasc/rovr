@@ -81,6 +81,20 @@ fn main() -> Result<()> {
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
+    let event_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync> =
+        std::sync::Arc::new(|_window_id| {
+            if let Some(event_tx) = EVENT_TX.get() {
+                let (response, response_rx) = mpsc::channel();
+                let request = Request::new(0, Command::Refresh);
+                let _ = event_tx.try_send(Envelope {
+                    request,
+                    response,
+                    queued_at: std::time::Instant::now(),
+                });
+                drop(response_rx);
+            }
+        });
+    platform.set_event_watcher(event_watcher);
     let mut engine = Engine::new(config.clone());
     engine.capabilities = platform.capabilities();
     if let Err(err) = engine.load_state(&state_path) {
@@ -158,6 +172,11 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     // socket instead of growing memory without limit while the state loop is
     // busy (256 in-flight requests is far beyond any real session).
     let (tx, rx) = mpsc::sync_channel::<Envelope>(256);
+
+    // AX event trampolines push a Refresh envelope through this so the state
+    // loop wakes instantly instead of waiting for the next tick. try_send
+    // only: a full queue must never block the AppKit event loop.
+    let _ = EVENT_TX.set(tx.clone());
 
     // State loop on its own thread (single owner of daemon state).
     let subs_for_loop = subscribers.clone();
@@ -442,6 +461,17 @@ impl Daemon {
         let id = request.id;
         match request.command {
             Command::Ping => HandleResult::ok(id, json!({ "pong": true })),
+            Command::Refresh => {
+                // Internal wake from the AX event trampoline: run one
+                // observation pass immediately so newly created windows tile
+                // without waiting for the periodic tick.
+                let changed = self.refresh_observation();
+                let result = HandleResult::ok(id, json!({ "refreshed": changed }));
+                if changed {
+                    return result.with_notifications(vec![Notification::StateChanged]);
+                }
+                result
+            }
             Command::Doctor => {
                 #[cfg(target_os = "macos")]
                 let sa_diagnostics = {
@@ -1056,6 +1086,10 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
         Ok(Config::default())
     }
 }
+
+/// Handle for AX-event trampolines to wake the state loop immediately.
+/// Set once in run_daemon before any thread that could trigger events.
+static EVENT_TX: std::sync::OnceLock<mpsc::SyncSender<Envelope>> = std::sync::OnceLock::new();
 
 fn default_socket_path() -> PathBuf {
     // Keyed on the REAL uid (getuid), never $UID: a daemon started from one

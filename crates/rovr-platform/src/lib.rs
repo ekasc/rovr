@@ -82,4 +82,10 @@ pub trait Platform: Send {
     fn sa_reinject_diagnostics(&self) -> Option<SaReinjectDiag> {
         None
     }
+    /// Register a callback invoked (on the platform's event thread) whenever
+    /// a window event is observed. Used to wake the daemon's state loop
+    /// immediately; observation remains snapshot-authoritative.
+    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        let _ = watcher;
+    }
 }
