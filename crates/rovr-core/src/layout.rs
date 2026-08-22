@@ -201,7 +201,8 @@ pub fn apply_layout(
         }
         let is_floating = !is_tileable(w)
             || matches_float_rule(w, rules, observed, workspaces)
-            || matches_open_scratchpad(w, &config.scratchpads, scratchpads);
+            || matches_open_scratchpad(w, &config.scratchpads, scratchpads)
+            || desired.windows.get(&w.id).is_some_and(|t| t.floating);
         if is_floating {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
