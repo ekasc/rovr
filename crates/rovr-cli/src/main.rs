@@ -28,6 +28,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum TopCommand {
     Ping,
+    #[command(about = "Run one observation pass now (internal)")]
+    Refresh,
     Doctor,
     Sa(SaArgs),
     Query(QueryArgs),
@@ -167,10 +169,19 @@ struct SpaceArgs {
 
 #[derive(Debug, Subcommand)]
 enum SpaceSubcommand {
-    Focus { space: u64 },
-    Create { anchor: Option<u64> },
-    Destroy { space: u64 },
-    Move { space: u64, after: u64 },
+    Focus {
+        space: u64,
+    },
+    Create {
+        anchor: Option<u64>,
+    },
+    Destroy {
+        space: u64,
+    },
+    Move {
+        space: u64,
+        after: u64,
+    },
     #[command(
         name = "toggle-insets",
         about = "Collapse/restore all gap+padding for the session"
@@ -388,6 +399,7 @@ fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -
 fn map_command(command: TopCommand) -> Command {
     match command {
         TopCommand::Ping => Command::Ping,
+        TopCommand::Refresh => Command::Refresh,
         TopCommand::Doctor => Command::Doctor,
         TopCommand::Query(args) => Command::Query(match args.command {
             QuerySubcommand::Windows => QueryCommand::Windows,
