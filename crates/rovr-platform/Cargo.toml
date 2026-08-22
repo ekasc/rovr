@@ -10,6 +10,7 @@ build = "build.rs"
 rovr-core.workspace = true
 rovr-types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 cc = "1"

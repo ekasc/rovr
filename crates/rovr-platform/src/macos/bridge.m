@@ -32,6 +32,7 @@ typedef CGError (*rovr_sls_space_set_compat_id_fn)(int cid, uint64_t sid, int wo
 typedef CGError (*rovr_sls_set_window_list_workspace_fn)(int cid, uint32_t *window_list, int window_count, int workspace);
 typedef CFArrayRef (*rovr_sls_copy_spaces_for_windows_fn)(int cid, int selector, CFArrayRef window_list);
 typedef int64_t (*rovr_sls_perform_async_bridged_op_fn)(void *operation);
+typedef CGError (*rovr_sls_set_active_menu_bar_display_identifier_fn)(int cid, CFStringRef uuid, CFStringRef uuid2);
 
 static rovr_sls_main_connection_fn g_sls_main_connection = NULL;
 static rovr_sls_copy_managed_display_spaces_fn g_sls_copy_managed_display_spaces = NULL;
@@ -43,6 +44,9 @@ static rovr_sls_space_set_compat_id_fn g_sls_space_set_compat_id = NULL;
 static rovr_sls_set_window_list_workspace_fn g_sls_set_window_list_workspace = NULL;
 static rovr_sls_copy_spaces_for_windows_fn g_sls_copy_spaces_for_windows = NULL;
 static rovr_sls_perform_async_bridged_op_fn g_sls_perform_async_bridged_op = NULL;
+// Activates a display (yabai: display_manager_set_active_display_id). Needed
+// so cross-display Space switches actually bring the other display forward.
+static rovr_sls_set_active_menu_bar_display_identifier_fn g_sls_set_active_menu_bar_display_identifier = NULL;
 
 static _Atomic int g_needs_refresh = 0;
 
@@ -178,6 +182,19 @@ static int rovr_ax_bool_for_window(AXUIElementRef window, CFStringRef attribute)
     return result;
 }
 
+// 1 = attribute present with a non-NULL value (any type), 0 = supported but
+// NULL / unsupported, 2 = query failed. Used for element-valued attributes
+// like the window-control buttons, which are not booleans.
+static int rovr_ax_present_for_window(AXUIElementRef window, CFStringRef attribute) {
+    if (!window || !attribute) return 2;
+    CFTypeRef value = NULL;
+    AXError err = AXUIElementCopyAttributeValue(window, attribute, &value);
+    if (err != kAXErrorSuccess) return 0;
+    if (!value) return 0;
+    CFRelease(value);
+    return 1;
+}
+
 static int rovr_ax_managed_for_window(AXUIElementRef window) {
     if (!window) return 2;
     CFTypeRef role = NULL;
@@ -204,6 +221,21 @@ static int rovr_ax_managed_for_window(AXUIElementRef window) {
     } else {
         if (subrole) CFRelease(subrole);
     }
+    // Toast/HUD filter: notification banners and overlays (e.g. browser web
+    // notification toasts, Chromium popup overlays) can present as plain
+    // AXWindows with NO floating subrole. Two independent signals mark them:
+    //   1. not activatable — a toast cannot take keyboard focus;
+    //   2. no window-control buttons at all (close/minimize/zoom all absent
+    //      or unsupported) — borderless chrome-less overlay windows.
+    // Signal 2 matters because Chromium apps do not expose "AXActivatable"
+    // at all (kAXErrorAttributeUnsupported on every window). A window that
+    // exposes ANY control button keeps the verdict above; unknowns stay
+    // honest instead of guessing.
+    if (rovr_ax_bool_for_window(window, CFSTR("AXActivatable")) == 0) return 0;
+    int close = rovr_ax_present_for_window(window, kAXCloseButtonAttribute);
+    int minimize = rovr_ax_present_for_window(window, kAXMinimizeButtonAttribute);
+    int zoom = rovr_ax_present_for_window(window, kAXZoomButtonAttribute);
+    if (close == 0 && minimize == 0 && zoom == 0) return 0;
     return 1;
 }
 
@@ -297,6 +329,9 @@ int rovr_bridge_init(void) {
         (rovr_sls_set_window_list_workspace_fn)dlsym(RTLD_DEFAULT, "SLSSetWindowListWorkspace");
     g_sls_copy_spaces_for_windows =
         (rovr_sls_copy_spaces_for_windows_fn)dlsym(RTLD_DEFAULT, "SLSCopySpacesForWindows");
+    g_sls_set_active_menu_bar_display_identifier =
+        (rovr_sls_set_active_menu_bar_display_identifier_fn)dlsym(
+            RTLD_DEFAULT, "SLSSetActiveMenuBarDisplayIdentifier");
     g_sls_perform_async_bridged_op = (rovr_sls_perform_async_bridged_op_fn)rovr_macho_find_symbol(
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
@@ -331,6 +366,12 @@ uint64_t rovr_bridge_capabilities(void) {
 int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) {
     if (!callback) return 1;
 
+    // Bounds for the per-snapshot caches. 512 windows / 64 apps is far beyond
+    // any real session; overflow simply leaves extra windows unrefined (they
+    // stay "unknown" on the Rust side, which is conservative and honest).
+    #define ROVR_ENUM_MAX_WINDOWS 512
+    #define ROVR_ENUM_MAX_PIDS 64
+
     @autoreleasepool {
         const uint32_t focused_window_id = rovr_focused_window_id();
         CFArrayRef list = CGWindowListCopyWindowInfo(
@@ -338,8 +379,19 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             kCGNullWindowID);
         if (!list) return 2;
 
+        // ---- Pass 1: collect candidates with the same filters as before ----
+        struct {
+            uint32_t window_id;
+            pid_t pid;
+            CGRect bounds;
+            CFDictionaryRef entry; // backed by `list`, alive through pass 3
+        } cand[ROVR_ENUM_MAX_WINDOWS];
+        int cand_count = 0;
+        pid_t pids[ROVR_ENUM_MAX_PIDS];
+        int pid_count = 0;
+
         CFIndex count = CFArrayGetCount(list);
-        for (CFIndex i = 0; i < count; i++) {
+        for (CFIndex i = 0; i < count && cand_count < ROVR_ENUM_MAX_WINDOWS; i++) {
             CFDictionaryRef entry = CFArrayGetValueAtIndex(list, i);
             CFNumberRef layer_number = CFDictionaryGetValue(entry, kCGWindowLayer);
             int layer = 0;
@@ -358,8 +410,66 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             if (!CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds)) continue;
             if (bounds.size.width <= 1.0 || bounds.size.height <= 1.0) continue;
 
+            cand[cand_count].window_id = (uint32_t)window_id;
+            cand[cand_count].pid = owner_pid;
+            cand[cand_count].bounds = bounds;
+            cand[cand_count].entry = entry;
+            cand_count++;
+
+            BOOL known_pid = NO;
+            for (int p = 0; p < pid_count; ++p) {
+                if (pids[p] == owner_pid) { known_pid = YES; break; }
+            }
+            if (!known_pid && pid_count < ROVR_ENUM_MAX_PIDS) {
+                pids[pid_count++] = owner_pid;
+            }
+        }
+
+        // ---- Pass 2: resolve AX elements ONCE PER APP -----------------------
+        // Previously each candidate window re-copied the full CG window list
+        // plus its app's full AX window array — O(N^2) IPC that made every
+        // snapshot cost ~350 ms and blocked the state loop behind it. One
+        // kAXWindowsAttribute query per app makes a snapshot O(apps + windows).
+        uint32_t ax_ids[ROVR_ENUM_MAX_WINDOWS];
+        AXUIElementRef ax_elems[ROVR_ENUM_MAX_WINDOWS];
+        int ax_count = 0;
+        const BOOL dbg = getenv("ROVR_BRIDGE_DEBUG") != NULL;
+        for (int p = 0; p < pid_count; ++p) {
+            @autoreleasepool {
+                AXUIElementRef app = AXUIElementCreateApplication(pids[p]);
+                if (!app) continue;
+                CFTypeRef value = NULL;
+                if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
+                    value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+                    CFArrayRef windows = (CFArrayRef)value;
+                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: %ld ax windows\n", pids[p], (long)CFArrayGetCount(windows));
+                    for (CFIndex j = 0; j < CFArrayGetCount(windows) && ax_count < ROVR_ENUM_MAX_WINDOWS; j++) {
+                        AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(windows, j);
+                        if (!w || CFGetTypeID(w) != AXUIElementGetTypeID()) continue;
+                        CGWindowID gid = 0;
+                        if (g_ax_get_window(w, &gid) == kAXErrorSuccess && gid != 0) {
+                            ax_ids[ax_count] = (uint32_t)gid;
+                            ax_elems[ax_count] = (AXUIElementRef)CFRetain(w);
+                            ax_count++;
+                        }
+                    }
+                    CFRelease(value);
+                } else if (dbg) {
+                    fprintf(stderr, "[rovr-enum] pid %d: kAXWindowsAttribute failed\n", pids[p]);
+                }
+                CFRelease(app);
+            }
+        }
+        if (dbg) fprintf(stderr, "[rovr-enum] candidates=%d pids=%d ax_mapped=%d\n", cand_count, pid_count, ax_count);
+
+        // ---- Pass 3: emit windows, refining from the cached AX elements ----
+        for (int i = 0; i < cand_count; i++) {
+            uint32_t window_id = cand[i].window_id;
+            pid_t owner_pid = cand[i].pid;
+            CGRect bounds = cand[i].bounds;
+
             rovr_bridge_window window = {0};
-            window.id = (uint32_t)window_id;
+            window.id = window_id;
             window.pid = owner_pid;
             window.display_id = rovr_display_for_rect(bounds);
             window.space_id = rovr_space_id_for_window(window.id);
@@ -374,11 +484,12 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             window.fullscreen = 2;
             window.managed = 2;
 
-            // Best-effort AX refinement. This is per-window (may be slow)
-            // but necessary for truthful observation: minimized/fullscreen
-            // and AX dialog/system-floating distinction. Transient windows
-            // that disappear between CG and AX simply stay unknown.
-            AXUIElementRef ax_window = rovr_ax_window_for_id(window.id, NULL);
+            // Best-effort AX refinement from the per-app cache. Transient
+            // windows missing from AX simply stay unknown.
+            AXUIElementRef ax_window = NULL;
+            for (int a = 0; a < ax_count; ++a) {
+                if (ax_ids[a] == window_id) { ax_window = ax_elems[a]; break; }
+            }
             if (ax_window) {
                 int minimized = rovr_ax_bool_for_window(ax_window, kAXMinimizedAttribute);
                 int fullscreen = rovr_ax_bool_for_window(ax_window, CFSTR("AXFullScreen"));
@@ -386,11 +497,10 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
                 window.minimized = (uint8_t)(minimized == 2 ? 2 : (minimized ? 1 : 0));
                 window.fullscreen = (uint8_t)(fullscreen == 2 ? 2 : (fullscreen ? 1 : 0));
                 window.managed = (uint8_t)(managed == 2 ? 2 : (managed ? 1 : 0));
-                CFRelease(ax_window);
             }
 
-            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowOwnerName), window.app, sizeof(window.app));
-            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowName), window.title, sizeof(window.title));
+            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowOwnerName), window.app, sizeof(window.app));
+            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowName), window.title, sizeof(window.title));
 
             NSRunningApplication *application =
                 [NSRunningApplication runningApplicationWithProcessIdentifier:owner_pid];
@@ -401,6 +511,10 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             }
 
             callback(&window, context);
+        }
+
+        for (int a = 0; a < ax_count; ++a) {
+            CFRelease(ax_elems[a]);
         }
 
         CFRelease(list);
@@ -632,17 +746,54 @@ int rovr_bridge_focus_space(uint64_t space_id) {
     CFStringRef target_uuid = g_sls_copy_managed_display_for_space(cid, space_id);
     if (!target_uuid) return 2;
     uint64_t current_sid = g_sls_managed_display_get_current_space(cid, target_uuid);
-    CFRelease(target_uuid);
-    if (current_sid == space_id) return 0;
+    if (current_sid == space_id) {
+        CFRelease(target_uuid);
+        return 0;
+    }
 
     int current_index = rovr_mission_control_index(cid, current_sid);
     int target_index = rovr_mission_control_index(cid, space_id);
-    if (current_index == 0 || target_index == 0) return 3;
+    if (current_index == 0 || target_index == 0) {
+        CFRelease(target_uuid);
+        return 3;
+    }
+
+    // Cross-display handling (mirrors yabai's space_manager_focus_space_using_
+    // gesture): dock swipes are delivered to the display under the CURSOR, so
+    // when the target Space lives on another display, warp the cursor to that
+    // display's center first and activate it afterwards — otherwise the swipe
+    // navigates the wrong display's stack and nothing happens.
+    CFUUIDRef target_uuid_parsed = CFUUIDCreateFromString(NULL, target_uuid);
+    uint32_t new_did =
+        target_uuid_parsed ? CGDisplayGetDisplayIDFromUUID(target_uuid_parsed) : 0;
+    if (target_uuid_parsed) CFRelease(target_uuid_parsed);
+
+    BOOL warp_cursor = NO;
+    if (new_did != 0) {
+        CGPoint cursor = CGPointZero;
+        CGEventRef cursor_event = CGEventCreate(NULL);
+        if (cursor_event) {
+            cursor = CGEventGetLocation(cursor_event);
+            CFRelease(cursor_event);
+        }
+        CGRect target_bounds = CGDisplayBounds(new_did);
+        BOOL cursor_on_target =
+            cursor.x >= CGRectGetMinX(target_bounds) && cursor.x < CGRectGetMaxX(target_bounds) &&
+            cursor.y >= CGRectGetMinY(target_bounds) && cursor.y < CGRectGetMaxY(target_bounds);
+        if (!cursor_on_target) {
+            warp_cursor = YES;
+            CGWarpMouseCursorPosition(
+                CGPointMake(CGRectGetMidX(target_bounds), CGRectGetMidY(target_bounds)));
+        }
+    }
 
     int delta = target_index - current_index;
     float sign = delta > 0 ? 1.0f : -1.0f;
     CGEventRef event = CGEventCreate(NULL);
-    if (!event) return 4;
+    if (!event) {
+        CFRelease(target_uuid);
+        return 4;
+    }
     CGEventSetIntegerValueField(event, 55, 30);     // kCGSEventDockControl
     CGEventSetIntegerValueField(event, 110, 23);    // kIOHIDEventTypeDockSwipe
     CGEventSetIntegerValueField(event, 123, 1);     // kCGGestureMotionHorizontal
@@ -656,6 +807,13 @@ int rovr_bridge_focus_space(uint64_t space_id) {
         CGEventPost(kCGSessionEventTap, event);
     }
     CFRelease(event);
+
+    if (warp_cursor && g_sls_set_active_menu_bar_display_identifier) {
+        // Activate the target display so the cross-display switch completes
+        // (yabai: display_manager_set_active_display_id). Best-effort.
+        g_sls_set_active_menu_bar_display_identifier(cid, target_uuid, target_uuid);
+    }
+    CFRelease(target_uuid);
     return 0;
 }
 
