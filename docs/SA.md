@@ -42,12 +42,64 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
   - `injected_compatible` — handshake answers with a `rovr-sa-1.*` version and all space-capability bits set
   - `incompatible_protocol` — something answers on the socket with a foreign/outdated version
   - `capability_missing` — compatible payload but some space-capability bits absent on this macOS build
-- `rovr sa install` — locates the built artifacts (`cargo build -p rovr-sa-payload -p rovr-sa-loader`; env overrides `ROVR_SA_PAYLOAD`/`ROVR_SA_LOADER`), verifies root + SIP scope (see `docs/SA_SIP.md`), copies them to `/Library/Application Support/rovr/`, runs the loader to inject into Dock, then polls the socket for a valid handshake as verification. Non-root invocations print the exact command to run instead of attempting anything.
-- `rovr sa uninstall` — removes the installed files and restarts Dock so the payload unloads.
+  It also reports the full lifecycle picture (`-- lifecycle --` section): privileged **service** state (`not_installed`, `installed`, `registered`; `awaiting_approval` is reserved for future SMAppService flows), the installed payload sha256 vs the install-time marker, and whether the **injected** payload differs from the **installed** one (replacing the dylib on disk does NOT update code already mapped into Dock — status flags that mismatch explicitly).
+- `rovr sa install` — full install lifecycle:
+  1. locates the built artifacts (`cargo build -p rovr-sa-payload -p rovr-sa-loader -p rovr-sa-helper`; env overrides `ROVR_SA_PAYLOAD`/`ROVR_SA_LOADER`/`ROVR_SA_HELPER`)
+  2. verifies root + SIP scope (see `docs/SA_SIP.md`)
+  3. copies payload dylib (0644), loader (0744) and helper (0744) into root-owned `/Library/Application Support/rovr/`
+  4. registers the privileged LaunchDaemon (`com.rovr.sa-helper`) via `launchctl bootstrap system`
+  5. triggers the initial injection by running the loader directly (root)
+  6. polls the socket for a verified handshake as the console user
+  7. writes `payload.installed.json` (installed/injected sha256 + handshake version) and reports actual capability bits
+
+  Failure at any stage is reported honestly; success is only claimed after a verified handshake, never merely because files were copied.
+- `rovr sa uninstall` — unregisters the LaunchDaemon first (guaranteeing no further reinjection), removes the plist, helper, loader, payload, identity marker, stale SA socket, then restarts Dock (required: code already mapped into Dock cannot be evicted any other way). Nothing privileged is left behind.
+
+## Automatic reinjection
+
+The Rovr scripting addition lives INSIDE Dock and dies whenever Dock dies or the machine reboots. Rovr restores it automatically without sudoers:
+
+```
+normal rovr daemon
+    |  observes: Dock PID change / SA socket gone / handshake dead
+    v
+bounded reinjection state machine   (crates/rovr-platform/src/macos/reinject.rs)
+    |  ONE request per attempt, single-flight, backoff 5s→15s→45s,
+    |  max 4 attempts per Dock generation, quiet until Dock changes again
+    v
+privileged helper (root LaunchDaemon, socket-activated)
+    |  inject() ONLY: authenticates peer, resolves Dock ITSELF,
+    |  validates fixed root-owned artifacts, runs fixed loader on fixed payload
+    v
+daemon re-probes handshake within a bounded window → capabilities refresh
+```
+
+Division of responsibility:
+
+- **Unprivileged daemon**: Dock lifecycle detection, SA health probing, retry policy, verification, diagnostics. All failure paths degrade to non-SA operation — every other Rovr capability keeps working if injection fails.
+- **Privileged helper** (`crates/rovr-sa-helper`): nothing but `inject()` and `status()`. No polling, no timers, no window-management policy, no config, no arbitrary targets.
+
+### Privileged helper security model
+
+- The request frame is exactly `{magic, proto, opcode, uid}` — there is structurally NO field for a pid, path, command or environment (unit-tested).
+- Payload/loader/helper paths are compile-time constants pointing at the root-owned installed artifacts; the helper resolves Dock itself via `NSRunningApplication` and never trusts a caller-supplied PID.
+- Callers are authenticated with `getpeereid()`: kernel peer uid must equal BOTH the uid in the request AND the owner of `/dev/console` (the GUI session user). Sockets are UID-specific (`/tmp/rovr-sa_<uid>.sock`), so an injection is always bound to the requesting console session; other users' processes are refused.
+- Artifacts are re-validated before every use: regular files only (`lstat` + `O_NOFOLLOW` — symlinks refused), root-owned, expected modes, install directory not group/other-writable.
+- The helper runs the loader via `posix_spawn` with a FIXED argv and a fixed minimal environment — nothing inherited from the request or daemon.
+- Event-driven only: launchd starts the helper when a client connects; no root process polls anything.
+
+### Service management — why not SMAppService
+
+Apple's current API, `SMAppService.daemon(plistName:)` (macOS 13+), registers a LaunchDaemon whose executable must be contained in the calling app bundle's `Contents/Library/LaunchDaemons`. Rovr is distributed as cargo-built CLI binaries with no `.app` bundle, so SMAppService is technically unusable without repackaging the entire distribution model. Rather than shipping a pseudo-SMAppService, Rovr uses the explicit minimal fallback documented here: a root-owned `/Library/LaunchDaemons/com.rovr.sa-helper.plist` registered once via `launchctl bootstrap` by `sudo rovr sa install`. This is standard launchd registration performed by an explicit root command — it requires NO sudoers modification, NOPASSWD or otherwise, and creates no generic root-execution hole: the service accepts exactly two fixed-frame requests and can only ever run the fixed loader against the fixed payload. If Rovr later ships inside an app bundle, migrating to SMAppService is a packaging change, not a protocol change.
 
 ## Doctor integration
 
 - `rovr doctor` includes `sa: { socket, present, version, compatible, attribs, expected_prefix }` plus `snapshot_wedged_ms` for observation-worker health. Incompatible or missing payload is reported cleanly, not silently degraded.
+- It also includes `sa_reinject`: the daemon's live reinjection lifecycle — `phase` (healthy/injecting/verifying/failed), `generation` and `dock_pid` (every attempt is keyed to the Dock generation), `attempts_this_generation`, `retry_in_secs` (active backoff), `pending`, `last_result`, `last_error` and the fixed `helper_socket`. No secrets or privileged internals are exposed.
+
+## Update behavior
+
+Replacing the installed payload dylib does NOT update code already mapped into Dock. `rovr sa status` detects this: install writes a `payload.installed.json` marker recording the installed sha256 AND the sha256 that was actually injected; if the current file hash differs from the injected hash, status reports `injection: STALE` with the remediation (`sudo rovr sa install`). Dock is never killed automatically during an update — reinjection into the running Dock happens only via the explicit install command or the daemon's bounded automatic path (which injects the currently installed build into a NEW Dock).
 
 ## Versioning
 
@@ -55,4 +107,4 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
 
 ## Verification status
 
-The payload, loader and install lifecycle compile and the protocol client is unit-tested, but injection requires SIP relaxation (recovery-mode reboot) and has NOT been verified end-to-end on a live macOS yet. Until then, SA-gated capabilities remain `[~] implemented but not verified end-to-end` in `docs/ROADMAP.md`.
+The payload, loader, helper and install lifecycle compile and the protocol client + reinjection state machine are unit-tested, but injection requires SIP relaxation (recovery-mode reboot) and has NOT been verified end-to-end on a live macOS yet. Automatic reinjection (Dock restart AND reboot recovery) is NOT marked done: both must be demonstrated in a real interactive session per docs/ROADMAP.md before claiming `[x]`. Until then, SA-gated capabilities remain `[~] implemented but not verified end-to-end` in `docs/ROADMAP.md`.

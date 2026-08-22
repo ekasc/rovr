@@ -1,0 +1,11 @@
+[package]
+name = "rovr-sa-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rovr privileged SA helper: launchd service that injects the fixed Rovr payload into Dock on request"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
