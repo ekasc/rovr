@@ -33,6 +33,17 @@ Rovr will **not** ask for `csrutil disable` (full SIP off). `rovr sa install` ch
 - When injection is missing or incompatible, `rovr doctor` marks `capabilities.{create_space,destroy_space,reorder_space,layer,sticky,shadow,opacity,scale} = false` and `sa.present = false` with the expected version prefix — no silent fallback to a yabai payload (different socket namespace).
 - `rovr sa install` / `rovr sa uninstall` are the only operations that touch privileged state.
 
+## Privileged helper — no sudoers, ever
+
+Automatic SA reinjection uses a narrowly scoped root LaunchDaemon (`com.rovr.sa-helper`, socket-activated at `/var/run/rovr-sa-helper.sock`). There is NO sudoers rule — NOPASSWD or otherwise — and no generic root-execution path anywhere in Rovr:
+
+- The request frame carries only `{magic, proto, opcode, uid}`; it cannot name a pid, dylib, command or environment variable.
+- The helper resolves Dock itself (`NSRunningApplication`, bundle id `com.apple.dock`) and validates the fixed root-owned loader/payload (regular files, no symlinks, root-owned, exact modes) before every use.
+- Peer credentials (`getpeereid`) must match the requesting uid AND the `/dev/console` owner, tying every injection to the requesting GUI session.
+- A random local process cannot make the helper inject arbitrary code into arbitrary processes — the only executable it can ever run is the installed `rovr-sa-loader` against the installed `librovr_sa_payload.dylib`.
+
+Full model in `docs/SA.md` ("Privileged helper security model").
+
 ## Verification status
 
 The SIP check logic is implemented in `rovr sa install`, but the actual injection flow has NOT been exercised end-to-end yet (requires a recovery-mode reboot). The exact `csrutil` invocations above must be verified per supported macOS minor before claiming `[x]`; do not promote the SA roadmap items until then.

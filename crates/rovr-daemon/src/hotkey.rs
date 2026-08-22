@@ -130,6 +130,10 @@ fn dispatch_via_ipc(socket_path: &PathBuf, command: rovr_protocol::Command) -> R
     let mut stream = UnixStream::connect(socket_path)?;
     serde_json::to_writer(&mut stream, &req)?;
     stream.write_all(b"\n")?;
+    // Read the response (content ignored): without this the daemon's reply
+    // write hits a half-closed socket and logs spurious "IPC client failed"
+    // noise on every hotkey press.
+    let _ = std::io::Read::read_to_end(&mut stream, &mut Vec::new());
     Ok(())
 }
 

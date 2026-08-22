@@ -50,10 +50,23 @@
 - [~] 13. Unknown macOS observation state is collapsed into misleading booleans
   - `ObservedBool { Yes, No, Unknown }` for `minimized`/`fullscreen`/`managed`; bridge passes 0/1/2 through unmapped; tiling policy conservative (any Unknown ⇒ not tiled); direction-focus excludes Unknown-minimized; query output serializes unknown honestly. Test added. Live-macOS diagnostics output not yet eyeballed.
 
+- [~] 14. Automatic SA reinjection after Dock restart/reboot (no sudoers)
+  - New `crates/rovr-sa-helper`: minimal root LaunchDaemon (`com.rovr.sa-helper`, socket-activated at `/var/run/rovr-sa-helper.sock`, launchd-owned socket, on-demand). API is exactly `inject()` + `status()` over fixed `{magic,proto,opcode,uid}` frames — structurally NO pid/path/command/env fields. Resolves Dock ITSELF; validates fixed root-owned artifacts every use (lstat+O_NOFOLLOW, root-owned, modes); auth via `getpeereid` == request uid == `/dev/console` owner. Fixed argv + minimal env for the loader. Event-driven only.
+  - SMAppService NOT usable: it requires the executable inside an app bundle's `Contents/Library/LaunchDaemons`; Rovr ships as bare cargo CLI binaries. Explicit fallback documented in docs/SA.md — no sudoers anywhere.
+  - `reinject.rs` pure state machine: Dock-generation keyed, single-flight, bounded verify window, backoff 5s→15s→45s, max 4 attempts/generation then quiet until Dock changes (no retry storm). Integrated into MacPlatform::needs_refresh; SA cache now refreshes on version/attribs change (capabilities follow reinjection). Non-SA Rovr unaffected on failure.
+  - CLI: `sa install` = files → service registration → direct injection → verified handshake → identity marker (`payload.installed.json`) → capability report. `sa uninstall` = bootout FIRST → plist/helper/loader/payload/marker/socket removal → documented Dock restart. `sa status` reports service/payload/injection states incl. installed≠injected payload mismatch. Doctor exposes `sa_reinject` lifecycle.
+  - Tests: 15 platform (single-flight, generation invalidation, late-result discard, bounded retries, backoff, verify window, client protocol/refusals) + 2 CLI + 1 daemon doctor. Helper compiles clean with clang -Wall.
+  - NOT VERIFIED live: initial install w/ SIP relaxation, killall Dock reinjection, reboot recovery, repeated Dock crashes, update simulation — all require a real interactive session (docs/SA.md acceptance criteria). Do not promote to [x] until demonstrated.
+
+- [x] 14b. Latency edge-case sweep (state-loop head-of-line blocking class)
+  - Root cause of "first switch slow" found by instrumentation: state loop did periodic O(N²) enumeration + synchronous waits, so requests queued behind observation cycles.
+  - Fixed: per-app AX resolution in enumerate_windows (O(apps+windows)); async periodic snapshots via new `BoundedWorker::submit/poll` (`request_periodic_snapshot`/`poll_periodic_snapshot` trait methods; verification paths keep the synchronous worker); adaptive reconcile cadence (100 ms burst for ~2 s after activity, configured interval when idle); timestamp-paced gesture gate replacing SLS busy-poll; throttled short-deadline SA health probes (wedged payload can't stall the loop); cross-display Space focus (cursor warp to target display + `SLSSetActiveMenuBarDisplayIdentifier`, mirroring yabai); IPC socket keyed on real `getuid()` not `$UID`; hotkey dispatch reads its response (no EPIPE noise); bounded envelope channel.
+  - Verified live: 12 rapid switches at 250 ms spacing complete in ≤240 ms each with ZERO queue waits; one-time cold-start cost only. fmt/clippy/tests clean.
+
 ## Full checks
 
-- `cargo fmt --all -- --check` — clean
+- `git diff --check` — clean; `cargo fmt --all -- --check` — clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean
-- `cargo test --workspace` — 89 passed, 0 failed
+- `cargo test --workspace` — 104 passed, 0 failed
 - Swift menu-bar app: no changes made; existing build checks untouched.
 - CI: not run (no CI trigger from this session).
