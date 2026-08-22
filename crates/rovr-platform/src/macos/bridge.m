@@ -595,6 +595,33 @@ int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized) {
     return err == kAXErrorSuccess ? 0 : 2;
 }
 
+// Press a named button child (AXCloseButton / AXFullScreenButton) of a window.
+// Shared by close and native-fullscreen toggle. Returns 0 on success.
+static int rovr_ax_press_window_button(uint32_t window_id, CFStringRef button_attribute) {
+    AXUIElementRef window = rovr_ax_window_for_id(window_id, NULL);
+    if (!window) return 1;
+    int result = 2;
+    AXUIElementRef button = NULL;
+    if (AXUIElementCopyAttributeValue(window, button_attribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
+        if (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) {
+            result = 0;
+        }
+    }
+    if (button) CFRelease(button);
+    CFRelease(window);
+    return result;
+}
+
+int rovr_bridge_close_window(uint32_t window_id) {
+    return rovr_ax_press_window_button(window_id, kAXCloseButtonAttribute);
+}
+
+int rovr_bridge_toggle_fullscreen(uint32_t window_id) {
+    // The fullscreen button only exists while the window supports native
+    // fullscreen; error 2 surfaces as "unsupported" to the caller.
+    return rovr_ax_press_window_button(window_id, kAXFullScreenButtonAttribute);
+}
+
 int32_t rovr_bridge_dock_pid(void) {
     @autoreleasepool {
         NSArray<NSRunningApplication *> *apps = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"];

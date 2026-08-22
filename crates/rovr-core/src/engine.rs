@@ -37,6 +37,10 @@ pub enum EngineError {
     WorkspaceNotFound(String),
     #[error("workspace {0} has no backing space")]
     WorkspaceNoBacking(String),
+    #[error("no focused window in observed state")]
+    NoFocusedWindow,
+    #[error("resize would shrink the window below its minimum size")]
+    ResizeTooSmall,
 }
 #[derive(Default)]
 pub struct Engine {
@@ -482,10 +486,10 @@ impl Engine {
     /// `DesiredState` later.
     pub fn set_window_layer(
         &self,
-        window: WindowId,
+        window: Option<WindowId>,
         layer: i32,
     ) -> Result<Vec<Action>, EngineError> {
-        self.require_window(window)?;
+        let window = self.resolve_window(window)?;
         Ok(vec![Action::SetWindowLayer { window, layer }])
     }
 
@@ -605,10 +609,10 @@ impl Engine {
 
     pub fn move_window_to_workspace(
         &self,
-        window: WindowId,
+        window: Option<WindowId>,
         name: &str,
     ) -> Result<Vec<Action>, EngineError> {
-        self.require_window(window)?;
+        let window = self.resolve_window(window)?;
         let space = self
             .workspaces
             .backing_for(name)
@@ -621,11 +625,127 @@ impl Engine {
         self.workspaces.name_for_space(space)
     }
 
+    /// The currently focused window, if observation saw one.
+    pub fn focused_window(&self) -> Option<WindowId> {
+        self.observed
+            .windows
+            .values()
+            .find(|w| w.focused)
+            .map(|w| w.id)
+    }
+
+    /// Resolve an optional window id: an explicit id must exist; None means
+    /// "the focused window". Commands that default to focus use this so
+    /// hotkey binds never need a `query focused` subshell.
+    pub fn resolve_window(&self, window: Option<WindowId>) -> Result<WindowId, EngineError> {
+        match window {
+            Some(id) => {
+                self.require_window(id)?;
+                Ok(id)
+            }
+            None => self.focused_window().ok_or(EngineError::NoFocusedWindow),
+        }
+    }
+
+    /// Close a window via its AX close button (None = the focused one).
+    pub fn close_window(&mut self, window: Option<WindowId>) -> Result<Vec<Action>, EngineError> {
+        let window = self.resolve_window(window)?;
+        Ok(vec![Action::CloseWindow { window }])
+    }
+
+    /// Toggle the native fullscreen state of a window.
+    pub fn toggle_fullscreen(
+        &mut self,
+        window: Option<WindowId>,
+    ) -> Result<Vec<Action>, EngineError> {
+        let window = self.resolve_window(window)?;
+        Ok(vec![Action::ToggleNativeFullscreen { window }])
+    }
+
+    /// Pull a managed window out of the tiling layout, or tile it again. The
+    /// flag lives in desired state so it survives restarts and flows through
+    /// reconciliation like every other desired property.
+    pub fn toggle_float(&mut self, window: Option<WindowId>) -> Result<(), EngineError> {
+        let window = self.resolve_window(window)?;
+        if !self.observed.windows.contains_key(&window) {
+            return Err(EngineError::WindowNotFound(window));
+        }
+        let target = self.desired.windows.entry(window).or_default();
+        target.floating = !target.floating;
+        if target.floating {
+            // Release from the layout immediately; reconciliation keeps the
+            // current frame for floating windows.
+            target.frame = None;
+        }
+        Ok(())
+    }
+
+    /// Swap with the nearest neighbor in `direction` (None = focused).
+    pub fn swap_windows_direction(
+        &mut self,
+        direction: Direction,
+        window: Option<WindowId>,
+    ) -> Result<(), EngineError> {
+        let from = self.resolve_window(window)?;
+        let target = self.closest_window_in_direction(from, direction)?;
+        self.swap_windows(from, target)
+    }
+
+    /// Insert at the nearest neighbor's tree position (None = focused).
+    pub fn warp_window_direction(
+        &mut self,
+        direction: Direction,
+        window: Option<WindowId>,
+    ) -> Result<(), EngineError> {
+        let from = self.resolve_window(window)?;
+        let target = self.closest_window_in_direction(from, direction)?;
+        self.warp_window(from, target)
+    }
+
+    /// Move one window edge outward by `delta` points (None = focused).
+    /// Absolute-frame composition over the observed frame; BSP ratios are
+    /// re-derived from observed geometry on the next layout pass.
+    pub fn resize_window_edge(
+        &mut self,
+        window: Option<WindowId>,
+        edge: Direction,
+        delta: i32,
+    ) -> Result<Vec<Action>, EngineError> {
+        let window = self.resolve_window(window)?;
+        let snapshot = self
+            .observed
+            .windows
+            .get(&window)
+            .ok_or(EngineError::WindowNotFound(window))?;
+        let mut frame = snapshot.frame;
+        let d = delta as f64;
+        match edge {
+            Direction::North => {
+                frame.y -= d;
+                frame.height += d;
+            }
+            Direction::South => frame.height += d,
+            Direction::East => frame.width += d,
+            Direction::West => {
+                frame.x -= d;
+                frame.width += d;
+            }
+        }
+        // Reject degenerate results only: a resize that would leave less
+        // than a title-bar-sized sliver is refused, everything else passes.
+        const GESTURE_MIN_SIZE: f64 = 40.0;
+        if frame.width < GESTURE_MIN_SIZE || frame.height < GESTURE_MIN_SIZE {
+            return Err(EngineError::ResizeTooSmall);
+        }
+        Ok(vec![Action::SetWindowFrame { window, frame }])
+    }
+
     pub fn focus_direction(
         &mut self,
-        from: WindowId,
+        from: Option<WindowId>,
         direction: Direction,
     ) -> Result<Vec<Action>, EngineError> {
+        let from = self.resolve_window(from)?;
         let target = self.closest_window_in_direction(from, direction)?;
         self.focus_window(target)
     }
@@ -782,7 +902,7 @@ mod tests {
         ])));
 
         let actions = engine
-            .focus_direction(WindowId(1), Direction::East)
+            .focus_direction(Some(WindowId(1)), Direction::East)
             .unwrap();
         assert_eq!(
             actions,
@@ -1364,5 +1484,171 @@ mod tests {
             Some(SpaceId(20)),
             "the created space goes to the lowest-ordinal still-missing workspace"
         );
+    }
+
+    /// Full observation context: one display, one focused Space, two tiled
+    /// windows side by side (window 1 focused).
+    fn snapshot_with_state(engine: &Engine) -> PlatformSnapshot {
+        let mut snap = snapshot(engine.observed.windows.values().cloned().collect());
+        for w in &mut snap.windows {
+            w.generation = engine.observed.generation;
+        }
+        snap.spaces = engine.observed.spaces.values().cloned().collect();
+        snap.displays = engine.observed.displays.values().cloned().collect();
+        snap
+    }
+
+    fn two_window_engine() -> Engine {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![window(1, 0.0, 0.0), window(2, 100.0, 0.0)]);
+        for w in &mut snap.windows {
+            w.space_id = Some(SpaceId(11));
+        }
+        snap.spaces = vec![SpaceSnapshot {
+            id: SpaceId(11),
+            display_id: DisplayId(1),
+            label: None,
+            focused: true,
+            generation: 0,
+            position: 0,
+        }];
+        snap.displays = vec![DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
+            label: None,
+            focused: true,
+            generation: 0,
+        }];
+        engine.apply_event(Event::Snapshot(snap));
+        engine
+    }
+
+    /// Directional swap resolves the nearest neighbor via observed geometry
+    /// and swaps the BSP positions of the focused (default) window.
+    #[test]
+    fn directional_swap_swaps_focused_with_neighbor() {
+        let mut engine = two_window_engine();
+        assert_eq!(engine.focused_window(), Some(WindowId(1)));
+        // Seed the BSP by applying a layout pass first (as steady state does).
+        let _ = engine.apply_event(Event::Snapshot(snapshot_with_state(&engine)));
+        engine
+            .swap_windows_direction(Direction::East, None)
+            .unwrap();
+        // After the swap the tree positions exchanged: window 2 now sits in
+        // window 1's original node. Verify via a fresh layout pass.
+        let mut desired = crate::state::DesiredState::default();
+        apply_layout(
+            &engine.config,
+            &engine.observed,
+            &mut desired,
+            &mut engine.layouts,
+            &engine.workspaces,
+            &engine.plugins,
+            &crate::layout_state::ScratchpadState::new(),
+            &[],
+        );
+        let f1 = desired.windows[&WindowId(1)].frame.unwrap();
+        assert!(f1.x > 50.0, "window 1 must now be on the right: {f1:?}");
+    }
+
+    /// Toggling float removes the window from tiling; toggling again
+    /// re-tiles it. The flag lives in desired state (persists).
+    #[test]
+    fn toggle_float_excludes_window_from_tiling() {
+        let mut engine = two_window_engine();
+        assert!(engine.desired.windows[&WindowId(2)].clone().frame.is_some());
+
+        engine.toggle_float(Some(WindowId(2))).unwrap();
+        // Drive a fresh snapshot through the FULL pipeline so apply_layout
+        // runs against the engine's own desired state (where the flag lives).
+        let snap = snapshot_with_state(&engine);
+        engine.apply_event(Event::Snapshot(snap));
+        let target = engine.desired.windows[&WindowId(2)].clone();
+        assert!(target.floating);
+        assert!(
+            target.frame.is_none(),
+            "floated window must not receive a tile frame"
+        );
+        assert!(engine.desired.windows[&WindowId(1)].clone().frame.is_some());
+
+        // Toggle back: re-enters the layout with a tile frame.
+        engine.toggle_float(Some(WindowId(2))).unwrap();
+        let snap = snapshot_with_state(&engine);
+        engine.apply_event(Event::Snapshot(snap));
+        assert!(
+            engine.desired.windows[&WindowId(2)].clone().frame.is_some(),
+            "un-floated window must be tiled again"
+        );
+    }
+
+    /// Edge resize composes over the observed frame; shrinking below the
+    /// minimum is rejected rather than producing a broken frame.
+    #[test]
+    fn edge_resize_adjusts_frame_and_rejects_too_small() {
+        let mut engine = Engine::default();
+        engine.apply_event(Event::Snapshot(snapshot(vec![window(3, 10.0, 10.0)])));
+
+        let actions = engine
+            .resize_window_edge(Some(WindowId(3)), Direction::East, 50)
+            .unwrap();
+        match actions.as_slice() {
+            [Action::SetWindowFrame {
+                window: WindowId(3),
+                frame,
+            }] => {
+                assert!((frame.width - 150.0).abs() < f64::EPSILON);
+                assert!((frame.x - 10.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected actions {other:?}"),
+        }
+
+        // West composes over the OBSERVED frame again (the SetWindowFrame
+        // above is an action, not an observation): x moves outward 20.
+        let actions = engine
+            .resize_window_edge(Some(WindowId(3)), Direction::West, 20)
+            .unwrap();
+        match actions.as_slice() {
+            [Action::SetWindowFrame { frame, .. }] => {
+                assert!((frame.x - (-10.0)).abs() < f64::EPSILON);
+                assert!((frame.width - 120.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected actions {other:?}"),
+        }
+
+        // Shrinking below minimum errors without emitting actions.
+        let result = engine.resize_window_edge(Some(WindowId(3)), Direction::North, -10_000);
+        assert!(matches!(result, Err(EngineError::ResizeTooSmall)));
+    }
+
+    /// resolve_window falls back to the focused window and validates ids.
+    #[test]
+    fn resolve_window_uses_focus_when_unspecified() {
+        let mut engine = Engine::default();
+        engine.apply_event(Event::Snapshot(snapshot(vec![
+            window(1, 0.0, 0.0),
+            window(2, 100.0, 0.0),
+        ])));
+        assert!(matches!(engine.resolve_window(None), Ok(WindowId(1))));
+        assert!(matches!(
+            engine.resolve_window(Some(WindowId(2))),
+            Ok(WindowId(2))
+        ));
+        assert!(matches!(
+            engine.resolve_window(Some(WindowId(99))),
+            Err(EngineError::WindowNotFound(WindowId(99)))
+        ));
+
+        // No focused window in state: None must error, not guess.
+        let mut empty = Engine::default();
+        empty.apply_event(Event::Snapshot(snapshot(vec![])));
+        assert!(matches!(
+            empty.resolve_window(None),
+            Err(EngineError::NoFocusedWindow)
+        ));
     }
 }

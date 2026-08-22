@@ -15,7 +15,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rovr_config::Config;
-use rovr_core::{Action, Engine, Event};
+use rovr_core::{Action, Engine, EngineError, Event};
 #[cfg(target_os = "macos")]
 use rovr_platform::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -25,6 +25,8 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
+use rovr_types::SpaceId;
+
 mod hotkey;
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -59,6 +61,11 @@ struct Daemon {
     config: Config,
     config_path: PathBuf,
     state_path: PathBuf,
+    /// The space that was current before the current one; updated whenever
+    /// observation sees a change. Backs `space focus-recent`.
+    previous_space: std::cell::Cell<Option<SpaceId>>,
+    /// The currently focused Space as of the last observation.
+    current_space_cell: std::cell::Cell<Option<SpaceId>>,
 }
 
 fn main() -> Result<()> {
@@ -95,6 +102,8 @@ fn main() -> Result<()> {
         config,
         config_path,
         state_path,
+        previous_space: std::cell::Cell::new(None),
+        current_space_cell: std::cell::Cell::new(None),
     };
 
     run_daemon(socket_path, daemon)
@@ -537,44 +546,25 @@ impl Daemon {
                 }
             },
             Command::Window(command) => {
-                match command {
+                // Layout-mutating ops (swap/warp) change BSP structure without
+                // producing actions; they need snapshot → reconcile → verify.
+                let layout_change = match command {
                     WindowCommand::Swap { a, b } => {
-                        return match self.engine.swap_windows(a, b) {
-                            Ok(()) => {
-                                self.persist_state();
-                                match self.platform.snapshot() {
-                                    Ok(snap) => {
-                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
-                                        match self.execute_and_refresh(actions) {
-                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
-                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
-                                        }
-                                    }
-                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
-                                }
-                            }
-                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
-                        };
+                        Some(self.engine.swap_windows(a, b))
                     }
                     WindowCommand::Warp { window, target } => {
-                        return match self.engine.warp_window(window, target) {
-                            Ok(()) => {
-                                self.persist_state();
-                                match self.platform.snapshot() {
-                                    Ok(snap) => {
-                                        let actions = self.engine.apply_event(Event::Snapshot(snap));
-                                        match self.execute_and_refresh(actions) {
-                                            Ok(()) => HandleResult::ok(id, json!({"accepted": true})).with_notifications(vec![Notification::StateChanged]),
-                                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()).with_notifications(vec![Notification::StateChanged]),
-                                        }
-                                    }
-                                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
-                                }
-                            }
-                            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
-                        };
+                        Some(self.engine.warp_window(window, target))
                     }
-                    _ => {}
+                    WindowCommand::SwapDirection { direction, window } => {
+                        Some(self.engine.swap_windows_direction(direction, window))
+                    }
+                    WindowCommand::WarpDirection { direction, window } => {
+                        Some(self.engine.warp_window_direction(direction, window))
+                    }
+                    _ => None,
+                };
+                if let Some(result) = layout_change {
+                    return self.layout_change_result(id, result);
                 }
                 let result = match command {
                     WindowCommand::Focus { window } => self.engine.focus_window(window),
@@ -605,7 +595,22 @@ impl Daemon {
                         duration_ms,
                     } => self.engine.set_window_opacity(window, opacity, duration_ms),
                     WindowCommand::Pip { window } => self.engine.toggle_window_pip(window),
-                    WindowCommand::Swap { .. } | WindowCommand::Warp { .. } => unreachable!(),
+                    WindowCommand::Close { window } => self.engine.close_window(window),
+                    WindowCommand::ToggleFullscreen { window } => {
+                        self.engine.toggle_fullscreen(window)
+                    }
+                    WindowCommand::ToggleFloat { window } => {
+                        self.engine.toggle_float(window).map(|()| vec![])
+                    }
+                    WindowCommand::Resize {
+                        window,
+                        edge,
+                        delta,
+                    } => self.engine.resize_window_edge(window, edge, delta),
+                    WindowCommand::Swap { .. }
+                    | WindowCommand::Warp { .. }
+                    | WindowCommand::SwapDirection { .. }
+                    | WindowCommand::WarpDirection { .. } => unreachable!(),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -617,20 +622,34 @@ impl Daemon {
                 }
             }
             Command::Layout(command) => {
+                // All layout commands default to the focused Space when no
+                // explicit id is given.
                 let space = match command {
                     LayoutCommand::Rotate { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.rotate_layout(space);
                         space
                     }
                     LayoutCommand::Mirror { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.mirror_layout(space);
                         space
                     }
                     LayoutCommand::Balance { space } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         self.engine.balance_layout(space);
                         space
                     }
                     LayoutCommand::SetRatio { space, ratio } => {
+                        let Some(space) = self.resolve_space_or_focused(space) else {
+                            return HandleResult::err(id, "ENGINE_ERROR", "no focused space");
+                        };
                         let res = self.engine.set_split_ratio(space, ratio);
                         if let Err(e) = res {
                             return HandleResult::err(id, "ENGINE_ERROR", e.to_string());
@@ -747,11 +766,28 @@ impl Daemon {
                 }
             }
             Command::Space(command) => {
+                if let SpaceCommand::FocusRecent = command {
+                    return match self.focus_recent_space() {
+                        Some(result) => {
+                            match self.execute_and_refresh(result) {
+                                Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged]),
+                                Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                            }
+                        }
+                        None => HandleResult::err(
+                            id,
+                            "ENGINE_ERROR",
+                            "no previous space to focus (need at least one observed switch)",
+                        ),
+                    };
+                }
                 let result = match command {
                     SpaceCommand::Focus { space } => self.engine.focus_space(space),
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                     SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
+                    SpaceCommand::FocusRecent => unreachable!("handled above"),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -848,7 +884,68 @@ impl Daemon {
                 warn!(%err, "periodic snapshot failed");
             }
         }
+        // Track the previous Space for `space focus-recent`: whenever
+        // observation sees the current Space change, the old one becomes
+        // "previous". Focused-space lookup mirrors QueryCommand::Current.
+        let current_space = self
+            .engine
+            .observed
+            .spaces
+            .values()
+            .find(|s| s.focused)
+            .map(|s| s.id);
+        if let (Some(prev_current), Some(new_current)) = (self.current_space(), current_space) {
+            if new_current != prev_current {
+                self.previous_space.set(Some(prev_current));
+            }
+        }
+        if let Some(cs) = current_space {
+            self.current_space_cell.set(Some(cs));
+        }
         changed
+    }
+
+    fn current_space(&self) -> Option<SpaceId> {
+        self.current_space_cell.get()
+    }
+
+    /// Resolve an optional Space id against the currently focused one.
+    /// `Some(id)` passes through (caller validates existence downstream).
+    fn resolve_space_or_focused(&self, space: Option<SpaceId>) -> Option<SpaceId> {
+        space.or_else(|| self.current_space())
+    }
+
+    /// Actions to focus the previous space, if one is known and still exists.
+    fn focus_recent_space(&mut self) -> Option<Vec<Action>> {
+        let previous = self.previous_space.get()?;
+        if !self.engine.observed.spaces.contains_key(&previous) {
+            return None;
+        }
+        self.engine.focus_space(previous).ok()
+    }
+
+    /// Result envelope for layout-tree mutations (swap/warp): they rewrite BSP
+    /// structure directly, so the flow is persist → snapshot → reconcile →
+    /// verify. Shared by the explicit-id and directional variants.
+    fn layout_change_result(&mut self, id: u64, result: Result<(), EngineError>) -> HandleResult {
+        match result {
+            Ok(()) => {
+                self.persist_state();
+                match self.platform.snapshot() {
+                    Ok(snap) => {
+                        let actions = self.engine.apply_event(Event::Snapshot(snap));
+                        match self.execute_and_refresh(actions) {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                .with_notifications(vec![Notification::StateChanged]),
+                        }
+                    }
+                    Err(err) => HandleResult::err(id, "SNAPSHOT_ERROR", err.to_string()),
+                }
+            }
+            Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+        }
     }
 
     fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
@@ -1034,6 +1131,8 @@ mod tests {
 
     fn test_daemon() -> Daemon {
         Daemon {
+            previous_space: std::cell::Cell::new(None),
+            current_space_cell: std::cell::Cell::new(None),
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -1161,6 +1260,50 @@ mod tests {
                 .is_some_and(|r| r.get("sa_reinject").is_some()),
             "doctor must include the sa_reinject lifecycle section: {value}"
         );
+    }
+
+    /// `space focus-recent` focuses the previously current Space, tracked
+    /// from observation. Without a tracked previous Space it errors cleanly.
+    #[test]
+    fn space_focus_recent_swaps_to_previous_space() {
+        let mut daemon = test_daemon();
+        // No history yet: clean error, no actions executed.
+        let result = daemon.handle(Request::new(1, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
+
+        // Simulate observation: Space 7 was current before Space 3, and
+        // Space 7 still exists in observed state.
+        daemon.current_space_cell.set(Some(SpaceId(3)));
+        daemon.previous_space.set(Some(SpaceId(7)));
+        daemon.engine.observed.spaces.insert(
+            SpaceId(7),
+            rovr_types::SpaceSnapshot {
+                id: SpaceId(7),
+                display_id: DisplayId(1),
+                label: None,
+                focused: false,
+                generation: 1,
+                position: 1,
+            },
+        );
+
+        let result = daemon.handle(Request::new(2, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+
+        // A tracked previous Space that no longer exists errors instead of
+        // emitting an action against a ghost Space.
+        daemon.previous_space.set(Some(SpaceId(999)));
+        let result = daemon.handle(Request::new(3, Command::Space(SpaceCommand::FocusRecent)));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Error { .. }
+        ));
     }
 
     /// M4b: a successful Window mutation emits StateChanged so subscribers learn

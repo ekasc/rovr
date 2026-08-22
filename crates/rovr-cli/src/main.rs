@@ -72,9 +72,10 @@ enum WindowSubcommand {
     Focus {
         window: u32,
     },
+    #[command(about = "Focus nearest window in a direction (default: focused window)")]
     FocusDirection {
-        from: u32,
         direction: DirectionArg,
+        from: Option<u32>,
     },
     SetFrame {
         window: u32,
@@ -89,15 +90,15 @@ enum WindowSubcommand {
     },
     #[command(
         name = "move-to-workspace",
-        about = "Move window to named workspace (logical)"
+        about = "Move window to named workspace (logical); defaults to the focused window"
     )]
     MoveToWorkspace {
-        window: u32,
         workspace: String,
+        window: Option<u32>,
     },
     SetLayer {
-        window: u32,
         layer: i32,
+        window: Option<u32>,
     },
     SetSticky {
         window: u32,
@@ -124,6 +125,37 @@ enum WindowSubcommand {
     Warp {
         window: u32,
         target: u32,
+    },
+    #[command(about = "Close a window (defaults to the focused window)")]
+    Close {
+        window: Option<u32>,
+    },
+    #[command(about = "Toggle native fullscreen (defaults to the focused window)")]
+    ToggleFullscreen {
+        window: Option<u32>,
+    },
+    #[command(about = "Toggle tiling for a window (defaults to the focused window)")]
+    ToggleFloat {
+        window: Option<u32>,
+    },
+    #[command(about = "Swap with nearest neighbor in a direction")]
+    SwapDirection {
+        direction: DirectionArg,
+        #[arg(long)]
+        window: Option<u32>,
+    },
+    #[command(about = "Insert at neighbor's tree position in a direction")]
+    WarpDirection {
+        direction: DirectionArg,
+        #[arg(long)]
+        window: Option<u32>,
+    },
+    #[command(about = "Resize one edge by delta points (positive = outward)")]
+    Resize {
+        #[arg(long)]
+        window: Option<u32>,
+        edge: DirectionArg,
+        delta: i32,
     },
 }
 
@@ -198,10 +230,24 @@ struct LayoutArgs {
 
 #[derive(Debug, Subcommand)]
 enum LayoutSubcommand {
-    Rotate { space: u64 },
-    Mirror { space: u64 },
-    Balance { space: u64 },
-    SetRatio { space: u64, ratio: f64 },
+    /// All layout commands default to the focused space.
+    Rotate {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    Mirror {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    Balance {
+        #[arg(long)]
+        space: Option<u64>,
+    },
+    SetRatio {
+        ratio: f64,
+        #[arg(long)]
+        space: Option<u64>,
+    },
 }
 #[derive(Debug, Args)]
 struct ScratchpadArgs {
@@ -225,10 +271,13 @@ enum WorkspaceSubcommand {
     Focus {
         name: String,
     },
-    #[command(name = "move-window", about = "Move window to named workspace")]
+    #[command(
+        name = "move-window",
+        about = "Move window to named workspace (defaults to the focused window)"
+    )]
     MoveWindow {
-        window: u32,
         workspace: String,
+        window: Option<u32>,
     },
 }
 
@@ -348,8 +397,34 @@ fn map_command(command: TopCommand) -> Command {
                 window: WindowId(window),
             },
             WindowSubcommand::FocusDirection { from, direction } => WindowCommand::FocusDirection {
-                from: WindowId(from),
+                from: from.map(WindowId),
                 direction: direction.into(),
+            },
+            WindowSubcommand::Close { window } => WindowCommand::Close {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::ToggleFullscreen { window } => WindowCommand::ToggleFullscreen {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::ToggleFloat { window } => WindowCommand::ToggleFloat {
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::SwapDirection { direction, window } => WindowCommand::SwapDirection {
+                direction: direction.into(),
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::WarpDirection { direction, window } => WindowCommand::WarpDirection {
+                direction: direction.into(),
+                window: window.map(WindowId),
+            },
+            WindowSubcommand::Resize {
+                window,
+                edge,
+                delta,
+            } => WindowCommand::Resize {
+                window: window.map(WindowId),
+                edge: edge.into(),
+                delta,
             },
             WindowSubcommand::SetFrame {
                 window,
@@ -372,12 +447,12 @@ fn map_command(command: TopCommand) -> Command {
             },
             WindowSubcommand::MoveToWorkspace { window, workspace } => {
                 WindowCommand::MoveToWorkspace {
-                    window: WindowId(window),
+                    window: window.map(WindowId),
                     workspace,
                 }
             }
             WindowSubcommand::SetLayer { window, layer } => WindowCommand::SetLayer {
-                window: WindowId(window),
+                window: window.map(WindowId),
                 layer,
             },
             WindowSubcommand::SetSticky { window, sticky } => WindowCommand::SetSticky {
@@ -436,16 +511,16 @@ fn map_command(command: TopCommand) -> Command {
         }),
         TopCommand::Layout(args) => Command::Layout(match args.command {
             LayoutSubcommand::Rotate { space } => LayoutCommand::Rotate {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::Mirror { space } => LayoutCommand::Mirror {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::Balance { space } => LayoutCommand::Balance {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
             },
             LayoutSubcommand::SetRatio { space, ratio } => LayoutCommand::SetRatio {
-                space: SpaceId(space),
+                space: space.map(SpaceId),
                 ratio,
             },
         }),
@@ -455,7 +530,7 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Workspace(args) => Command::Workspace(match args.command {
             WorkspaceSubcommand::Focus { name } => WorkspaceCommand::Focus { name },
             WorkspaceSubcommand::MoveWindow { window, workspace } => WorkspaceCommand::MoveWindow {
-                window: WindowId(window),
+                window: window.map(WindowId),
                 workspace,
             },
         }),

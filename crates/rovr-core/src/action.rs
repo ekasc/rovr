@@ -64,4 +64,12 @@ pub enum Action {
         window: WindowId,
         minimized: bool,
     },
+    /// Close a window by pressing its AX close button.
+    CloseWindow {
+        window: WindowId,
+    },
+    /// Toggle the native (green-button) fullscreen state via AX.
+    ToggleNativeFullscreen {
+        window: WindowId,
+    },
 }
