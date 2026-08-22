@@ -352,6 +352,10 @@ fn parse_space(args: &[&str]) -> Result<Command, ParseError> {
             need(rest, 0, "space focus-recent")?;
             SpaceCommand::FocusRecent
         }
+        "toggle-insets" => {
+            need(rest, 0, "space toggle-insets")?;
+            SpaceCommand::ToggleInsets
+        }
         "create" => {
             at_least(rest, 0, "space create [anchor]")?;
             if rest.len() > 1 {

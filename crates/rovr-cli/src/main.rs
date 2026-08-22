@@ -171,6 +171,11 @@ enum SpaceSubcommand {
     Create { anchor: Option<u64> },
     Destroy { space: u64 },
     Move { space: u64, after: u64 },
+    #[command(
+        name = "toggle-insets",
+        about = "Collapse/restore all gap+padding for the session"
+    )]
+    ToggleInsets,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -498,6 +503,7 @@ fn map_command(command: TopCommand) -> Command {
                 space: SpaceId(space),
                 after: SpaceId(after),
             },
+            SpaceSubcommand::ToggleInsets => SpaceCommand::ToggleInsets,
         }),
         TopCommand::Config(args) => Command::Config(match args.command {
             ConfigSubcommand::Reload { path } => ConfigCommand::Reload { path },
