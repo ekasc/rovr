@@ -9,19 +9,20 @@
 //! - at most ONE observation job is in flight platform-wide;
 //! - a wedged worker causes fast-fail callers (bounded wait, no new threads,
 //!   nothing queued behind the hang);
-//! - the wedge is detectable (`wedged_since`) and recovery is explicit:
-//!   after `retry_interval`, a fresh request is attempted against the same
-//!   lone worker (stale responses are discarded by epoch). If the underlying
-//!   call never un-wedges, exactly ONE thread stays wedged — bounded, visible,
-//!   and the daemon remains responsive throughout.
+//! - the wedge is detectable (`wedged_since`); recovery occurs only after the
+//!   timed-out closure actually returns. No recovery closure is queued behind
+//!   a permanent hang. Exactly ONE thread stays wedged — bounded and visible.
 
 use std::cell::Cell;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{
+    channel, sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError,
+};
 use std::time::{Duration, Instant};
 
 /// How long a caller waits for the worker before declaring a timeout.
 pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to fail fast after a wedge before attempting recovery.
+/// Legacy constructor tuning retained for API stability; recovery now waits
+/// for observed completion rather than queueing timed retries.
 pub const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,21 +55,23 @@ struct Job<R> {
 }
 
 pub struct BoundedWorker<R: Send + 'static> {
-    tx: Sender<Job<R>>,
+    tx: SyncSender<Job<R>>,
     rx: Receiver<(u64, R)>,
     /// True while a submitted job may still be executing on the worker.
     in_flight: Cell<bool>,
     epoch: Cell<u64>,
     wedged_at: Cell<Option<Instant>>,
     job_timeout: Duration,
-    retry_interval: Duration,
 }
 
 impl<R: Send + 'static> BoundedWorker<R> {
     /// Spawn the single worker thread. Exactly one thread is created for the
     /// worker's lifetime; no other code path creates threads.
-    pub fn new(job_timeout: Duration, retry_interval: Duration) -> Self {
-        let (tx, job_rx) = channel::<Job<R>>();
+    pub fn new(job_timeout: Duration, _retry_interval: Duration) -> Self {
+        // Capacity one plus the `in_flight` guard means the worker can hold
+        // exactly one running/queued closure. A timed-out closure is never
+        // followed by recovery closures queued behind it.
+        let (tx, job_rx) = sync_channel::<Job<R>>(1);
         let (result_tx, rx) = channel::<(u64, R)>();
         std::thread::Builder::new()
             .name("rovr-platform-worker".into())
@@ -88,7 +91,6 @@ impl<R: Send + 'static> BoundedWorker<R> {
             epoch: Cell::new(0),
             wedged_at: Cell::new(None),
             job_timeout,
-            retry_interval,
         }
     }
 
@@ -99,15 +101,20 @@ impl<R: Send + 'static> BoundedWorker<R> {
 
     /// Run `job` on the lone worker with a bounded wait.
     pub fn run(&self, job: impl FnOnce() -> R + Send + 'static) -> Result<R, BoundedError> {
-        // Fail fast while a previously-submitted job may still be wedged,
-        // unless the retry interval elapsed — then attempt explicit recovery
-        // against the SAME worker (never a new one).
+        // Reap a timed-out job if it eventually completed. Recovery is then
+        // an ordinary fresh submission; while it is still running we never
+        // enqueue another closure behind it.
         if self.in_flight.get() {
-            match self.wedged_at.get() {
-                Some(since) if since.elapsed() < self.retry_interval => {
+            match self.rx.try_recv() {
+                Ok(_) => {
+                    self.in_flight.set(false);
+                    self.wedged_at.set(None);
+                }
+                Err(TryRecvError::Empty) => {
+                    let since = self.wedged_at.get().unwrap_or_else(Instant::now);
                     return Err(BoundedError::FastFail { since });
                 }
-                _ => {}
+                Err(TryRecvError::Disconnected) => return Err(BoundedError::Dead),
             }
         }
 
@@ -116,7 +123,7 @@ impl<R: Send + 'static> BoundedWorker<R> {
         self.in_flight.set(true);
 
         self.tx
-            .send(Job {
+            .try_send(Job {
                 epoch,
                 job: Box::new(job),
             })
@@ -216,7 +223,7 @@ mod tests {
     }
 
     /// Blocker 2: while wedged, callers FAIL FAST without submitting work;
-    /// after the retry interval, recovery against the same worker succeeds.
+    /// after the timed-out job finishes, recovery against the same worker succeeds.
     #[test]
     fn blocker2_wedge_is_detectable_and_recovery_is_explicit() {
         let (active, max_seen) = counters();
@@ -250,7 +257,7 @@ mod tests {
             "must fail fast while wedged, got {err:?}"
         );
 
-        // After the retry interval elapses, the same worker serves a new job.
+        // After the timed-out job completes, the same worker serves a new job.
         std::thread::sleep(Duration::from_millis(250));
         let result = worker.run(|| 3).expect("recovery must succeed");
         assert_eq!(result, 3);

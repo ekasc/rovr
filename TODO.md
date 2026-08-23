@@ -5,15 +5,15 @@
 ## Blockers
 
 - [~] 1. Rovr-owned scripting addition is claimed but not actually shipped
-  - `crates/rovr-sa-payload`: real ObjC payload dylib (Rovr socket `/tmp/rovr-sa_<uid>.sock`, `rovr-sa-1.0` handshake, honest capability attribs, opcodes 0x02–0x05/0x07–0x0B/0x0D; SkyLight cosmetics direct, space lifecycle via vendored yabai MIT pattern tables with attribution). Scan bounds-guarded so it cannot walk off mapped memory.
+  - `crates/rovr-sa-payload`: real ObjC payload dylib (Rovr socket `/tmp/rovr-<uid>/sa.sock`, `rovr-sa-2.0` handshake, honest capability attribs, opcodes 0x02–0x05/0x07–0x0B/0x0D; SkyLight cosmetics direct, space lifecycle via vendored yabai MIT pattern tables with attribution). Scan bounds-guarded so it cannot walk off mapped memory.
   - `crates/rovr-sa-loader`: root injector (adapted from yabai loader.m, attribution preserved).
   - `rovr sa install|uninstall` wired for real (artifact discovery, root check, SIP check, copy to `/Library/Application Support/rovr/`, inject, poll handshake). `rovr sa status` reports all five states (`not_installed`, `installed_not_injected`, `injected_compatible`, `incompatible_protocol`, `capability_missing`).
   - Client framing bug found & fixed via live interop test (`len = 3 + payload_len`); socket path now keyed on `getuid()` matching the payload.
-  - VERIFIED: payload loaded into an isolated host process — constructor, socket bind, handshake (`rovr-sa-1.0`), opacity/sticky op frames + EOF ack, honest `capability_missing` status via `rovr sa status`.
+  - PREVIOUSLY VERIFIED against protocol v1 in an isolated host process: constructor, socket bind, handshake, and opacity/sticky frames. Protocol v2 adds the private runtime directory, exact frame lengths, peer checks, and status ACKs; unit-tested, but the isolated-host interop test still needs to be rerun.
   - NOT VERIFIED: injection into real Dock and actual space/cosmetic effects — requires SIP relaxation (recovery reboot), see docs/SA_SIP.md.
 
 - [~] 2. Snapshot timeout leaks hung threads
-  - Replaced spawn-and-abandon with ONE `BoundedWorker` thread (`crates/rovr-platform/src/bounded_worker.rs`): at most one observation in flight, fail-fast while wedged, detectable via `wedged_since` (exposed in `doctor.snapshot_wedged_ms`), explicit epoch-based retry recovery.
+  - Replaced spawn-and-abandon with ONE `BoundedWorker` thread (`crates/rovr-platform/src/bounded_worker.rs`): at most one observation in flight, fail-fast while wedged, detectable via `wedged_since` (exposed in `doctor.snapshot_wedged_ms`), recovery only after the timed-out closure is observed complete (no queued retries).
   - Regression tests: 30 consecutive timeouts keep execution concurrency at exactly 1; wedge detection + fail-fast + recovery; healthy path. Real AX/SkyLight hang not reproduced on live macOS.
 
 - [~] 3. Workspace remapping is nondeterministic
@@ -81,3 +81,68 @@
 - `cargo test --workspace` — 104 passed, 0 failed
 - Swift menu-bar app: no changes made; existing build checks untouched.
 - CI: not run (no CI trigger from this session).
+
+## Multi-display + spawn-tile latency fixes (2026-08-23)
+
+- Per-display focused Spaces: bridge reports SLSManagedDisplayGetCurrentSpace per
+  display; Rust no longer collapses to a single global focused Space.
+- Window display_id derived from the Space's display (sid→did map built once per
+  snapshot), not CGGetDisplaysWithRect rect hit-testing.
+- display="main" now means CGMainDisplayID (DisplaySnapshot.is_main), not the
+  focused menu-bar display.
+- Workspace remap compaction: stale backings / config add-remove-reorder trigger a
+  full ordinal→position reassignment so alt-N stays N→desktop N (alt-5→desktop-4
+  off-by-one bug); manual Mission Control drags tracked via last_position refresh.
+- Spawn→tile flicker (~600-900ms → ~200ms):
+  - state loop no longer double-observes Refresh envelopes (AX created event path);
+  - wid→sid resolved in bulk via SLSCopyWindowsWithOptionsAndTags per SPACE
+    (yabai approach) instead of SLSCopySpacesForWindows PER WINDOW (~100 private-API
+    round trips per snapshot eliminated); fallback only for real AX windows
+    (minimized). obs_ms 200-500 → ~100.
+- Verified live on 2 displays: fresh BSP inserts are exact 50% ratios;
+  layout balance resets drifted persisted ratios.
+
+## Switch-latency root cause (2026-08-23, cont.)
+
+- User confirmed switches have NO animation — lag was daemon-side, not gesture.
+- Root cause: state loop ran a FULL pre-handle observation (~100-500ms with
+  100+ windows) before EVERY non-Refresh command. Workspace/space focus paid it
+  on every alt-N press.
+- Fix: skip_pre_observe for Refresh, Workspace/Space commands, and
+  focus-defaulting window commands (the latter self-refresh in handle()).
+- Focus timing now logged at INFO when total_ms > 50 ("workspace focus timing
+  (slow)") so regressions are visible without debug logging.
+- Verified: no-op focus round-trips 17-35ms end-to-end via IPC (was 100-600ms).
+- Cross-display settle-gate skip + activate-display-before-swipe also landed
+  (bridge.m / macos/mod.rs).
+
+## Simplify interactive Space focus (2026-08-23)
+
+- [x] State loop is FIFO again; AX callbacks share one atomic Refresh wake, acknowledged before its snapshot so callbacks during observation queue the next wake.
+- [x] Engine tracks an optimistic Space cursor per display; next/prev, explicit Space focus, and Workspace focus update it, while snapshots confirm or reconcile it.
+- [x] Built-in hotkeys feed one persistent bounded IPC dispatcher (FIFO, no thread per press), which reads every IPC response and provides ordered bounded backpressure without blocking the AppKit listener.
+- [x] Window creation enqueues an immediate Refresh for spawn tiling; focus events are handled by on-demand observation in focus-defaulting window commands plus the five-second idle recovery watchdog.
+- [x] Rapid next-next-next and wrap were verified at the pure engine seam with stale observed focus; fmt, clippy, and workspace tests pass. No Space/window mutations were used for verification.
+
+## Targeted no-wait adjacent Space stepping (2026-08-23)
+
+- [~] `space next/prev` now emits `FocusSpaceStep { target, delta }`, preserving the optimistic per-display cursor while carrying the exact relative displacement from its current index to the target (including wrap).
+- [~] The macOS fallback posts one high-velocity Dock swipe pair per displacement step on the display containing `target`, without querying current Space state or entering the absolute-focus settle gate. The scripting addition may still focus `target` directly.
+- [x] Absolute `FocusSpace` and its bounded 450 ms completion gate remain unchanged for explicit/workspace focus.
+- [x] Pure engine serialization, stale-observation sequence/wrap, and nonzero-displacement validation tests pass; fmt, clippy, and workspace tests are clean.
+- [x] User verified rapid `alt+tab` stepping is fast on the external display.
+
+## Luna gap sweep (2026-08-23)
+
+- [x] Audit the current working tree against PRODUCT.md for reproducible correctness, latency, and recovery gaps.
+- [x] Fix only high-confidence issues with a bounded blast radius; avoid speculative features and compensating schedulers.
+  - Workspace config reorder now preserves old ordinals before rebuilding the registry, so the next snapshot performs the required ordinal-to-position remap.
+  - Focus-recent/current tracking is per display, with deterministic observation and active-display fallback (focused, main, then lowest display id).
+  - Hotkey reload timeout cancellation now races safely with main-thread claim; a cancelled callback cannot apply config, and a claimed callback's result is awaited.
+  - Relative Space wrap displacement is intentionally unchanged: Dock swipes do not wrap, so Rovr emits the existing `-(N-1)`/`+(N-1)` displacement.
+- [x] Add regression coverage at the real failure seams.
+- [x] Run fmt, clippy, workspace tests, non-mutating daemon checks, and inspect the final diff.
+
+### Deferred known gaps
+
+- [x] P2: hotkey key syntax is parsed by the shared protocol seam and validated before config load/reload.

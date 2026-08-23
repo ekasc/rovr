@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rovr_config::Config;
-use rovr_types::{Direction, PlatformSnapshot, Rect, SpaceId, WindowId};
+use rovr_types::{Direction, DisplayId, PlatformSnapshot, Rect, SpaceId, WindowId};
 use std::path::Path;
 use thiserror::Error;
 
@@ -39,6 +39,12 @@ pub enum EngineError {
     WorkspaceNoBacking(String),
     #[error("no focused window in observed state")]
     NoFocusedWindow,
+    #[error("display {0} not found")]
+    DisplayNotFound(String),
+    #[error("display has no other space to step to")]
+    NoAdjacentSpace,
+    #[error("space step command delta must be +1 or -1")]
+    InvalidSpaceStep,
     #[error("resize would shrink the window below its minimum size")]
     ResizeTooSmall,
 }
@@ -59,6 +65,7 @@ pub struct Engine {
     pub scratchpads: ScratchpadState,
     pub workspaces: WorkspaceRegistry,
     pub plugins: PluginRegistry,
+    space_cursors: HashMap<DisplayId, (SpaceId, bool)>,
     /// Session-scoped gap/padding collapse (space toggle-insets). Not
     /// persisted: a daemon restart restores configured insets.
     pub insets_off: bool,
@@ -248,7 +255,7 @@ impl Engine {
             .filter_map(|(k, v)| k.parse::<u64>().ok().map(|n| (SpaceId(n), v)))
             .collect();
         self.scratchpads = ScratchpadState(persisted.scratchpads);
-        self.workspaces = crate::workspace::WorkspaceRegistry(persisted.workspaces);
+        self.workspaces = crate::workspace::WorkspaceRegistry(persisted.workspaces, false);
         // Blocker 5: restore workspace-owned layout state onto each
         // workspace's current backing Space.
         for (name, state) in persisted.workspace_layouts {
@@ -393,6 +400,7 @@ impl Engine {
         match event {
             Event::Snapshot(snapshot) => {
                 self.apply_snapshot(snapshot);
+                self.reconcile_space_cursors();
                 let moves = self
                     .workspaces
                     .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
@@ -565,6 +573,129 @@ impl Engine {
     pub fn focus_space(&self, space: SpaceId) -> Result<Vec<Action>, EngineError> {
         self.require_space(space)?;
         Ok(vec![Action::FocusSpace { space }])
+    }
+
+    /// Step to the next (`delta = 1`) or previous (`delta = -1`) space on one
+    /// display, wrapping at the ends. `display`: None = display of the
+    /// currently focused space, "main" = CGMainDisplayID, numeric = that
+    /// display id. Per-display focused Spaces (multi-display fix) mean every
+    /// display always reports exactly one current Space, so this works even
+    /// when the TARGET display is not the active one — e.g. alt+arrows
+    /// driving the external display while typing on the built-in one.
+    pub fn focus_space_step(
+        &mut self,
+        display: Option<&str>,
+        delta: i32,
+    ) -> Result<Vec<Action>, EngineError> {
+        if !matches!(delta, -1 | 1) {
+            return Err(EngineError::InvalidSpaceStep);
+        }
+        let target_display = match display {
+            Some("main") => self
+                .observed
+                .displays
+                .values()
+                .find(|d| d.is_main)
+                .or_else(|| self.observed.displays.values().find(|d| d.focused))
+                .map(|d| d.id)
+                .ok_or(EngineError::NoFocusedSpace)?,
+            Some(n) => {
+                let id = n
+                    .parse::<u32>()
+                    .map(DisplayId)
+                    .map_err(|_| EngineError::DisplayNotFound(n.to_string()))?;
+                if !self.observed.displays.contains_key(&id) {
+                    return Err(EngineError::DisplayNotFound(n.to_string()));
+                }
+                id
+            }
+            None => self
+                .observed
+                .spaces
+                .values()
+                .find(|s| s.focused)
+                .map(|s| s.display_id)
+                .ok_or(EngineError::NoFocusedSpace)?,
+        };
+
+        let mut on_display: Vec<_> = self
+            .observed
+            .spaces
+            .values()
+            .filter(|s| s.display_id == target_display)
+            .collect();
+        on_display.sort_by_key(|s| (s.position, s.id));
+        if on_display.is_empty() {
+            return Err(EngineError::DisplayNotFound(target_display.0.to_string()));
+        }
+        if on_display.len() == 1 {
+            return Err(EngineError::NoAdjacentSpace);
+        }
+        let current_space = self
+            .space_cursors
+            .get(&target_display)
+            .map(|(space, _)| *space)
+            .or_else(|| on_display.iter().find(|s| s.focused).map(|s| s.id))
+            .unwrap_or(on_display[0].id);
+        let current = on_display
+            .iter()
+            .position(|s| s.id == current_space)
+            .unwrap_or(0);
+        let next = (current as i32 + delta).rem_euclid(on_display.len() as i32) as usize;
+        let target = on_display[next].id;
+        let displacement = next as i32 - current as i32;
+        self.space_cursors.insert(target_display, (target, true));
+        Ok(vec![Action::FocusSpaceStep {
+            target,
+            delta: displacement,
+        }])
+    }
+
+    pub fn note_space_focus_dispatched(&mut self, space: SpaceId) {
+        if let Some(display) = self.observed.spaces.get(&space).map(|s| s.display_id) {
+            self.space_cursors.insert(display, (space, true));
+        }
+    }
+
+    pub fn cancel_pending_space_focus(&mut self, space: SpaceId) {
+        if let Some(display) = self.observed.spaces.get(&space).map(|s| s.display_id) {
+            self.space_cursors.remove(&display);
+        }
+    }
+
+    /// Make the next snapshot authoritative for Space navigation cursors.
+    /// Immediate event-driven snapshots intentionally preserve pending targets
+    /// so rapid navigation can chain while macOS focus observation is stale.
+    pub fn abandon_pending_space_cursors(&mut self) {
+        for (_, pending) in self.space_cursors.values_mut() {
+            *pending = false;
+        }
+    }
+
+    fn reconcile_space_cursors(&mut self) {
+        for display in self.observed.displays.keys().copied().collect::<Vec<_>>() {
+            let observed = self
+                .observed
+                .spaces
+                .values()
+                .find(|space| space.display_id == display && space.focused)
+                .map(|space| space.id);
+            let Some(observed) = observed else { continue };
+            match self.space_cursors.get(&display).copied() {
+                Some((intended, true)) if intended != observed => {}
+                _ => {
+                    self.space_cursors.insert(display, (observed, false));
+                }
+            }
+        }
+        self.space_cursors.retain(|display, (space, _)| {
+            self.observed.displays.contains_key(display)
+                && self
+                    .observed
+                    .spaces
+                    .get(space)
+                    .is_some_and(|s| s.display_id == *display)
+        });
     }
 
     /// Create a new Space on the display of the anchor Space. The new Space's
@@ -819,6 +950,9 @@ impl Engine {
             .values()
             .filter(|candidate| {
                 candidate.id != from
+                    && candidate.space_id == source.space_id
+                    && candidate.display_id == source.display_id
+                    && candidate.managed == rovr_types::ObservedBool::Yes
                     && candidate.minimized == rovr_types::ObservedBool::No
                     && candidate.generation == self.observed.generation
             })
@@ -978,6 +1112,7 @@ mod tests {
                     },
                     label: None,
                     focused: false,
+                    is_main: false,
                     generation: 0,
                 },
                 DisplaySnapshot {
@@ -990,6 +1125,7 @@ mod tests {
                     },
                     label: None,
                     focused: false,
+                    is_main: false,
                     generation: 0,
                 },
             ],
@@ -1027,6 +1163,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -1233,6 +1370,7 @@ mod tests {
             },
             label: None,
             focused: id == 1,
+            is_main: false,
             generation: 0,
         }
     }
@@ -1528,6 +1666,7 @@ mod tests {
             },
             label: None,
             focused: true,
+            is_main: false,
             generation: 0,
         }];
         engine.apply_event(Event::Snapshot(snap));
@@ -1630,6 +1769,174 @@ mod tests {
         // Shrinking below minimum errors without emitting actions.
         let result = engine.resize_window_edge(Some(WindowId(3)), Direction::North, -10_000);
         assert!(matches!(result, Err(EngineError::ResizeTooSmall)));
+    }
+
+    /// focus_space_step: alt+arrow navigation across a display's spaces,
+    /// including targeting a NON-active display (per-display focused Spaces
+    /// make the external display's current Space visible from anywhere).
+    #[test]
+    fn focus_space_steps_and_wraps_per_display() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.spaces = vec![
+            SpaceSnapshot {
+                id: SpaceId(1),
+                display_id: DisplayId(2),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 0,
+            },
+            SpaceSnapshot {
+                id: SpaceId(2),
+                display_id: DisplayId(2),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 1,
+            },
+            SpaceSnapshot {
+                id: SpaceId(3),
+                display_id: DisplayId(2),
+                label: None,
+                focused: false,
+                generation: 0,
+                position: 2,
+            },
+            // decoy on the other display, globally "focused"
+            SpaceSnapshot {
+                id: SpaceId(9),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 3,
+            },
+        ];
+        snap.displays = vec![
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 0,
+            },
+            DisplaySnapshot {
+                id: DisplayId(2),
+                frame: Rect {
+                    x: 100.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                label: None,
+                focused: false,
+                is_main: false,
+                generation: 0,
+            },
+        ];
+        engine.apply_event(Event::Snapshot(snap));
+
+        // next on display 2: current is 2 -> 3
+        assert_eq!(
+            engine.focus_space_step(Some("2"), 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(3),
+                delta: 1,
+            }]
+        );
+        // Observation is still stale at 2, but rapid presses continue from
+        // the intended target and wrap: 3 -> 1 -> 2.
+        assert_eq!(
+            engine.focus_space_step(Some("2"), 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(1),
+                delta: -2,
+            }]
+        );
+        assert_eq!(
+            engine.focus_space_step(Some("2"), 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(2),
+                delta: 1,
+            }]
+        );
+        assert_eq!(
+            engine.focus_space_step(Some("2"), -1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(1),
+                delta: -1,
+            }]
+        );
+        assert_eq!(
+            engine.focus_space_step(Some("2"), -1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(3),
+                delta: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_replaces_stale_pending_space_cursor() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.spaces = (1..=3)
+            .map(|id| SpaceSnapshot {
+                id: SpaceId(id),
+                display_id: DisplayId(1),
+                label: None,
+                focused: id == 1,
+                generation: 0,
+                position: id as u32 - 1,
+            })
+            .collect();
+        snap.displays = vec![DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            label: None,
+            focused: true,
+            is_main: true,
+            generation: 0,
+        }];
+        engine.apply_event(Event::Snapshot(snap.clone()));
+
+        assert_eq!(
+            engine.focus_space_step(None, 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(2),
+                delta: 1,
+            }]
+        );
+        engine.apply_event(Event::Snapshot(snap.clone()));
+        assert_eq!(
+            engine.focus_space_step(None, 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(3),
+                delta: 1,
+            }]
+        );
+
+        engine.abandon_pending_space_cursors();
+        engine.apply_event(Event::Snapshot(snap));
+        assert_eq!(
+            engine.focus_space_step(None, 1).unwrap(),
+            vec![Action::FocusSpaceStep {
+                target: SpaceId(2),
+                delta: 1,
+            }]
+        );
     }
 
     /// resolve_window falls back to the focused window and validates ids.

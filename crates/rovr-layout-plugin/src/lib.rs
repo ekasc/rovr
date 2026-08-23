@@ -85,10 +85,20 @@ pub fn validate_placements(
         // the area origin offset while catching absurd values).
         let max_w = request.area.width * 2.0 + 1.0;
         let max_h = request.area.height * 2.0 + 1.0;
-        if f.width > max_w || f.height > max_h {
+        let min_x = request.area.x - max_w;
+        let max_x = request.area.x + request.area.width + max_w;
+        let min_y = request.area.y - max_h;
+        let max_y = request.area.y + request.area.height + max_h;
+        if f.width > max_w
+            || f.height > max_h
+            || f.x < min_x
+            || f.y < min_y
+            || f.x + f.width > max_x
+            || f.y + f.height > max_y
+        {
             return Err(format!(
-                "frame for window {:?} exceeds reasonable bounds: {}x{} vs area {}x{}",
-                p.window, f.width, f.height, request.area.width, request.area.height
+                "frame for window {:?} exceeds bounds around area {:?}: {:?}",
+                p.window, request.area, f
             ));
         }
     }
@@ -721,6 +731,32 @@ mod tests {
             },
         )];
         assert!(validate_placements(&req, &huge).is_err());
+    }
+
+    #[test]
+    fn blocker12_huge_origins_rejected_on_negative_coordinate_displays() {
+        let mut req = req_for(&[1]);
+        req.area.x = -1920.0;
+        let positive = vec![place(
+            1,
+            Rect {
+                x: 1.0e12,
+                y: 0.0,
+                width: 500.0,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &positive).is_err());
+        let negative = vec![place(
+            1,
+            Rect {
+                x: -1.0e12,
+                y: 0.0,
+                width: 500.0,
+                height: 800.0,
+            },
+        )];
+        assert!(validate_placements(&req, &negative).is_err());
     }
 
     // ---- Blocker 11: WASM memory limiting ----

@@ -14,12 +14,16 @@ use crate::bounded_worker::BoundedWorker;
 use crate::{Platform, PlatformError};
 
 use reinject::{HelperClient, InjectionJob, ReinjectionPhase, Reinjector, TickAction};
-use sa::{SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_MOV_SPACE, OSAX_ATTRIB_REM_SPACE};
+use sa::{
+    SaClient, SaInfo, OSAX_ATTRIB_ADD_SPACE, OSAX_ATTRIB_FOCUS_SPACE, OSAX_ATTRIB_MOV_SPACE,
+    OSAX_ATTRIB_REM_SPACE, OSAX_ATTRIB_WINDOW_LAYER, OSAX_ATTRIB_WINDOW_OPACITY,
+    OSAX_ATTRIB_WINDOW_SCALE, OSAX_ATTRIB_WINDOW_SHADOW, OSAX_ATTRIB_WINDOW_STICKY,
+};
 
 // AX event plumbing: the C observer handler runs on the main thread and
 // calls the trampoline below. Events accumulate as a bitmask consumed by
-// needs_refresh(); an optional watcher (registered by the daemon) is invoked
-// synchronously so the state loop can be woken immediately.
+// needs_refresh(); an optional watcher (registered by the daemon) receives the
+// event kind synchronously so the state loop can decide whether to wake immediately.
 static PENDING_EVENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static EVENT_WATCHER: std::sync::OnceLock<std::sync::Arc<dyn Fn(u32) + Send + Sync>> =
     std::sync::OnceLock::new();
@@ -27,10 +31,10 @@ static EVENT_WATCHER: std::sync::OnceLock<std::sync::Arc<dyn Fn(u32) + Send + Sy
 #[allow(non_camel_case_types)]
 pub type rovr_ax_event_trampoline_fn = extern "C" fn(event_kind: i32, window_id: u32);
 
-extern "C" fn rovr_ax_event_trampoline(event_kind: i32, window_id: u32) {
+extern "C" fn rovr_ax_event_trampoline(event_kind: i32, _window_id: u32) {
     PENDING_EVENTS.fetch_or(event_kind as u32, std::sync::atomic::Ordering::SeqCst);
     if let Some(watcher) = EVENT_WATCHER.get() {
-        watcher(window_id);
+        watcher(event_kind as u32);
     }
 }
 
@@ -60,6 +64,19 @@ const SA_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// a post is recorded AND recent.
 fn gesture_settle_needed(posted_at: Option<Instant>, now: Instant) -> bool {
     posted_at.is_some_and(|at| now.duration_since(at) < GESTURE_STALE_AGE)
+}
+
+fn valid_space_step_delta(delta: i32) -> bool {
+    delta != 0
+}
+
+#[allow(dead_code)]
+fn focused_space_for_display(spaces: &[SpaceSnapshot], display: DisplayId) -> Option<SpaceId> {
+    spaces
+        .iter()
+        .filter(|space| space.display_id == display && space.focused)
+        .min_by_key(|space| (space.position, space.id))
+        .map(|space| space.id)
 }
 
 const ROVR_CAP_OBSERVE_WINDOWS: u64 = 1 << 0;
@@ -94,6 +111,7 @@ struct BridgeWindow {
 struct BridgeDisplay {
     id: u32,
     focused: u8,
+    is_main: u8,
     x: f64,
     y: f64,
     width: f64,
@@ -130,8 +148,10 @@ extern "C" {
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
     fn rovr_bridge_focus_space(space_id: u64) -> i32;
+    fn rovr_bridge_focus_space_step(target_space_id: u64, delta: i32) -> i32;
     fn rovr_bridge_window_space_id(window_id: u32) -> u64;
-    fn rovr_bridge_current_space_id() -> u64;
+    fn rovr_bridge_current_space_for_space(space_id: u64) -> u64;
+    fn rovr_bridge_display_for_space(space_id: u64) -> u32;
     fn rovr_bridge_dock_pid() -> i32;
 }
 
@@ -213,8 +233,8 @@ impl MacPlatform {
         })
     }
 
-    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
-        let _ = EVENT_WATCHER.set(watcher);
+    fn set_event_watcher(&mut self, event_kind_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        let _ = EVENT_WATCHER.set(event_kind_watcher);
     }
 
     /// How long the observation worker has been wedged, if it has.
@@ -290,24 +310,33 @@ impl MacPlatform {
         self.sa_info
             .borrow()
             .as_ref()
+            .filter(|info| info.is_compatible())
             .map(|info| info.attribs)
             .unwrap_or(0)
     }
 
     fn execute_sa(
         &self,
+        required_capability: u32,
+        name: &'static str,
         op: impl Fn(&SaClient) -> Result<(), sa::SaError>,
     ) -> Result<(), PlatformError> {
-        if self.sa_info.borrow().is_none() {
-            return Err(PlatformError::Unsupported("scripting_addition"));
+        let info = self.sa_info.borrow();
+        if !info
+            .as_ref()
+            .is_some_and(|info| info.is_compatible() && info.attribs & required_capability != 0)
+        {
+            return Err(PlatformError::Unsupported(name));
         }
+        drop(info);
         op(&self.sa).map_err(|err| PlatformError::Operation(err.to_string()))
     }
 
     fn execute_focus_space(&self, space: &SpaceId) -> Result<(), PlatformError> {
         // Prefer the SA's clean focus (no gesture, no animation) when the
         // payload is live; fall back to gesture synthesis otherwise.
-        if self.sa_info.borrow().is_some() && self.sa.focus_space(space.0).is_ok() {
+        if self.sa_attribs() & OSAX_ATTRIB_FOCUS_SPACE != 0 && self.sa.focus_space(space.0).is_ok()
+        {
             self.last_focus_target.set(space.0);
             return Ok(());
         }
@@ -316,21 +345,28 @@ impl MacPlatform {
         // Spaces (blank screen). Wait — bounded — until the previous target
         // has actually landed, exiting the moment it does. A stale previous
         // post (idle-then-switch, manual Space change) never waits.
+        // CROSS-DISPLAY posts skip the gate: the previous animation runs on
+        // the OTHER display and cannot leave this display between Spaces, so
+        // waiting only added latency to external-display switches.
         let now = Instant::now();
         let t_start = now;
         let mut settled_ms = 0u64;
-        if gesture_settle_needed(self.last_focus_posted_at.get(), now) {
-            let target = self.last_focus_target.get();
-            if target != 0 {
-                let deadline = now + GESTURE_LAND_CAP;
-                while unsafe { rovr_bridge_current_space_id() } != target {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(GESTURE_LAND_POLL);
+        let prev_target = self.last_focus_target.get();
+        let cross_display = prev_target != 0
+            && unsafe { rovr_bridge_display_for_space(space.0) }
+                != unsafe { rovr_bridge_display_for_space(prev_target) };
+        if gesture_settle_needed(self.last_focus_posted_at.get(), now)
+            && !cross_display
+            && prev_target != 0
+        {
+            let deadline = now + GESTURE_LAND_CAP;
+            while unsafe { rovr_bridge_current_space_for_space(prev_target) } != prev_target {
+                if Instant::now() >= deadline {
+                    break;
                 }
-                settled_ms = t_start.elapsed().as_millis() as u64;
+                std::thread::sleep(GESTURE_LAND_POLL);
             }
+            settled_ms = t_start.elapsed().as_millis() as u64;
         }
         let t_pre_post = Instant::now();
         let status = unsafe { rovr_bridge_focus_space(space.0) };
@@ -352,6 +388,40 @@ impl MacPlatform {
                 "focus space failed with status {status}"
             )))
         }
+    }
+
+    fn execute_focus_space_step(&self, target: &SpaceId, delta: i32) -> Result<(), PlatformError> {
+        if !valid_space_step_delta(delta) {
+            return Err(PlatformError::Operation(
+                "space step displacement must be nonzero".to_string(),
+            ));
+        }
+        if self.sa_attribs() & OSAX_ATTRIB_FOCUS_SPACE != 0 && self.sa.focus_space(target.0).is_ok()
+        {
+            self.last_focus_target.set(target.0);
+            self.last_focus_posted_at.set(Some(Instant::now()));
+            return Ok(());
+        }
+
+        let status = unsafe { rovr_bridge_focus_space_step(target.0, delta) };
+        if status == 0 {
+            self.last_focus_target.set(target.0);
+            self.last_focus_posted_at.set(Some(Instant::now()));
+            Ok(())
+        } else {
+            Err(PlatformError::Operation(format!(
+                "focus space step failed with status {status}"
+            )))
+        }
+    }
+
+    fn ensure_bridge_idle(&self) -> Result<(), PlatformError> {
+        self.snapshot_worker
+            .run(|| Ok(PlatformSnapshot::default()))
+            .map(|_| ())
+            .map_err(|err| {
+                PlatformError::Operation(format!("Objective-C bridge unavailable: {err}"))
+            })
     }
 
     fn snapshot_inner(bridge_capabilities: u64) -> Result<PlatformSnapshot, PlatformError> {
@@ -414,6 +484,7 @@ impl MacPlatform {
                 },
                 label: None,
                 focused: display.focused != 0,
+                is_main: display.is_main != 0,
                 generation: 0,
             });
         }
@@ -432,7 +503,7 @@ impl MacPlatform {
                 position: space.position,
             });
         }
-        let mut windows = Vec::new();
+        let mut windows: Vec<WindowSnapshot> = Vec::new();
         let window_status = unsafe {
             rovr_bridge_enumerate_windows(collect_window, &mut windows as *mut _ as *mut c_void)
         };
@@ -441,7 +512,7 @@ impl MacPlatform {
                 "window enumeration failed with status {window_status}"
             )));
         }
-        let mut displays = Vec::new();
+        let mut displays: Vec<DisplaySnapshot> = Vec::new();
         let display_status = unsafe {
             rovr_bridge_enumerate_displays(collect_display, &mut displays as *mut _ as *mut c_void)
         };
@@ -450,7 +521,7 @@ impl MacPlatform {
                 "display enumeration failed with status {display_status}"
             )));
         }
-        let mut spaces = Vec::new();
+        let mut spaces: Vec<SpaceSnapshot> = Vec::new();
         if bridge_capabilities & ROVR_CAP_OBSERVE_SPACES != 0 {
             let space_status = unsafe {
                 rovr_bridge_enumerate_spaces(collect_space, &mut spaces as *mut _ as *mut c_void)
@@ -461,6 +532,11 @@ impl MacPlatform {
                 )));
             }
         }
+        // Per-display focused spaces: the bridge now reports one focused space
+        // per display via SLSManagedDisplayGetCurrentSpace (multi-display
+        // correct). Keep them as-is; do not collapse to a single global
+        // focused space, which would discard the secondary display's current
+        // space and break workspace/tiling on that display.
         Ok(PlatformSnapshot {
             windows,
             spaces,
@@ -482,12 +558,16 @@ impl Platform for MacPlatform {
             destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
             focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
             reorder_space: sa_attribs & OSAX_ATTRIB_MOV_SPACE != 0,
-            set_window_layer: self.sa_info.borrow().is_some(),
-            set_window_sticky: self.sa_info.borrow().is_some(),
-            set_window_shadow: self.sa_info.borrow().is_some(),
-            set_window_opacity: self.sa_info.borrow().is_some(),
-            set_window_scale: self.sa_info.borrow().is_some(),
-            scripting_addition: self.sa_info.borrow().is_some(),
+            set_window_layer: sa_attribs & OSAX_ATTRIB_WINDOW_LAYER != 0,
+            set_window_sticky: sa_attribs & OSAX_ATTRIB_WINDOW_STICKY != 0,
+            set_window_shadow: sa_attribs & OSAX_ATTRIB_WINDOW_SHADOW != 0,
+            set_window_opacity: sa_attribs & OSAX_ATTRIB_WINDOW_OPACITY != 0,
+            set_window_scale: sa_attribs & OSAX_ATTRIB_WINDOW_SCALE != 0,
+            scripting_addition: self
+                .sa_info
+                .borrow()
+                .as_ref()
+                .is_some_and(SaInfo::is_compatible),
         }
     }
 
@@ -510,6 +590,12 @@ impl Platform for MacPlatform {
     }
 
     fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+        // A timed-out observation closure continues on the sole worker. Do
+        // not overlap any mutation, including SA-backed Dock mutations, with
+        // that closure. Refresh actions do not touch macOS.
+        if !matches!(action, Action::RefreshAll | Action::RefreshWindow { .. }) {
+            self.ensure_bridge_idle()?;
+        }
         let status = match action {
             Action::RefreshAll | Action::RefreshWindow { .. } => return Ok(()),
             Action::SetWindowFrame { window, frame } => unsafe {
@@ -523,10 +609,14 @@ impl Platform for MacPlatform {
                 // for WindowServer to report the switch as landed before
                 // raising the window.
                 let target_space = unsafe { rovr_bridge_window_space_id(window.0) };
-                if target_space != 0 && target_space != unsafe { rovr_bridge_current_space_id() } {
+                if target_space != 0
+                    && target_space != unsafe { rovr_bridge_current_space_for_space(target_space) }
+                {
                     self.execute_focus_space(&SpaceId(target_space))?;
                     let deadline = Instant::now() + GESTURE_LAND_CAP;
-                    while unsafe { rovr_bridge_current_space_id() } != target_space {
+                    while unsafe { rovr_bridge_current_space_for_space(target_space) }
+                        != target_space
+                    {
                         if Instant::now() >= deadline {
                             break;
                         }
@@ -551,35 +641,52 @@ impl Platform for MacPlatform {
             Action::FocusSpace { space } => {
                 return self.execute_focus_space(space);
             }
+            Action::FocusSpaceStep { target, delta } => {
+                return self.execute_focus_space_step(target, *delta);
+            }
             Action::CreateSpace { anchor } => {
-                return self.execute_sa(|sa| sa.create_space(anchor.0));
+                return self.execute_sa(OSAX_ATTRIB_ADD_SPACE, "create_space", |sa| {
+                    sa.create_space(anchor.0)
+                });
             }
             Action::DestroySpace { space } => {
-                return self.execute_sa(|sa| sa.destroy_space(space.0));
+                return self.execute_sa(OSAX_ATTRIB_REM_SPACE, "destroy_space", |sa| {
+                    sa.destroy_space(space.0)
+                });
             }
             Action::MoveSpace { space, after } => {
-                return self.execute_sa(|sa| sa.move_space(space.0, after.0));
+                return self.execute_sa(OSAX_ATTRIB_MOV_SPACE, "reorder_space", |sa| {
+                    sa.move_space(space.0, after.0)
+                });
             }
             Action::SetWindowLayer { window, layer } => {
-                return self.execute_sa(|sa| sa.set_layer(window.0, *layer));
+                return self.execute_sa(OSAX_ATTRIB_WINDOW_LAYER, "set_window_layer", |sa| {
+                    sa.set_layer(window.0, *layer)
+                });
             }
             Action::SetWindowSticky { window, sticky } => {
-                return self.execute_sa(|sa| sa.set_sticky(window.0, *sticky));
+                return self.execute_sa(OSAX_ATTRIB_WINDOW_STICKY, "set_window_sticky", |sa| {
+                    sa.set_sticky(window.0, *sticky)
+                });
             }
             Action::SetWindowShadow { window, shadow } => {
-                return self.execute_sa(|sa| sa.set_shadow(window.0, *shadow));
+                return self.execute_sa(OSAX_ATTRIB_WINDOW_SHADOW, "set_window_shadow", |sa| {
+                    sa.set_shadow(window.0, *shadow)
+                });
             }
             Action::SetWindowOpacity {
                 window,
                 opacity,
                 duration_ms,
             } => {
-                return self.execute_sa(|sa| {
+                return self.execute_sa(OSAX_ATTRIB_WINDOW_OPACITY, "set_window_opacity", |sa| {
                     sa.set_opacity(window.0, *opacity as f32, *duration_ms as f32 / 1000.0)
                 });
             }
             Action::SetWindowScale { window, x, y, w, h } => {
-                return self.execute_sa(|sa| sa.scale_window(window.0, *x, *y, *w, *h));
+                return self.execute_sa(OSAX_ATTRIB_WINDOW_SCALE, "set_window_scale", |sa| {
+                    sa.scale_window(window.0, *x, *y, *w, *h)
+                });
             }
         };
 
@@ -600,8 +707,8 @@ impl Platform for MacPlatform {
         Some(MacPlatform::sa_reinject_diagnostics(self))
     }
 
-    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
-        MacPlatform::set_event_watcher(self, watcher);
+    fn set_event_watcher(&mut self, event_kind_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        MacPlatform::set_event_watcher(self, event_kind_watcher);
     }
 }
 
@@ -666,11 +773,16 @@ impl MacPlatform {
             self.last_sa_present.set(current_sa);
             needs = true;
         }
+        let compatible_sa = self
+            .sa_info
+            .borrow()
+            .as_ref()
+            .is_some_and(SaInfo::is_compatible);
         // Automatic reinjection lifecycle: Dock PID change, SA loss or failed
         // handshake feed the bounded state machine; it requests privileged
-        // injection at most once per generation with backoff. Non-SA Rovr
-        // functionality is unaffected by any failure here.
-        self.drive_reinjection(current_dock, current_sa);
+        // injection at most once per generation with backoff. An incompatible
+        // responder remains visible to diagnostics but is not considered live.
+        self.drive_reinjection(current_dock, compatible_sa);
         needs
     }
 }
@@ -690,6 +802,41 @@ mod tests {
     /// Settle gate: waits only for a RECENT previous post. Successive
     /// switching exits as soon as the animation lands (bounded), and an
     /// idle-then-switch never waits at all.
+    #[test]
+    fn focused_space_selection_is_scoped_to_active_display() {
+        let spaces = vec![
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+            },
+            SpaceSnapshot {
+                id: SpaceId(22),
+                display_id: DisplayId(2),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 1,
+            },
+        ];
+        assert_eq!(
+            focused_space_for_display(&spaces, DisplayId(2)),
+            Some(SpaceId(22))
+        );
+    }
+
+    #[test]
+    fn relative_space_step_accepts_nonzero_displacements() {
+        assert!(valid_space_step_delta(-3));
+        assert!(valid_space_step_delta(-1));
+        assert!(valid_space_step_delta(1));
+        assert!(valid_space_step_delta(3));
+        assert!(!valid_space_step_delta(0));
+    }
+
     #[test]
     fn gesture_settle_only_for_recent_posts() {
         let now = Instant::now();
