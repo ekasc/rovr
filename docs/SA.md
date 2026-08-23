@@ -4,16 +4,16 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
 
 ## Socket namespace
 
-- Rovr daemon and CLI use `/tmp/rovr-sa_<uid>.sock` (UID via `getuid()`, not `$USER`). The daemon probes this socket at startup; CLI `rovr sa status` probes it directly without the daemon.
+- Rovr uses the user-owned `0700` runtime directory `/tmp/rovr-<uid>/`. The daemon socket is `daemon.sock`; the Dock payload socket is `sa.sock`. UID comes from `getuid()`, not `$USER`. Clients validate socket ownership and kernel peer credentials.
 
 ## Protocol
 
 - Binary framing identical to yabai's `sa.m` / `osax/common.h` (MIT © 2019 Åsmund Vikane) but with Rovr version prefix:
   - request: `[i16 LE len][u8 opcode][payload]` where `len = 3 + payload.len()` (the reader consumes `len - 2` bytes after the prefix; upstream-compatible)
-  - handshake `0x01`: response `version\x00 + u32 LE attribs` — version must be `rovr-sa-1.*` (e.g. `rovr-sa-1.0`). A `yabai-sa-*` response is rejected as incompatible.
-  - ops: packed LE payloads per opcode. Payload closes connection after processing; EOF is the timeout-bounded ACK.
+  - handshake `0x01`: response `version\x00 + u32 LE attribs` — version must be `rovr-sa-2.*` (e.g. `rovr-sa-2.0`). A `yabai-sa-*` response is rejected as incompatible.
+  - ops: packed LE payloads with exact opcode-specific lengths. The payload returns a one-byte status ACK; EOF without that ACK is failure. Reads and writes have 2 s deadlines.
 - Opcodes implemented by the Rovr payload: `0x01 handshake`, `0x02 focus_space`, `0x03 create_space`, `0x04 destroy_space`, `0x05 move_space`, `0x07 opacity`, `0x08 opacity_fade`, `0x09 layer`, `0x0A sticky`, `0x0B shadow`, `0x0D scale`.
-- Capability bits in handshake attribs report what ACTUALLY resolved inside this Dock process: `0x04 add_space`, `0x08 rem_space`, `0x10 mov_space`. The window-cosmetic ops (layer/sticky/shadow/opacity/scale) are pure SkyLight and are available whenever the payload is live.
+- Capability bits report each operation independently, including focus and window cosmetics. Clients gate every opcode on its bit; unsupported operations return an explicit status.
 - Every IPC carries a hard 2 s deadline (`SA_DEADLINE`); no unbounded wait.
 
 ## Payload responsibilities (strictly primitive)
@@ -39,10 +39,10 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
 - `rovr sa status` — probes the socket and reports one of five states:
   - `not_installed` — no socket, no installed files
   - `installed_not_injected` — files present under `/Library/Application Support/rovr/`, but Dock is not running the payload
-  - `injected_compatible` — handshake answers with a `rovr-sa-1.*` version and all space-capability bits set
+  - `injected_compatible` — handshake answers with a `rovr-sa-2.*` version and all space-capability bits set
   - `incompatible_protocol` — something answers on the socket with a foreign/outdated version
   - `capability_missing` — compatible payload but some space-capability bits absent on this macOS build
-  It also reports the full lifecycle picture (`-- lifecycle --` section): privileged **service** state (`not_installed`, `installed`, `registered`; `awaiting_approval` is reserved for future SMAppService flows), the installed payload sha256 vs the install-time marker, and whether the **injected** payload differs from the **installed** one (replacing the dylib on disk does NOT update code already mapped into Dock — status flags that mismatch explicitly).
+  It also reports the full lifecycle picture (`-- lifecycle --` section): privileged **service** state (`not_installed`, `installed`, `registered`; `awaiting_approval` is reserved for future SMAppService flows), the installed payload sha256 vs the install-time marker, and the live handshake version. Dock does not expose the hash of mapped payload code, so status does not claim to compare the injected and installed hashes.
 - `rovr sa install` — full install lifecycle:
   1. locates the built artifacts (`cargo build -p rovr-sa-payload -p rovr-sa-loader -p rovr-sa-helper`; env overrides `ROVR_SA_PAYLOAD`/`ROVR_SA_LOADER`/`ROVR_SA_HELPER`)
   2. verifies root + SIP scope (see `docs/SA_SIP.md`)
@@ -52,7 +52,7 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
   6. polls the socket for a verified handshake as the console user
   7. writes `payload.installed.json` (installed/injected sha256 + handshake version) and reports actual capability bits
 
-  Failure at any stage is reported honestly; success is only claimed after a verified handshake, never merely because files were copied.
+  Failure at any stage is reported honestly; success is only claimed after a verified handshake. Status reports the installed SHA and handshake version separately because Dock does not expose the SHA of mapped payload code.
 - `rovr sa uninstall` — unregisters the LaunchDaemon first (guaranteeing no further reinjection), removes the plist, helper, loader, payload, identity marker, stale SA socket, then restarts Dock (required: code already mapped into Dock cannot be evicted any other way). Nothing privileged is left behind.
 
 ## Automatic reinjection
@@ -83,7 +83,7 @@ Division of responsibility:
 
 - The request frame is exactly `{magic, proto, opcode, uid}` — there is structurally NO field for a pid, path, command or environment (unit-tested).
 - Payload/loader/helper paths are compile-time constants pointing at the root-owned installed artifacts; the helper resolves Dock itself via `NSRunningApplication` and never trusts a caller-supplied PID.
-- Callers are authenticated with `getpeereid()`: kernel peer uid must equal BOTH the uid in the request AND the owner of `/dev/console` (the GUI session user). Sockets are UID-specific (`/tmp/rovr-sa_<uid>.sock`), so an injection is always bound to the requesting console session; other users' processes are refused.
+- Callers are authenticated with `getpeereid()`: kernel peer uid must equal BOTH the uid in the request AND the owner of `/dev/console` (the GUI session user). Sockets live in the UID-specific `0700` runtime directory (`/tmp/rovr-<uid>/`), so an injection is always bound to the requesting console session; other users' processes are refused.
 - Artifacts are re-validated before every use: regular files only (`lstat` + `O_NOFOLLOW` — symlinks refused), root-owned, expected modes, install directory not group/other-writable.
 - The helper runs the loader via `posix_spawn` with a FIXED argv and a fixed minimal environment — nothing inherited from the request or daemon.
 - Event-driven only: launchd starts the helper when a client connects; no root process polls anything.
@@ -99,11 +99,11 @@ Apple's current API, `SMAppService.daemon(plistName:)` (macOS 13+), registers a 
 
 ## Update behavior
 
-Replacing the installed payload dylib does NOT update code already mapped into Dock. `rovr sa status` detects this: install writes a `payload.installed.json` marker recording the installed sha256 AND the sha256 that was actually injected; if the current file hash differs from the injected hash, status reports `injection: STALE` with the remediation (`sudo rovr sa install`). Dock is never killed automatically during an update — reinjection into the running Dock happens only via the explicit install command or the daemon's bounded automatic path (which injects the currently installed build into a NEW Dock).
+Replacing the installed payload dylib does NOT update code already mapped into Dock. `payload.installed.json` records the installed sha256 and the handshake version observed after installation, but Dock does not expose the hash of mapped payload code. `rovr sa status` therefore reports that limitation instead of claiming an injected hash. Reinjection into the running Dock happens only through the explicit install command or the daemon's bounded automatic path for a new Dock generation.
 
 ## Versioning
 
-- Payload/client protocol is versioned via `ROVR_SA_VERSION_PREFIX = "rovr-sa-1."`. The client rejects mismatched majors; minors remain wire-compatible. Bumping the major requires coordinated payload + client release. `rovr sa status` and `rovr doctor` surface the mismatch for remediation.
+- Payload/client protocol is versioned via `ROVR_SA_VERSION_PREFIX = "rovr-sa-2."`. The client rejects mismatched majors; minors remain wire-compatible. Bumping the major requires coordinated payload + client release. `rovr sa status` and `rovr doctor` surface the mismatch for remediation.
 
 ## Verification status
 

@@ -146,6 +146,10 @@ pub struct DisplaySnapshot {
     pub frame: Rect,
     pub label: Option<String>,
     pub focused: bool,
+    /// True if this is the main display (CGMainDisplayID), not just the
+    /// active menu-bar display. Used for workspace display="main" semantics.
+    #[serde(default)]
+    pub is_main: bool,
     pub generation: u64,
 }
 

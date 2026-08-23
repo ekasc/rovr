@@ -370,6 +370,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -489,6 +490,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -577,6 +579,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -689,6 +692,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -784,6 +788,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -871,6 +876,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -958,6 +964,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -1295,6 +1302,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -1380,6 +1388,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );
@@ -1480,6 +1489,7 @@ mod tests {
                 },
                 label: None,
                 focused: false,
+                is_main: false,
                 generation: 0,
             },
         );

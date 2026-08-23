@@ -22,7 +22,7 @@ persistent = true
 [[workspace]]
 name = "chat"
 layout = "stack"
-display = "secondary"
+display = "2"
 persistent = true
 
 [[rule]]
@@ -38,10 +38,10 @@ workspace = "chat"
 # CLI invocation without the leading "rovr".
 # [[bind]]
 # key = "alt - h"
-# command = "window focus-direction --from 1 --direction west"
+# command = "window focus-direction west 1"
 # [[bind]]
 # key = "alt - l"
-# command = "window focus-direction --from 1 --direction east"
+# command = "window focus-direction east 1"
 # [[bind]]
 # key = "alt - r"
 # command = "layout rotate --space 1"

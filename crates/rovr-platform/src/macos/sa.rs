@@ -2,7 +2,7 @@
 //
 // Rovr speaks the same length-prefixed binary framing as yabai's SA
 // (src/sa.m / src/osax/common.h, MIT © 2019 Åsmund Vikane) but over its
-// OWN socket namespace `/tmp/rovr-sa_<uid>.sock` and with a versioned
+// OWN socket namespace `/tmp/rovr-<uid>/sa.sock` and with a versioned
 // handshake. The payload is Rovr-owned: primitive operations only, no layout
 // policy, no config parsing, no desired-state. Every transition carries a
 // hard deadline.
@@ -13,7 +13,7 @@
 //   handshake: request opcode 0x01 with no payload
 //              response: version cstring, NUL, u32 LE capability attributes
 //              Rovr payload version strings are `rovr-sa-<semver>` (e.g.
-//              `rovr-sa-1.0`). The client probes, parses and version-checks
+//              `rovr-sa-2.0`). The client probes, parses and version-checks
 //              this string; a yabai payload (`yabai-sa-*`) is treated as
 //              incompatible (different namespace), not silently accepted.
 //   ops: payload is packed little-endian; the payload echoes one byte ACK.
@@ -30,11 +30,11 @@ use thiserror::Error;
 /// Rovr-owned SA socket namespace. Uses UID (not $USER) so the daemon
 /// and CLI agree even when $USER is unset or differs; `$USER` fallback is
 /// kept only for error messaging.
-pub const SA_SOCKET_PATH_FMT: &str = "/tmp/rovr-sa_{}.sock";
+pub const SA_SOCKET_PATH_FMT: &str = "/tmp/rovr-{}/sa.sock";
 /// Expected payload version prefix. Bump the minor on wire-compatible
-/// extensions; bump the major on breaking changes. `probe()` rejects any
-/// payload whose version string does not start with this prefix.
-pub const ROVR_SA_VERSION_PREFIX: &str = "rovr-sa-1.";
+/// extensions; bump the major on breaking changes. `probe()` preserves raw
+/// mismatched versions for status, while capabilities reject them.
+pub const ROVR_SA_VERSION_PREFIX: &str = "rovr-sa-2.";
 const SA_SOCKET_BUFF_LEN: usize = 0x1000;
 const SA_DEADLINE: Duration = Duration::from_secs(2);
 /// Deadline for PERIODIC health probes: a wedged payload must never hold the
@@ -56,10 +56,17 @@ const SA_OPCODE_WINDOW_SCALE: u8 = 0x0D;
 pub const OSAX_ATTRIB_ADD_SPACE: u32 = 0x04;
 pub const OSAX_ATTRIB_REM_SPACE: u32 = 0x08;
 pub const OSAX_ATTRIB_MOV_SPACE: u32 = 0x10;
+pub const OSAX_ATTRIB_FOCUS_SPACE: u32 = 0x20;
+pub const OSAX_ATTRIB_WINDOW_OPACITY: u32 = 0x40;
+pub const OSAX_ATTRIB_WINDOW_LAYER: u32 = 0x80;
+pub const OSAX_ATTRIB_WINDOW_STICKY: u32 = 0x100;
+pub const OSAX_ATTRIB_WINDOW_SHADOW: u32 = 0x200;
+pub const OSAX_ATTRIB_WINDOW_SCALE: u32 = 0x400;
 
 #[cfg(target_os = "macos")]
 extern "C" {
     fn getuid() -> u32;
+    fn getpeereid(socket: i32, euid: *mut u32, egid: *mut u32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -67,9 +74,26 @@ unsafe fn libc_getuid() -> u32 {
     getuid()
 }
 
+#[cfg(target_os = "macos")]
+fn validate_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), SaError> {
+    use std::os::fd::AsRawFd;
+    let mut uid = u32::MAX;
+    let mut gid = 0u32;
+    let status = unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if status != 0 || uid != expected_uid {
+        return Err(SaError::Unavailable("SA socket peer owner mismatch".into()));
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 unsafe fn libc_getuid() -> u32 {
     0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_peer(_stream: &UnixStream, _expected_uid: u32) -> Result<(), SaError> {
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +120,7 @@ impl SaInfo {
 
 pub struct SaClient {
     socket_path: PathBuf,
+    expected_uid: u32,
 }
 
 impl Default for SaClient {
@@ -120,11 +145,22 @@ impl SaClient {
     pub fn new() -> Self {
         Self {
             socket_path: Self::default_socket_path(),
+            expected_uid: unsafe { libc_getuid() },
         }
     }
 
     pub fn with_socket_path(path: PathBuf) -> Self {
-        Self { socket_path: path }
+        Self {
+            socket_path: path,
+            expected_uid: unsafe { libc_getuid() },
+        }
+    }
+
+    pub fn with_socket_path_for_uid(path: PathBuf, expected_uid: u32) -> Self {
+        Self {
+            socket_path: path,
+            expected_uid,
+        }
     }
 
     pub fn socket_path(&self) -> &PathBuf {
@@ -182,12 +218,8 @@ impl SaClient {
         let nul = buffer[..length].iter().position(|&byte| byte == 0)?;
         let version_bytes = &buffer[..nul];
         let version = String::from_utf8_lossy(version_bytes).into_owned();
-        // Require Rovr payload; a yabai payload ("yabai-sa-*") or any
-        // unexpected version is treated as incompatible — not silently
-        // accepted. This prevents accidentally depending on yabai.
-        if !version.starts_with(ROVR_SA_VERSION_PREFIX) {
-            return None;
-        }
+        // Preserve the raw version even when incompatible so status can
+        // distinguish a protocol mismatch from an absent/stalled payload.
         let attribs = u32::from_le_bytes(buffer[nul + 1..nul + 5].try_into().ok()?);
         Some(SaInfo { version, attribs })
     }
@@ -197,9 +229,23 @@ impl SaClient {
     }
 
     fn connect_with_deadline(&self, deadline: Duration) -> Result<UnixStream, SaError> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::symlink_metadata(&self.socket_path).map_err(|err| {
+            SaError::Unavailable(format!("{}: {err}", self.socket_path.display()))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_socket()
+            || metadata.uid() != self.expected_uid
+        {
+            return Err(SaError::Unavailable(format!(
+                "unsafe socket identity at {}",
+                self.socket_path.display()
+            )));
+        }
         let stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             SaError::Unavailable(format!("{}: {err}", self.socket_path.display()))
         })?;
+        validate_peer(&stream, self.expected_uid)?;
         stream
             .set_read_timeout(Some(deadline))
             .and_then(|()| stream.set_write_timeout(Some(deadline)))
@@ -222,20 +268,15 @@ impl SaClient {
             .write_all(&bytes)
             .map_err(|err| SaError::Operation(format!("send opcode {opcode:#04x}: {err}")))?;
 
-        // The payload sends no ACK for non-handshake opcodes; it processes
-        // the message then closes the connection. Reading to EOF is the
-        // completion signal and bounds the wait by SA_DEADLINE.
-        let mut sink = [0u8; 256];
-        loop {
-            match stream.read(&mut sink) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) => {
-                    return Err(SaError::Operation(format!(
-                        "completion wait for opcode {opcode:#04x}: {err}"
-                    )))
-                }
-            }
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).map_err(|err| {
+            SaError::Operation(format!("ACK wait for opcode {opcode:#04x}: {err}"))
+        })?;
+        if ack[0] != 0 {
+            return Err(SaError::Operation(format!(
+                "opcode {opcode:#04x} rejected with status {}",
+                ack[0]
+            )));
         }
         Ok(())
     }
@@ -302,5 +343,50 @@ impl SaClient {
         payload.extend_from_slice(&0u64.to_le_bytes());
         payload.push(0u8);
         self.send_op(SA_OPCODE_SPACE_MOVE, &payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn socket(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rovr-sa-{name}-{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn eof_without_operation_ack_is_failure() {
+        let path = socket("eof");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 32];
+            let _ = stream.read(&mut request);
+        });
+        let client = SaClient::with_socket_path(path.clone());
+        assert!(client.set_layer(1, 0).is_err());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_preserves_incompatible_raw_version() {
+        let path = socket("version");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 3];
+            stream.read_exact(&mut request).unwrap();
+            stream.write_all(b"rovr-sa-9.0\0\0\0\0\0").unwrap();
+        });
+        let client = SaClient::with_socket_path(path.clone());
+        let info = client.probe().expect("raw handshake remains observable");
+        assert_eq!(info.version, "rovr-sa-9.0");
+        assert!(!info.is_compatible());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }
