@@ -1,7 +1,7 @@
 //
 // Rovr scripting-addition payload — injected into Dock.app.
 //
-// Listens on the ROVR-OWNED socket /tmp/rovr-sa_<uid>.sock and executes
+// Listens on the ROVR-OWNED socket /tmp/rovr-<uid>/sa.sock and executes
 // primitive SkyLight / Dock-internal operations ONLY. This payload contains
 // no layout policy, no config parsing, no workspace logic, and never talks to
 // yabai's socket.
@@ -120,15 +120,19 @@ static uint64_t image_slide(void)
 // Scan bounded by the host's __TEXT size: in Dock the region is large, but
 // if the payload is ever loaded into another host the scan must not walk off
 // the end of mapped memory.
+static uint64_t g_scan_base = 0;
 static uint64_t g_scan_limit = 0;
 
 static uint64_t hex_find_seq(uint64_t baddr, const char *c_pattern)
 {
-    if (!baddr || !c_pattern || baddr == UINT64_MAX) return 0;
-    if (g_scan_limit && baddr >= g_scan_limit) return 0;
+    if (!baddr || !c_pattern || baddr == UINT64_MAX || !g_scan_base || !g_scan_limit) return 0;
+    uint64_t scan_end = 0;
+    if (__builtin_add_overflow(g_scan_base, g_scan_limit, &scan_end) ||
+        baddr < g_scan_base || baddr >= scan_end) return 0;
 
     uint64_t addr = baddr;
     uint64_t pattern_length = (strlen(c_pattern) + 1) / 3;
+    if (pattern_length == 0 || pattern_length > scan_end - baddr) return 0;
     char buffer_a[pattern_length];
     char buffer_b[pattern_length];
     memset(buffer_a, 0, sizeof(buffer_a));
@@ -149,21 +153,17 @@ static uint64_t hex_find_seq(uint64_t baddr, const char *c_pattern)
         pattern += 3;
     }
 
+    uint64_t available = scan_end - baddr;
+    uint64_t scan_length = available < 0x1286a0 ? available : 0x1286a0;
+    if (scan_length < pattern_length) return 0;
+
 loop:
-    for (int counter = 0; counter < pattern_length; ++counter) {
-        if (g_scan_limit && (uint64_t)((char *)addr + counter) - baddr >= g_scan_limit) {
-            return 0;
-        }
+    for (uint64_t counter = 0; counter < pattern_length; ++counter) {
+        if (counter >= scan_end - addr) return 0;
         if ((buffer_b[counter] == 0) && (((char *)addr)[counter] != buffer_a[counter])) {
-            addr = (uint64_t)((char *)addr + 1);
-            if (g_scan_limit && (addr - baddr) >= g_scan_limit) {
-                return 0;
-            }
-            if (addr - baddr < 0x1286a0) {
-                goto loop;
-            } else {
-                return 0;
-            }
+            if (addr - baddr >= scan_length - pattern_length) return 0;
+            addr++;
+            goto loop;
         }
     }
 
@@ -235,12 +235,12 @@ static uint64_t region_size_at(uint64_t addr)
     return (uint64_t) size;
 }
 
-static uint64_t find_offset_clamped(uint64_t offset)
+static uint64_t scan_address_for_offset(uint64_t offset)
 {
-    // Offsets beyond the host __TEXT cannot match anything; skipping them
-    // keeps the scan strictly inside mapped memory.
-    if (g_scan_limit && offset >= g_scan_limit) return UINT64_MAX;
-    return offset;
+    if (!g_scan_base || offset >= g_scan_limit) return UINT64_MAX;
+    uint64_t address = 0;
+    if (__builtin_add_overflow(g_scan_base, offset, &address)) return UINT64_MAX;
+    return address;
 }
 
 static void init_instances()
@@ -255,10 +255,11 @@ static void init_instances()
         uint64_t seg_size = text ? (uint64_t) text->filesize : 0;
         // Belt and braces: clamp to whatever is actually mapped at baseaddr.
         uint64_t mapped = region_size_at(baseaddr);
+        g_scan_base = baseaddr;
         g_scan_limit = mapped > 0 ? (seg_size ? (seg_size < mapped ? seg_size : mapped) : mapped) : 0;
     }
 
-    uint64_t dock_spaces_addr = hex_find_seq(baseaddr + find_offset_clamped(get_dock_spaces_offset(os_version)), get_dock_spaces_pattern(os_version));
+    uint64_t dock_spaces_addr = hex_find_seq(scan_address_for_offset(get_dock_spaces_offset(os_version)), get_dock_spaces_pattern(os_version));
     if (dock_spaces_addr == 0) {
         dock_spaces = nil;
         NSLog(@"[rovr-sa] could not locate pointer to dock.spaces! spaces functionality will not work!");
@@ -272,7 +273,7 @@ static void init_instances()
 #endif
     }
 
-    uint64_t dppm_addr = hex_find_seq(baseaddr + find_offset_clamped(get_dppm_offset(os_version)), get_dppm_pattern(os_version));
+    uint64_t dppm_addr = hex_find_seq(scan_address_for_offset(get_dppm_offset(os_version)), get_dppm_pattern(os_version));
     if (dppm_addr == 0) {
         dp_desktop_picture_manager = nil;
         NSLog(@"[rovr-sa] could not locate pointer to dppm! moving spaces will not work!");
@@ -300,7 +301,7 @@ static void init_instances()
 #endif
     }
 
-    uint64_t add_space_addr = hex_find_seq(baseaddr + find_offset_clamped(get_add_space_offset(os_version)), get_add_space_pattern(os_version));
+    uint64_t add_space_addr = hex_find_seq(scan_address_for_offset(get_add_space_offset(os_version)), get_add_space_pattern(os_version));
     if (add_space_addr == 0x0) {
         NSLog(@"[rovr-sa] failed to get pointer to addSpace function..");
         add_space_fp = 0;
@@ -312,7 +313,7 @@ static void init_instances()
 #endif
     }
 
-    uint64_t remove_space_addr = hex_find_seq(baseaddr + find_offset_clamped(get_remove_space_offset(os_version)), get_remove_space_pattern(os_version));
+    uint64_t remove_space_addr = hex_find_seq(scan_address_for_offset(get_remove_space_offset(os_version)), get_remove_space_pattern(os_version));
     if (remove_space_addr == 0x0) {
         NSLog(@"[rovr-sa] failed to get pointer to removeSpace function..");
         remove_space_fp = 0;
@@ -324,7 +325,7 @@ static void init_instances()
 #endif
     }
 
-    uint64_t move_space_addr = hex_find_seq(baseaddr + find_offset_clamped(get_move_space_offset(os_version)), get_move_space_pattern(os_version));
+    uint64_t move_space_addr = hex_find_seq(scan_address_for_offset(get_move_space_offset(os_version)), get_move_space_pattern(os_version));
     if (move_space_addr == 0x0) {
         NSLog(@"[rovr-sa] failed to get pointer to moveSpace function..");
         move_space_fp = 0;
@@ -502,21 +503,25 @@ static void do_space_create(char *message)
     });
 }
 
-static void do_space_focus(char *message)
+static bool do_space_focus(char *message)
 {
-    if (dock_spaces == nil) return;
+    if (dock_spaces == nil) return false;
 
     uint64_t dest_space_id;
     unpack(dest_space_id);
-
-    if (dest_space_id) {
+    if (!dest_space_id) return false;
+    bool accepted = false;
+    {
         CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
+        if (!dest_display) return false;
         id source_space = macOSSequoia
                         ? ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceForDisplayUUID:), dest_display)
                         : ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceforDisplayUUID:), dest_display);
         uint64_t source_space_id = get_space_id(source_space);
 
-        if (source_space_id != dest_space_id) {
+        if (source_space_id == dest_space_id) {
+            accepted = true;
+        } else {
             id dest_space = space_for_display_with_id(dest_display, dest_space_id);
             if (dest_space != nil) {
                 id display_space = display_space_for_space_with_id(source_space_id);
@@ -527,6 +532,7 @@ static void do_space_focus(char *message)
                     SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
                     SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
                     set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
+                    accepted = true;
                     [ns_dest_space release];
                     [ns_source_space release];
                 }
@@ -535,6 +541,7 @@ static void do_space_focus(char *message)
 
         CFRelease(dest_display);
     }
+    return accepted;
 }
 
 static void do_window_scale(char *message)
@@ -759,6 +766,10 @@ static void do_handshake(int sockfd)
     if (add_space_fp)                      attrib |= OSAX_ATTRIB_ADD_SPACE;
     if (remove_space_fp)                   attrib |= OSAX_ATTRIB_REM_SPACE;
     if (move_space_fp)                     attrib |= OSAX_ATTRIB_MOV_SPACE;
+    if (dock_spaces != nil)                attrib |= OSAX_ATTRIB_FOCUS_SPACE;
+    attrib |= OSAX_ATTRIB_WINDOW_OPACITY | OSAX_ATTRIB_WINDOW_LAYER |
+              OSAX_ATTRIB_WINDOW_STICKY | OSAX_ATTRIB_WINDOW_SHADOW |
+              OSAX_ATTRIB_WINDOW_SCALE;
 
     char bytes[BUFSIZ] = {};
     int version_length = strlen(ROVR_SA_VERSION);
@@ -773,47 +784,63 @@ static void do_handshake(int sockfd)
     send(sockfd, bytes, bytes_length+1, 0);
 }
 
-static void handle_message(int sockfd, char *message)
+static size_t expected_message_length(enum sa_opcode op)
 {
-    enum sa_opcode op = *message++;
     switch (op) {
-    case SA_OPCODE_HANDSHAKE: {
-        do_handshake(sockfd);
-    } break;
-    case SA_OPCODE_SPACE_FOCUS: {
-        do_space_focus(message);
-    } break;
-    case SA_OPCODE_SPACE_CREATE: {
-        do_space_create(message);
-    } break;
-    case SA_OPCODE_SPACE_DESTROY: {
-        do_space_destroy(message);
-    } break;
-    case SA_OPCODE_SPACE_MOVE: {
-        do_space_move(message);
-    } break;
-    case SA_OPCODE_WINDOW_OPACITY: {
-        do_window_opacity(message);
-    } break;
-    case SA_OPCODE_WINDOW_OPACITY_FADE: {
-        do_window_opacity_fade(message);
-    } break;
-    case SA_OPCODE_WINDOW_LAYER: {
-        do_window_layer(message);
-    } break;
-    case SA_OPCODE_WINDOW_STICKY: {
-        do_window_sticky(message);
-    } break;
-    case SA_OPCODE_WINDOW_SHADOW: {
-        do_window_shadow(message);
-    } break;
-    case SA_OPCODE_WINDOW_SCALE: {
-        do_window_scale(message);
-    } break;
+    case SA_OPCODE_HANDSHAKE: return 1;
+    case SA_OPCODE_SPACE_FOCUS:
+    case SA_OPCODE_SPACE_CREATE:
+    case SA_OPCODE_SPACE_DESTROY: return 1 + sizeof(uint64_t);
+    case SA_OPCODE_SPACE_MOVE: return 1 + sizeof(uint64_t) * 3 + sizeof(uint8_t);
+    case SA_OPCODE_WINDOW_OPACITY:
+    case SA_OPCODE_WINDOW_OPACITY_FADE: return 1 + sizeof(uint32_t) + sizeof(float) * 2;
+    case SA_OPCODE_WINDOW_LAYER: return 1 + sizeof(uint32_t) + sizeof(int32_t);
+    case SA_OPCODE_WINDOW_STICKY:
+    case SA_OPCODE_WINDOW_SHADOW: return 1 + sizeof(uint32_t) + sizeof(uint8_t);
+    case SA_OPCODE_WINDOW_SCALE: return 1 + sizeof(uint32_t) + sizeof(float) * 4;
+    default: return 0;
     }
 }
 
-static bool read_message(int sockfd, char *message)
+static uint8_t handle_message(int sockfd, char *message, size_t length)
+{
+    enum sa_opcode op = (enum sa_opcode)(uint8_t)*message++;
+    if (expected_message_length(op) != length) return SA_STATUS_BAD_FRAME;
+    if (op != SA_OPCODE_HANDSHAKE) {
+        uint64_t identifier = 0;
+        memcpy(&identifier, message, op == SA_OPCODE_SPACE_MOVE ||
+               op == SA_OPCODE_SPACE_FOCUS || op == SA_OPCODE_SPACE_CREATE ||
+               op == SA_OPCODE_SPACE_DESTROY ? sizeof(uint64_t) : sizeof(uint32_t));
+        if (identifier == 0) return SA_STATUS_INVALID;
+    }
+    switch (op) {
+    case SA_OPCODE_HANDSHAKE: do_handshake(sockfd); return SA_STATUS_OK;
+    case SA_OPCODE_SPACE_FOCUS:
+        if (dock_spaces == nil) return SA_STATUS_UNSUPPORTED;
+        if (!do_space_focus(message)) return SA_STATUS_INVALID;
+        break;
+    case SA_OPCODE_SPACE_CREATE:
+        if (dock_spaces == nil || add_space_fp == 0) return SA_STATUS_UNSUPPORTED;
+        do_space_create(message); break;
+    case SA_OPCODE_SPACE_DESTROY:
+        if (dock_spaces == nil || remove_space_fp == 0) return SA_STATUS_UNSUPPORTED;
+        do_space_destroy(message); break;
+    case SA_OPCODE_SPACE_MOVE:
+        if (dock_spaces == nil || dp_desktop_picture_manager == nil || move_space_fp == 0)
+            return SA_STATUS_UNSUPPORTED;
+        do_space_move(message); break;
+    case SA_OPCODE_WINDOW_OPACITY: do_window_opacity(message); break;
+    case SA_OPCODE_WINDOW_OPACITY_FADE: do_window_opacity_fade(message); break;
+    case SA_OPCODE_WINDOW_LAYER: do_window_layer(message); break;
+    case SA_OPCODE_WINDOW_STICKY: do_window_sticky(message); break;
+    case SA_OPCODE_WINDOW_SHADOW: do_window_shadow(message); break;
+    case SA_OPCODE_WINDOW_SCALE: do_window_scale(message); break;
+    default: return SA_STATUS_UNSUPPORTED;
+    }
+    return SA_STATUS_OK;
+}
+
+static bool read_message(int sockfd, char *message, size_t *message_length)
 {
     int16_t length = 0;
     int bytes_read = 0;
@@ -836,7 +863,11 @@ static bool read_message(int sockfd, char *message)
             bytes_read += cur_read;
         } while (bytes_read < bytes_to_read);
 
-        return bytes_read == bytes_to_read;
+        if (bytes_read == bytes_to_read) {
+            *message_length = (size_t)bytes_to_read;
+            return true;
+        }
+        return false;
     }
 
     return false;
@@ -848,9 +879,27 @@ static void *handle_connection(void *unused)
         int sockfd = accept(daemon_sockfd, NULL, 0);
         if (sockfd == -1) continue;
 
-        char message[SA_SOCKET_BUFF_LEN];
-        if (read_message(sockfd, message)) {
-            handle_message(sockfd, message);
+        uid_t peer_uid = UINT32_MAX;
+        gid_t peer_gid = 0;
+        if (getpeereid(sockfd, &peer_uid, &peer_gid) != 0 ||
+            (peer_uid != getuid() && peer_uid != 0)) {
+            shutdown(sockfd, SHUT_RDWR);
+            close(sockfd);
+            continue;
+        }
+        struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        char message[SA_SOCKET_BUFF_LEN] = {0};
+        size_t message_length = 0;
+        if (read_message(sockfd, message, &message_length)) {
+            enum sa_opcode op = (enum sa_opcode)(uint8_t)message[0];
+            uint8_t status = handle_message(sockfd, message, message_length);
+            if (op != SA_OPCODE_HANDSHAKE) send(sockfd, &status, sizeof(status), 0);
+        } else {
+            uint8_t status = SA_STATUS_BAD_FRAME;
+            send(sockfd, &status, sizeof(status), 0);
         }
 
         shutdown(sockfd, SHUT_RDWR);
@@ -860,9 +909,21 @@ static void *handle_connection(void *unused)
     return NULL;
 }
 
-static bool start_daemon(char *socket_path)
+static bool ensure_runtime_dir(char *runtime_dir)
 {
-    struct sockaddr_un socket_address;
+    struct stat st = {0};
+    if (lstat(runtime_dir, &st) == 0) {
+        return S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode) &&
+               st.st_uid == getuid() && (st.st_mode & 0077) == 0;
+    }
+    if (mkdir(runtime_dir, 0700) != 0) return false;
+    return chmod(runtime_dir, 0700) == 0;
+}
+
+static bool start_daemon(char *runtime_dir, char *socket_path)
+{
+    if (!ensure_runtime_dir(runtime_dir)) return false;
+    struct sockaddr_un socket_address = {0};
     socket_address.sun_family = AF_UNIX;
     snprintf(socket_address.sun_path, sizeof(socket_address.sun_path), "%s", socket_path);
     unlink(socket_path);
@@ -898,10 +959,12 @@ void load_payload(void)
     // unset or differs); $USER is not consulted at all.
     uid_t uid = getuid();
 
+    char runtime_dir[255];
     char socket_file[255];
+    snprintf(runtime_dir, sizeof(runtime_dir), SA_RUNTIME_DIR_FMT, uid);
     snprintf(socket_file, sizeof(socket_file), SA_SOCKET_PATH_FMT, uid);
 
-    if (start_daemon(socket_file)) {
+    if (start_daemon(runtime_dir, socket_file)) {
         NSLog(@"[rovr-sa] now listening on %s..", socket_file);
     } else {
         NSLog(@"[rovr-sa] failed to start socket listener..");

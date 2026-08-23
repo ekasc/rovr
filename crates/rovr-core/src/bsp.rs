@@ -144,6 +144,54 @@ impl BspNode {
             }
         }
     }
+
+    fn resize_edge(
+        &mut self,
+        window: WindowId,
+        edge: rovr_types::Direction,
+        delta: f64,
+        area: Rect,
+        gap: f64,
+    ) -> bool {
+        let BspNode::Split {
+            axis,
+            ratio,
+            left,
+            right,
+        } = self
+        else {
+            return false;
+        };
+        let (left_area, right_area) = split(area, gap, *axis, *ratio);
+        let in_left = left.contains(window);
+        let child_changed = if in_left {
+            left.resize_edge(window, edge, delta, left_area, gap)
+        } else if right.contains(window) {
+            right.resize_edge(window, edge, delta, right_area, gap)
+        } else {
+            return false;
+        };
+        if child_changed {
+            return true;
+        }
+
+        let total = match axis {
+            Axis::Vertical => area.width - gap,
+            Axis::Horizontal => area.height - gap,
+        };
+        if total <= 0.0 {
+            return false;
+        }
+        let adjustment = match (*axis, in_left, edge) {
+            (Axis::Vertical, true, rovr_types::Direction::East)
+            | (Axis::Horizontal, true, rovr_types::Direction::South) => delta / total,
+            (Axis::Vertical, false, rovr_types::Direction::West)
+            | (Axis::Horizontal, false, rovr_types::Direction::North) => -delta / total,
+            _ => return false,
+        };
+        *ratio = Self::clamp_ratio(*ratio + adjustment);
+        true
+    }
 }
 
 fn split(area: Rect, gap: f64, axis: Axis, ratio: f64) -> (Rect, Rect) {
@@ -421,6 +469,20 @@ impl BspTree {
         }
     }
 
+    /// Adjust the nearest BSP split boundary represented by `edge`.
+    pub fn resize_edge(
+        &mut self,
+        window: WindowId,
+        edge: rovr_types::Direction,
+        delta: f64,
+        area: Rect,
+        gap: f64,
+    ) -> bool {
+        self.root
+            .as_mut()
+            .is_some_and(|root| root.resize_edge(window, edge, delta, area, gap))
+    }
+
     pub fn set_ratio(&mut self, ratio: f64) -> bool {
         let r = BspNode::clamp_ratio(ratio);
         if let Some(root) = &mut self.root {
@@ -649,6 +711,24 @@ mod tests {
             assert!(r.x >= 0.0 && r.y >= 0.0);
             assert!(r.width > 0.0 && r.height > 0.0);
         }
+    }
+
+    #[test]
+    fn resize_edge_updates_split_ratio_and_survives_relayout() {
+        let mut tree = BspTree::new();
+        tree.insert(WindowId(1));
+        tree.insert(WindowId(2));
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        let before = tree.placements(area, 0.0);
+        assert!(tree.resize_edge(WindowId(1), rovr_types::Direction::East, 100.0, area, 0.0));
+        let after = tree.placements(area, 0.0);
+        assert!(after[0].1.width > before[0].1.width);
+        assert!(after[1].1.width < before[1].1.width);
     }
 
     #[test]

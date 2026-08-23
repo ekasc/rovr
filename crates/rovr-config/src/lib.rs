@@ -114,7 +114,8 @@ pub struct ScratchpadConfig {
 /// not yet register global hotkeys itself; this table is the single source of
 /// truth for skhd and for a future built-in listener. `key` uses skhd syntax
 /// like "cmd - h" or "alt + shift - r". `command` is the rovr CLI invocation
-/// without the leading "rovr", e.g. "window --focus 1" or "layout --rotate 1".
+/// without the leading "rovr", e.g. "window focus 1" or
+/// "layout rotate --space 1".
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KeybindConfig {
     pub key: String,
@@ -171,6 +172,8 @@ pub enum ConfigError {
     EmptyBindCommand,
     #[error("duplicate keybind key: {0}")]
     DuplicateBind(String),
+    #[error("invalid bind key {key:?}: {reason}")]
+    InvalidBindKey { key: String, reason: String },
     #[error("invalid bind command for key {key:?}: {reason}")]
     InvalidBindCommand { key: String, reason: String },
     #[error("opacity must be between 0.0 and 1.0")]
@@ -245,6 +248,12 @@ impl Config {
             if bind.command.trim().is_empty() {
                 return Err(ConfigError::EmptyBindCommand);
             }
+            let chord = rovr_protocol::hotkey::parse_hotkey(&bind.key).map_err(|parse_err| {
+                ConfigError::InvalidBindKey {
+                    key: bind.key.clone(),
+                    reason: parse_err.to_string(),
+                }
+            })?;
             // Blocker 8: an invalid bind command fails config load/reload —
             // it can never silently become a different command at runtime.
             // Blocker 7: validation uses the ONE shared parser (same grammar
@@ -255,7 +264,7 @@ impl Config {
                     reason: parse_err.message,
                 });
             }
-            if !bind_keys.insert(bind.key.as_str()) {
+            if !bind_keys.insert(chord) {
                 return Err(ConfigError::DuplicateBind(bind.key.clone()));
             }
         }
@@ -315,14 +324,54 @@ mod tests {
             r#"
             [[bind]]
             key = "alt - h"
-            command = "window focus-direction 1 west"
+            command = "window focus-direction west 1"
             [[bind]]
             key = "alt - l"
-            command = "window focus-direction 1 east"
+            command = "window focus-direction east 1"
+            [[bind]]
+            key = "alt - tab"
+            command = "query windows"
+            [[bind]]
+            key = "alt + shift - tab"
+            command = "query spaces"
             "#,
         )
         .expect("valid binds");
-        assert_eq!(cfg.binds.len(), 2);
+        assert_eq!(cfg.binds.len(), 4);
+    }
+
+    #[test]
+    fn rejects_unknown_bind_modifier_at_load() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "hyper - h"
+            command = "query --windows"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBindKey { ref key, ref reason }
+                if key == "hyper - h" && reason.contains("unknown modifier")
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_bind_key_at_load() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - banana"
+            command = "query --windows"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidBindKey { ref key, ref reason }
+                if key == "alt - banana" && reason.contains("unknown key")
+        ));
     }
 
     #[test]
@@ -352,6 +401,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "alt - h"));
+    }
+
+    #[test]
+    fn rejects_modifier_alias_duplicate_bind_keys() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "query windows"
+            [[bind]]
+            key = "option - h"
+            command = "query spaces"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "option - h"));
+    }
+
+    #[test]
+    fn rejects_case_duplicate_bind_keys() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "query windows"
+            [[bind]]
+            key = "ALT - H"
+            command = "query spaces"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "ALT - H"));
+    }
+
+    #[test]
+    fn rejects_modifier_order_duplicate_bind_keys() {
+        let err = Config::parse(
+            r#"
+            [[bind]]
+            key = "alt + shift - h"
+            command = "query windows"
+            [[bind]]
+            key = "shift + option - h"
+            command = "query spaces"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "shift + option - h"));
+    }
+
+    #[test]
+    fn accepts_distinct_normalized_bind_keys() {
+        Config::parse(
+            r#"
+            [[bind]]
+            key = "alt - h"
+            command = "query windows"
+            [[bind]]
+            key = "shift - h"
+            command = "query spaces"
+            "#,
+        )
+        .expect("distinct binds are valid");
     }
 
     #[test]

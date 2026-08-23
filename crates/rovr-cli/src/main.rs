@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -15,6 +15,8 @@ use rovr_protocol::{
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+const RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "rovr", version, about = "Rovr macOS window manager client")]
@@ -140,13 +142,21 @@ enum WindowSubcommand {
     ToggleFloat {
         window: Option<u32>,
     },
-    #[command(about = "Swap with nearest neighbor in a direction")]
+    #[command(
+        name = "swap-dir",
+        visible_alias = "swap-direction",
+        about = "Swap with nearest neighbor in a direction"
+    )]
     SwapDirection {
         direction: DirectionArg,
         #[arg(long)]
         window: Option<u32>,
     },
-    #[command(about = "Insert at neighbor's tree position in a direction")]
+    #[command(
+        name = "warp-dir",
+        visible_alias = "warp-direction",
+        about = "Insert at neighbor's tree position in a direction"
+    )]
     WarpDirection {
         direction: DirectionArg,
         #[arg(long)]
@@ -172,6 +182,8 @@ enum SpaceSubcommand {
     Focus {
         space: u64,
     },
+    #[command(name = "focus-recent", about = "Focus the previously active Space")]
+    FocusRecent,
     Create {
         anchor: Option<u64>,
     },
@@ -347,6 +359,8 @@ fn generate_completions(shell: Shell) {
 fn run_subscribe(socket: &Path) -> Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to rovr daemon at {}", socket.display()))?;
+    stream.set_read_timeout(Some(RESPONSE_DEADLINE))?;
+    stream.set_write_timeout(Some(RESPONSE_DEADLINE))?;
     let request = Request::new(
         NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
         Command::Subscribe,
@@ -355,18 +369,26 @@ fn run_subscribe(socket: &Path) -> Result<()> {
     stream.write_all(b"\n")?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
+    read_subscription_ack(&mut reader)?;
+    reader.get_mut().set_read_timeout(None)?;
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    consume_subscribe_stream(&mut reader, &mut handle)
+    consume_notifications(&mut reader, &mut handle)
 }
 
 /// Reads a subscription stream: consumes the first line as the ACK `Response`
 /// (returning an error if it is not `ok`), then prints each subsequent
 /// notification line. Unknown/future notification variants are silently skipped
 /// so the client stays forward-compatible.
+#[cfg(test)]
 fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -> Result<()> {
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    read_subscription_ack(reader)?;
+    consume_notifications(reader, out)
+}
+
+fn read_subscription_ack(reader: &mut impl BufRead) -> Result<()> {
+    let line = read_bounded_line(reader, MAX_RESPONSE_BYTES as usize)?;
+    if line.is_empty() {
         return Err(anyhow::anyhow!("subscription stream closed before ACK"));
     }
     let ack: Response = serde_json::from_str(line.trim()).context("decode subscription ACK")?;
@@ -377,11 +399,13 @@ fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -
         };
         return Err(anyhow::anyhow!("subscription rejected: {msg}"));
     }
-    let mut buf = String::new();
+    Ok(())
+}
+
+fn consume_notifications(reader: &mut impl BufRead, out: &mut impl Write) -> Result<()> {
     loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
-        if n == 0 {
+        let buf = read_bounded_line(reader, MAX_RESPONSE_BYTES as usize)?;
+        if buf.is_empty() {
             break;
         }
         match serde_json::from_str::<Notification>(buf.trim()) {
@@ -394,6 +418,29 @@ fn consume_subscribe_stream<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -
         }
     }
     Ok(())
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> Result<String> {
+    let mut output = Vec::new();
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let take = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(chunk.len(), |index| index + 1);
+        if output.len().saturating_add(take) > max {
+            anyhow::bail!("daemon response exceeds {max} bytes");
+        }
+        output.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if output.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    String::from_utf8(output).context("daemon response is not UTF-8")
 }
 
 fn map_command(command: TopCommand) -> Command {
@@ -505,6 +552,7 @@ fn map_command(command: TopCommand) -> Command {
             SpaceSubcommand::Focus { space } => SpaceCommand::Focus {
                 space: SpaceId(space),
             },
+            SpaceSubcommand::FocusRecent => SpaceCommand::FocusRecent,
             SpaceSubcommand::Create { anchor } => SpaceCommand::Create {
                 anchor: anchor.map(SpaceId),
             },
@@ -605,7 +653,15 @@ fn run_sa_status() -> Result<()> {
                 println!("  create_space: {}", add);
                 println!("  destroy_space: {}", rem);
                 println!("  reorder_space: {}", mov_);
-                println!("  layer/sticky/shadow/opacity/scale: true");
+                println!(
+                    "  focus/layer/sticky/shadow/opacity/scale: {}/{}/{}/{}/{}/{}",
+                    info.attribs & 0x20 != 0,
+                    info.attribs & 0x80 != 0,
+                    info.attribs & 0x100 != 0,
+                    info.attribs & 0x200 != 0,
+                    info.attribs & 0x40 != 0,
+                    info.attribs & 0x400 != 0
+                );
             }
             SaState::IncompatibleProtocol(version) => {
                 println!("state: incompatible_protocol");
@@ -707,6 +763,18 @@ fn sa_state(client: &rovr_platform::macos::sa::SaClient) -> SaState {
             }
             if info.attribs & OSAX_ATTRIB_MOV_SPACE == 0 {
                 missing.push("reorder_space".to_string());
+            }
+            for (bit, name) in [
+                (0x20, "focus_space"),
+                (0x40, "set_window_opacity"),
+                (0x80, "set_window_layer"),
+                (0x100, "set_window_sticky"),
+                (0x200, "set_window_shadow"),
+                (0x400, "set_window_scale"),
+            ] {
+                if info.attribs & bit == 0 {
+                    missing.push(name.to_string());
+                }
             }
             if missing.is_empty() {
                 SaState::InjectedCompatible(info)
@@ -830,26 +898,33 @@ fn run_sa_install() -> Result<()> {
         }
         check_sip_for_install()?;
 
+        // Pin every user-provided/discovered source before changing any
+        // privileged destination. Copies and hashes below use only these file
+        // descriptors, so a path swap cannot replace an artifact mid-install.
+        let mut pinned = [
+            open_pinned_artifact(&dylib)?,
+            open_pinned_artifact(&loader)?,
+            open_pinned_artifact(&helper)?,
+        ];
+
         // ---- 1. Install root-owned immutable copies -------------------------
         std::fs::create_dir_all(SA_INSTALL_DIR)
             .with_context(|| format!("create {SA_INSTALL_DIR}"))?;
         // Root-only write on the directory; group/other read-only.
         std::fs::set_permissions(SA_INSTALL_DIR, std::fs::Permissions::from_mode(0o755))?;
-        for (src, dst, mode) in [
-            (&dylib, SA_INSTALLED_DYLIB, 0o644),
-            (&loader, SA_INSTALLED_LOADER, 0o744),
-            (&helper, SA_INSTALLED_HELPER, 0o744),
-        ] {
-            // Remove first so a stale symlink at dst can never be followed.
-            let _ = std::fs::remove_file(dst);
-            std::fs::copy(src, dst).with_context(|| format!("copy payload to {dst}"))?;
-            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))?;
+        let destinations = [
+            (SA_INSTALLED_DYLIB, 0o644),
+            (SA_INSTALLED_LOADER, 0o744),
+            (SA_INSTALLED_HELPER, 0o744),
+        ];
+        let mut installed_sha = String::new();
+        for (index, (dst, mode)) in destinations.into_iter().enumerate() {
+            let sha = install_pinned_artifact(&mut pinned[index], dst, mode)?;
+            if index == 0 {
+                installed_sha = sha;
+            }
         }
         println!("installed: payload + loader + helper in {SA_INSTALL_DIR}");
-
-        // Record the installed payload identity BEFORE injection; the injected
-        // identity is appended after a verified handshake.
-        let installed_sha = sha256_file(SA_INSTALLED_DYLIB)?;
 
         // ---- 2. Register the privileged service (LaunchDaemon) --------------
         std::fs::write(SA_PLIST_PATH, launchd_plist_xml())
@@ -897,8 +972,9 @@ fn run_sa_install() -> Result<()> {
 
         // ---- 4. Verify the SA handshake ------------------------------------
         let uid = console_uid().context("determine console uid")?;
-        let client = rovr_platform::macos::sa::SaClient::with_socket_path(
+        let client = rovr_platform::macos::sa::SaClient::with_socket_path_for_uid(
             rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
+            uid,
         );
         let mut handshake_version = None;
         for _ in 0..20 {
@@ -921,8 +997,8 @@ fn run_sa_install() -> Result<()> {
         // ---- 5. Persist identity marker + report capabilities ---------------
         let marker = serde_json::json!({
             "installed_sha256": installed_sha,
-            "injected_sha256": installed_sha,
             "handshake_version": version,
+            "injected_identity_observable": false,
         });
         std::fs::write(
             SA_MARKER_PATH,
@@ -935,7 +1011,12 @@ fn run_sa_install() -> Result<()> {
         println!("  create_space:  {}", attribs & 0x04 != 0);
         println!("  destroy_space: {}", attribs & 0x08 != 0);
         println!("  reorder_space: {}", attribs & 0x10 != 0);
-        println!("  layer/sticky/shadow/opacity/scale: true");
+        println!("  focus_space:   {}", attribs & 0x20 != 0);
+        println!("  opacity:       {}", attribs & 0x40 != 0);
+        println!("  layer:         {}", attribs & 0x80 != 0);
+        println!("  sticky:        {}", attribs & 0x100 != 0);
+        println!("  shadow:        {}", attribs & 0x200 != 0);
+        println!("  scale:         {}", attribs & 0x400 != 0);
         println!("sa install complete.");
         Ok(())
     }
@@ -964,7 +1045,7 @@ fn launchd_plist_xml() -> String {
             <key>SockPathName</key>
             <string>{}</string>
             <key>SockPathMode</key>
-            <integer>438</integer>
+            <integer>146</integer>
             <key>SockType</key>
             <string>stream</string>
         </dict>
@@ -976,6 +1057,63 @@ fn launchd_plist_xml() -> String {
 "#,
         rovr_platform::macos::reinject::HELPER_SOCKET_PATH
     )
+}
+
+#[cfg(target_os = "macos")]
+fn open_pinned_artifact(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const O_NOFOLLOW: i32 = 0x100;
+    let before = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect artifact {}", path.display()))?;
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        anyhow::bail!(
+            "artifact {} is not a regular non-symlink file",
+            path.display()
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open artifact {}", path.display()))?;
+    let after = file.metadata()?;
+    if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
+        anyhow::bail!("artifact {} changed while being opened", path.display());
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn install_pinned_artifact(file: &mut std::fs::File, dst: &str, mode: u32) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    file.seek(SeekFrom::Start(0))?;
+    let tmp = format!("{dst}.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("create pinned destination {tmp}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    output.sync_all()?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    // The root-owned install directory is not writable by the source owner;
+    // replacement cannot be redirected after this rename.
+    std::fs::rename(&tmp, dst).with_context(|| format!("install {dst}"))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1152,22 +1290,16 @@ fn print_sa_lifecycle_status(client: &rovr_platform::macos::sa::SaClient) {
                     ", MARKER MISMATCH — reinstall via `sudo rovr sa install`"
                 }
             );
-            // Installed-vs-injected identity: replacing the dylib on disk does
-            // NOT update code already mapped into Dock.
-            let injected = m["injected_sha256"].as_str().unwrap_or("");
             let handshake = client.probe().map(|i| i.version);
-            if !injected.is_empty() && injected != sha {
-                println!("injection: STALE — installed payload differs from the payload last injected into Dock");
-                println!("hint: run `sudo rovr sa install` to reinject; until then Dock keeps running the OLD payload build");
-            } else {
-                println!(
-                    "injection: {}",
-                    handshake
-                        .as_deref()
-                        .map(|v| format!("current (handshake {v})"))
-                        .unwrap_or_else(|| "not_injected".to_string())
-                );
-            }
+            println!(
+                "injection: {}",
+                handshake
+                    .as_deref()
+                    .map(|v| format!(
+                        "handshake observed ({v}); mapped payload SHA is not observable"
+                    ))
+                    .unwrap_or_else(|| "not_injected".to_string())
+            );
             println!(
                 "handshake_version_at_install: {}",
                 m["handshake_version"].as_str().unwrap_or("?")
@@ -1213,18 +1345,24 @@ fn run_gen_skhd(path: Option<&str>) -> Result<()> {
 fn send(path: &Path, request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(path)
         .with_context(|| format!("connect to rovr daemon at {}", path.display()))?;
+    stream.set_read_timeout(Some(RESPONSE_DEADLINE))?;
+    stream.set_write_timeout(Some(RESPONSE_DEADLINE))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    BufReader::new(stream)
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_line(&mut line)?;
+    if line.len() as u64 > MAX_RESPONSE_BYTES {
+        anyhow::bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+    }
     serde_json::from_str(&line).context("decode daemon response")
 }
 
 fn default_socket_path() -> PathBuf {
-    // Must match the daemon (real getuid, not $UID — see rovr_platform).
-    PathBuf::from(format!("/tmp/rovr-{}.sock", rovr_platform::unix_uid()))
+    rovr_platform::daemon_socket_path()
 }
 
 #[cfg(test)]
@@ -1242,13 +1380,27 @@ mod tests {
         let mut buf = Vec::new();
         generate(Shell::Zsh, &mut cmd, name, &mut buf);
         let script = String::from_utf8(buf).expect("completion script is utf-8");
-        for expected in ["query", "layout", "scratchpad", "completions"] {
+        for expected in [
+            "query",
+            "layout",
+            "scratchpad",
+            "focus-recent",
+            "completions",
+        ] {
             assert!(
                 script.contains(expected),
                 "completion script missing subcommand `{expected}`"
             );
         }
     }
+    #[test]
+    fn space_focus_recent_maps_to_protocol_command() {
+        let command = map_command(TopCommand::Space(SpaceArgs {
+            command: SpaceSubcommand::FocusRecent,
+        }));
+        assert_eq!(command, Command::Space(SpaceCommand::FocusRecent));
+    }
+
     /// M4b: `rovr subscribe` consumes the subscription ACK (and errors if it is
     /// not ok) before printing only notification lines.
     #[test]

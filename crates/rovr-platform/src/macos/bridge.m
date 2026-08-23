@@ -36,6 +36,7 @@ typedef CGError (*rovr_sls_set_window_list_workspace_fn)(int cid, uint32_t *wind
 typedef CFArrayRef (*rovr_sls_copy_spaces_for_windows_fn)(int cid, int selector, CFArrayRef window_list);
 typedef int64_t (*rovr_sls_perform_async_bridged_op_fn)(void *operation);
 typedef CGError (*rovr_sls_set_active_menu_bar_display_identifier_fn)(int cid, CFStringRef uuid, CFStringRef uuid2);
+typedef CFStringRef (*rovr_sls_copy_active_menu_bar_display_identifier_fn)(int cid);
 
 static rovr_sls_main_connection_fn g_sls_main_connection = NULL;
 static rovr_sls_copy_managed_display_spaces_fn g_sls_copy_managed_display_spaces = NULL;
@@ -50,6 +51,7 @@ static rovr_sls_perform_async_bridged_op_fn g_sls_perform_async_bridged_op = NUL
 // Activates a display (yabai: display_manager_set_active_display_id). Needed
 // so cross-display Space switches actually bring the other display forward.
 static rovr_sls_set_active_menu_bar_display_identifier_fn g_sls_set_active_menu_bar_display_identifier = NULL;
+static rovr_sls_copy_active_menu_bar_display_identifier_fn g_sls_copy_active_menu_bar_display_identifier = NULL;
 
 static _Atomic int g_needs_refresh = 0;
 
@@ -68,6 +70,18 @@ static void rovr_copy_cf_string(CFStringRef value, char *buffer, size_t capacity
     buffer[0] = '\0';
     if (!value) return;
     CFStringGetCString(value, buffer, capacity, kCFStringEncodingUTF8);
+}
+
+static uint32_t rovr_active_display_id(void) {
+    if (!g_sls_main_connection || !g_sls_copy_active_menu_bar_display_identifier) return 0;
+    CFStringRef uuid = g_sls_copy_active_menu_bar_display_identifier(g_sls_main_connection());
+    if (!uuid) return 0;
+    CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
+    CFRelease(uuid);
+    if (!parsed) return 0;
+    uint32_t display_id = CGDisplayGetDisplayIDFromUUID(parsed);
+    CFRelease(parsed);
+    return display_id;
 }
 
 static uint32_t rovr_display_for_rect(CGRect rect) {
@@ -240,12 +254,19 @@ static void rovr_prune_observers(void) {
 // already asked so each snapshot does not re-send it (bounded table).
 static pid_t g_manual_ax_pids[64] = {0};
 static int g_manual_ax_count = 0;
+static pthread_mutex_t g_manual_ax_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bool rovr_manual_ax_already_requested(pid_t pid) {
+    bool found = false;
+    pthread_mutex_lock(&g_manual_ax_lock);
     for (int i = 0; i < g_manual_ax_count; ++i) {
-        if (g_manual_ax_pids[i] == pid) return true;
+        if (g_manual_ax_pids[i] == pid) {
+            found = true;
+            break;
+        }
     }
-    return false;
+    pthread_mutex_unlock(&g_manual_ax_lock);
+    return found;
 }
 
 static void rovr_ax_enable_manual_accessibility(AXUIElementRef app) {
@@ -254,8 +275,19 @@ static void rovr_ax_enable_manual_accessibility(AXUIElementRef app) {
     // the operation (see rovr_bridge_set_window_frame).
     AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
     pid_t pid = 0;
-    if (g_manual_ax_count < 64 && AXUIElementGetPid(app, &pid) == kAXErrorSuccess) {
-        g_manual_ax_pids[g_manual_ax_count++] = pid;
+    if (AXUIElementGetPid(app, &pid) == kAXErrorSuccess) {
+        pthread_mutex_lock(&g_manual_ax_lock);
+        bool found = false;
+        for (int i = 0; i < g_manual_ax_count; ++i) {
+            if (g_manual_ax_pids[i] == pid) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && g_manual_ax_count < 64) {
+            g_manual_ax_pids[g_manual_ax_count++] = pid;
+        }
+        pthread_mutex_unlock(&g_manual_ax_lock);
     }
 }
 
@@ -316,6 +348,154 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
     }
     CFRelease(windows);
     return result;
+}
+
+static uint32_t rovr_display_for_space(uint64_t sid) {
+    if (!g_sls_copy_managed_display_for_space || !g_sls_main_connection || sid == 0) return 0;
+    int cid = g_sls_main_connection();
+    CFStringRef uuid = g_sls_copy_managed_display_for_space(cid, sid);
+    if (!uuid) return 0;
+    CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
+    CFRelease(uuid);
+    if (!parsed) return 0;
+    uint32_t did = CGDisplayGetDisplayIDFromUUID(parsed);
+    CFRelease(parsed);
+    return did;
+}
+
+// Space -> display map built once per snapshot. Resolving each window's
+// display through SLSCopyManagedDisplayForSpace individually costs one
+// private-API round trip PER WINDOW and measurably slowed every snapshot;
+// one SLSCopyManagedDisplaySpaces pass gives every mapping at once.
+#define ROVR_SPACE_DISPLAY_MAX 128
+struct space_display_entry {
+    uint64_t sid;
+    uint32_t did;
+};
+
+static int rovr_build_space_display_map(struct space_display_entry *out, int capacity) {
+    if (!out || capacity <= 0 || !g_sls_copy_managed_display_spaces || !g_sls_main_connection) {
+        return 0;
+    }
+    int cid = g_sls_main_connection();
+    CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
+    if (!display_spaces) return 0;
+    int count = 0;
+    CFIndex display_count = CFArrayGetCount(display_spaces);
+    for (CFIndex d = 0; d < display_count && count < capacity; d++) {
+        CFDictionaryRef display_ref =
+            (CFDictionaryRef)CFArrayGetValueAtIndex(display_spaces, d);
+        CFStringRef uuid =
+            (CFStringRef)CFDictionaryGetValue(display_ref, CFSTR("Display Identifier"));
+        CFArrayRef spaces_ref =
+            (CFArrayRef)CFDictionaryGetValue(display_ref, CFSTR("Spaces"));
+        if (!uuid || !spaces_ref) continue;
+        uint32_t did = 0;
+        CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
+        if (parsed) {
+            did = CGDisplayGetDisplayIDFromUUID(parsed);
+            CFRelease(parsed);
+        }
+        if (did == 0) continue;
+        CFIndex space_count = CFArrayGetCount(spaces_ref);
+        for (CFIndex s = 0; s < space_count && count < capacity; s++) {
+            CFDictionaryRef space_ref =
+                (CFDictionaryRef)CFArrayGetValueAtIndex(spaces_ref, s);
+            CFNumberRef sid_ref = (CFNumberRef)CFDictionaryGetValue(space_ref, CFSTR("id64"));
+            if (!sid_ref) continue;
+            uint64_t sid = 0;
+            CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &sid);
+            out[count].sid = sid;
+            out[count].did = did;
+            count++;
+        }
+    }
+    CFRelease(display_spaces);
+    return count;
+}
+
+static uint32_t rovr_lookup_display_for_space(
+    const struct space_display_entry *map, int map_len, uint64_t sid) {
+    if (sid == 0) return 0;
+    for (int i = 0; i < map_len; i++) {
+        if (map[i].sid == sid) return map[i].did;
+    }
+    return 0;
+}
+
+// wid -> sid map built once per snapshot. The previous approach called
+// SLSCopySpacesForWindows once PER WINDOW (one private-API round trip each);
+// with ~100 windows that alone made every snapshot take 200-500 ms, which is
+// the visible delay between a window spawning and Rovr tiling it. yabai's
+// approach: SLSCopyWindowsWithOptionsAndTags per SPACE (a handful of calls)
+// gives every on-screen window's space in one shot. Windows not found
+// (minimized / transient) fall back to the old per-window call.
+typedef CFArrayRef (*rovr_sls_copy_windows_with_options_and_tags_fn)(
+    int cid, uint32_t owner, CFArrayRef spaces, uint32_t options,
+    uint64_t *set_tags, uint64_t *clear_tags);
+static rovr_sls_copy_windows_with_options_and_tags_fn g_sls_copy_windows_with_options_and_tags = NULL;
+
+#define ROVR_WINDOW_SPACE_MAX 1024
+struct window_space_entry {
+    uint32_t wid;
+    uint64_t sid;
+};
+
+static int rovr_build_window_space_map(struct window_space_entry *out, int capacity) {
+    if (!out || capacity <= 0 || !g_sls_main_connection ||
+        !g_sls_copy_windows_with_options_and_tags) {
+        return 0;
+    }
+    int cid = g_sls_main_connection();
+
+    struct space_display_entry spaces[ROVR_SPACE_DISPLAY_MAX];
+    // Reuse the space list builder: we only need the sids here.
+    int space_count = rovr_build_space_display_map(spaces, ROVR_SPACE_DISPLAY_MAX);
+    if (space_count <= 0) return 0;
+
+    int count = 0;
+    for (int s = 0; s < space_count && count < capacity; s++) {
+        CFNumberRef sid_ref =
+            CFNumberCreate(NULL, kCFNumberSInt64Type, &spaces[s].sid);
+        if (!sid_ref) continue;
+        const void *sid_values[1] = { sid_ref };
+        CFArrayRef space_list =
+            CFArrayCreate(NULL, sid_values, 1, &kCFTypeArrayCallBacks);
+        CFRelease(sid_ref);
+        if (!space_list) continue;
+
+        // 0x2 = on-screen windows only (yabai's non-minimized option).
+        // set/clear tags must be real addresses — passing NULL segfaults
+        // inside SkyLight (yabai always passes locals).
+        uint64_t set_tags = 0;
+        uint64_t clear_tags = 0;
+        CFArrayRef space_windows = g_sls_copy_windows_with_options_and_tags(
+            cid, 0, space_list, 0x2, &set_tags, &clear_tags);
+        CFRelease(space_list);
+        if (!space_windows) continue;
+
+        CFIndex w_count = CFArrayGetCount(space_windows);
+        for (CFIndex i = 0; i < w_count && count < capacity; i++) {
+            CFNumberRef wid_ref = (CFNumberRef)CFArrayGetValueAtIndex(space_windows, i);
+            uint32_t wid = 0;
+            if (wid_ref && CFNumberGetValue(wid_ref, kCFNumberIntType, &wid) && wid != 0) {
+                out[count].wid = wid;
+                out[count].sid = spaces[s].sid;
+                count++;
+            }
+        }
+        CFRelease(space_windows);
+    }
+    return count;
+}
+
+static uint64_t rovr_lookup_space_for_window(
+    const struct window_space_entry *map, int map_len, uint32_t wid) {
+    if (wid == 0) return 0;
+    for (int i = 0; i < map_len; i++) {
+        if (map[i].wid == wid) return map[i].sid;
+    }
+    return 0;
 }
 
 static uint64_t rovr_space_id_for_window(uint32_t wid) {
@@ -509,9 +689,15 @@ int rovr_bridge_init(void) {
         (rovr_sls_set_window_list_workspace_fn)dlsym(RTLD_DEFAULT, "SLSSetWindowListWorkspace");
     g_sls_copy_spaces_for_windows =
         (rovr_sls_copy_spaces_for_windows_fn)dlsym(RTLD_DEFAULT, "SLSCopySpacesForWindows");
+    g_sls_copy_windows_with_options_and_tags =
+        (rovr_sls_copy_windows_with_options_and_tags_fn)dlsym(
+            RTLD_DEFAULT, "SLSCopyWindowsWithOptionsAndTags");
     g_sls_set_active_menu_bar_display_identifier =
         (rovr_sls_set_active_menu_bar_display_identifier_fn)dlsym(
             RTLD_DEFAULT, "SLSSetActiveMenuBarDisplayIdentifier");
+    g_sls_copy_active_menu_bar_display_identifier =
+        (rovr_sls_copy_active_menu_bar_display_identifier_fn)dlsym(
+            RTLD_DEFAULT, "SLSCopyActiveMenuBarDisplayIdentifier");
     g_sls_perform_async_bridged_op = (rovr_sls_perform_async_bridged_op_fn)rovr_macho_find_symbol(
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
@@ -660,6 +846,12 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
         if (dbg) fprintf(stderr, "[rovr-enum] candidates=%d pids=%d ax_mapped=%d\n", cand_count, pid_count, ax_count);
 
         // ---- Pass 3: emit windows, refining from the cached AX elements ----
+        struct space_display_entry space_displays[ROVR_SPACE_DISPLAY_MAX];
+        const int space_display_count =
+            rovr_build_space_display_map(space_displays, ROVR_SPACE_DISPLAY_MAX);
+        struct window_space_entry window_spaces[ROVR_WINDOW_SPACE_MAX];
+        const int window_space_count =
+            rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
         for (int i = 0; i < cand_count; i++) {
             uint32_t window_id = cand[i].window_id;
             pid_t owner_pid = cand[i].pid;
@@ -668,8 +860,25 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             rovr_bridge_window window = {0};
             window.id = window_id;
             window.pid = owner_pid;
-            window.display_id = rovr_display_for_rect(bounds);
-            window.space_id = rovr_space_id_for_window(window.id);
+
+            // Best-effort AX refinement from the per-app cache. Transient
+            // windows missing from AX simply stay unknown.
+            AXUIElementRef ax_window = NULL;
+            for (int a = 0; a < ax_count; ++a) {
+                if (ax_ids[a] == window_id) { ax_window = ax_elems[a]; break; }
+            }
+
+            window.space_id = rovr_lookup_space_for_window(window_spaces, window_space_count, window_id);
+            if (window.space_id == 0 && ax_window) {
+                // Real app window missing from the on-screen map: likely
+                // MINIMIZED. Fall back to the direct (expensive) query —
+                // bounded by the number of real app windows, not all
+                // candidates, so overlays never trigger it.
+                window.space_id = rovr_space_id_for_window(window.id);
+            }
+            uint32_t space_display =
+                rovr_lookup_display_for_space(space_displays, space_display_count, window.space_id);
+            window.display_id = space_display != 0 ? space_display : rovr_display_for_rect(bounds);
             window.focused = focused_window_id == window.id ? 1 : 0;
             window.x = bounds.origin.x;
             window.y = bounds.origin.y;
@@ -681,12 +890,6 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             window.fullscreen = 2;
             window.managed = 2;
 
-            // Best-effort AX refinement from the per-app cache. Transient
-            // windows missing from AX simply stay unknown.
-            AXUIElementRef ax_window = NULL;
-            for (int a = 0; a < ax_count; ++a) {
-                if (ax_ids[a] == window_id) { ax_window = ax_elems[a]; break; }
-            }
             if (ax_window) {
                 int minimized = rovr_ax_bool_for_window(ax_window, kAXMinimizedAttribute);
                 int fullscreen = rovr_ax_bool_for_window(ax_window, CFSTR("AXFullScreen"));
@@ -726,12 +929,15 @@ int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context
     uint32_t count = 0;
     if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess) return 2;
 
-    const CGDirectDisplayID main_display = CGMainDisplayID();
+    CGDirectDisplayID active_display = rovr_active_display_id();
+    if (active_display == 0) active_display = CGMainDisplayID();
+    CGDirectDisplayID main_display = CGMainDisplayID();
     for (uint32_t i = 0; i < count; i++) {
         CGRect frame = CGDisplayBounds(displays[i]);
         rovr_bridge_display display = {
             .id = displays[i],
-            .focused = displays[i] == main_display ? 1 : 0,
+            .focused = displays[i] == active_display ? 1 : 0,
+            .is_main = displays[i] == main_display ? 1 : 0,
             .x = frame.origin.x,
             .y = frame.origin.y,
             .width = frame.size.width,
@@ -853,9 +1059,6 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
     CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
     if (!display_spaces) return 2;
 
-    CGDirectDisplayID active_displays[32] = {0};
-    uint32_t active_display_count = 0;
-    CGGetActiveDisplayList(32, active_displays, &active_display_count);
     uint32_t position = 0;
 
     CFIndex display_count = CFArrayGetCount(display_spaces);
@@ -872,16 +1075,9 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
             CFRelease(parsed);
         }
         if (display_id == 0) continue;
-        bool display_focused = false;
-        for (uint32_t i = 0; i < active_display_count; i++) {
-            if (active_displays[i] == display_id) {
-                display_focused = true;
-                break;
-            }
-        }
 
         uint64_t active_sid = 0;
-        if (display_focused && g_sls_managed_display_get_current_space) {
+        if (g_sls_managed_display_get_current_space) {
             active_sid = g_sls_managed_display_get_current_space(cid, uuid);
         }
 
@@ -1021,6 +1217,14 @@ int rovr_bridge_focus_space(uint64_t space_id) {
             warp_cursor = YES;
             CGWarpMouseCursorPosition(
                 CGPointMake(CGRectGetMidX(target_bounds), CGRectGetMidY(target_bounds)));
+            // Activate the target display BEFORE posting swipes so its
+            // animation starts while it is already key — activating after
+            // the animation made every cross-display switch feel a beat
+            // slower and let keyboard focus lag behind on the external
+            // display (yabai: display_manager_set_active_display_id).
+            if (g_sls_set_active_menu_bar_display_identifier) {
+                g_sls_set_active_menu_bar_display_identifier(cid, target_uuid, target_uuid);
+            }
         }
     }
 
@@ -1045,52 +1249,84 @@ int rovr_bridge_focus_space(uint64_t space_id) {
     }
     CFRelease(event);
 
-    if (warp_cursor && g_sls_set_active_menu_bar_display_identifier) {
-        // Activate the target display so the cross-display switch completes
-        // (yabai: display_manager_set_active_display_id). Best-effort.
-        g_sls_set_active_menu_bar_display_identifier(cid, target_uuid, target_uuid);
-    }
     CFRelease(target_uuid);
     return 0;
 }
 
-uint64_t rovr_bridge_current_space_id(void) {
-    if (!g_sls_copy_managed_display_spaces || !g_sls_managed_display_get_current_space ||
-        !g_sls_main_connection) {
-        return 0;
+int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta) {
+    if (!g_sls_copy_managed_display_for_space || !g_sls_main_connection ||
+        target_space_id == 0 || delta == 0) {
+        return 1;
     }
 
     int cid = g_sls_main_connection();
-    CFArrayRef display_spaces = g_sls_copy_managed_display_spaces(cid);
-    if (!display_spaces) return 0;
+    CFStringRef target_uuid =
+        g_sls_copy_managed_display_for_space(cid, target_space_id);
+    if (!target_uuid) return 2;
 
-    CGDirectDisplayID active_displays[32] = {0};
-    uint32_t active_display_count = 0;
-    CGGetActiveDisplayList(32, active_displays, &active_display_count);
+    CFUUIDRef target_uuid_parsed = CFUUIDCreateFromString(NULL, target_uuid);
+    uint32_t target_did =
+        target_uuid_parsed ? CGDisplayGetDisplayIDFromUUID(target_uuid_parsed) : 0;
+    if (target_uuid_parsed) CFRelease(target_uuid_parsed);
 
-    uint64_t result = 0;
-    CFIndex display_count = CFArrayGetCount(display_spaces);
-    for (CFIndex d = 0; d < display_count && result == 0; d++) {
-        CFDictionaryRef display_ref = (CFDictionaryRef)CFArrayGetValueAtIndex(display_spaces, d);
-        CFStringRef uuid = (CFStringRef)CFDictionaryGetValue(display_ref, CFSTR("Display Identifier"));
-        if (!uuid) continue;
-
-        uint32_t display_id = 0;
-        CFUUIDRef parsed = CFUUIDCreateFromString(NULL, uuid);
-        if (parsed) {
-            display_id = CGDisplayGetDisplayIDFromUUID(parsed);
-            CFRelease(parsed);
+    if (target_did != 0) {
+        CGPoint cursor = CGPointZero;
+        CGEventRef cursor_event = CGEventCreate(NULL);
+        if (cursor_event) {
+            cursor = CGEventGetLocation(cursor_event);
+            CFRelease(cursor_event);
         }
-        if (display_id == 0) continue;
-
-        for (uint32_t i = 0; i < active_display_count; i++) {
-            if (active_displays[i] == display_id) {
-                result = g_sls_managed_display_get_current_space(cid, uuid);
-                break;
+        CGRect target_bounds = CGDisplayBounds(target_did);
+        BOOL cursor_on_target =
+            cursor.x >= CGRectGetMinX(target_bounds) && cursor.x < CGRectGetMaxX(target_bounds) &&
+            cursor.y >= CGRectGetMinY(target_bounds) && cursor.y < CGRectGetMaxY(target_bounds);
+        if (!cursor_on_target) {
+            CGWarpMouseCursorPosition(
+                CGPointMake(CGRectGetMidX(target_bounds), CGRectGetMidY(target_bounds)));
+            if (g_sls_set_active_menu_bar_display_identifier) {
+                g_sls_set_active_menu_bar_display_identifier(cid, target_uuid, target_uuid);
             }
         }
     }
 
-    CFRelease(display_spaces);
+    float sign = delta > 0 ? 1.0f : -1.0f;
+    CGEventRef event = CGEventCreate(NULL);
+    if (!event) {
+        CFRelease(target_uuid);
+        return 3;
+    }
+    CGEventSetIntegerValueField(event, 55, 30);     // kCGSEventDockControl
+    CGEventSetIntegerValueField(event, 110, 23);    // kIOHIDEventTypeDockSwipe
+    CGEventSetIntegerValueField(event, 123, 1);     // kCGGestureMotionHorizontal
+    CGEventSetDoubleValueField(event, 124, sign);   // swipe progress
+    CGEventSetDoubleValueField(event, 129, sign * 9999.0);
+    int64_t steps = delta < 0 ? -(int64_t)delta : (int64_t)delta;
+    for (int64_t i = 0; i < steps; i++) {
+        CGEventSetIntegerValueField(event, 132, 1); // phase began
+        CGEventPost(kCGSessionEventTap, event);
+        CGEventSetIntegerValueField(event, 132, 4); // phase ended
+        CGEventPost(kCGSessionEventTap, event);
+    }
+    CFRelease(event);
+    CFRelease(target_uuid);
+    return 0;
+}
+
+uint64_t rovr_bridge_current_space_for_space(uint64_t space_id) {
+    if (!g_sls_copy_managed_display_for_space || !g_sls_managed_display_get_current_space ||
+        !g_sls_main_connection || space_id == 0) {
+        return 0;
+    }
+    int cid = g_sls_main_connection();
+    CFStringRef uuid = g_sls_copy_managed_display_for_space(cid, space_id);
+    if (!uuid) return 0;
+    uint64_t result = g_sls_managed_display_get_current_space(cid, uuid);
+    CFRelease(uuid);
     return result;
+}
+
+// The display a Space lives on. Used by the focus path to detect
+// cross-display switches (their settle gates are independent).
+uint32_t rovr_bridge_display_for_space(uint64_t space_id) {
+    return rovr_display_for_space(space_id);
 }

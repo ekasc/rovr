@@ -64,6 +64,16 @@ extern "C" {
     fn getuid() -> u32;
 }
 
+/// Per-user runtime directory shared by daemon, CLI and Dock payload. The
+/// daemon/payload create it as 0700 and refuse unsafe pre-existing entries.
+pub fn runtime_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/rovr-{}", unix_uid()))
+}
+
+pub fn daemon_socket_path() -> std::path::PathBuf {
+    runtime_dir().join("daemon.sock")
+}
+
 pub trait Platform: Send {
     fn capabilities(&self) -> Capabilities;
     fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError>;
@@ -82,10 +92,10 @@ pub trait Platform: Send {
     fn sa_reinject_diagnostics(&self) -> Option<SaReinjectDiag> {
         None
     }
-    /// Register a callback invoked (on the platform's event thread) whenever
-    /// a window event is observed. Used to wake the daemon's state loop
-    /// immediately; observation remains snapshot-authoritative.
-    fn set_event_watcher(&mut self, watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
-        let _ = watcher;
+    /// Register a callback invoked (on the platform's event thread) with the
+    /// kind of each observed window event. The daemon may use the kind to wake
+    /// its state loop immediately; observation remains snapshot-authoritative.
+    fn set_event_watcher(&mut self, event_kind_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
+        let _ = event_kind_watcher;
     }
 }

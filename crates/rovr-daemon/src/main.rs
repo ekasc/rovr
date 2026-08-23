@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::fs::{FileTypeExt, PermissionsExt},
@@ -25,7 +26,7 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
-use rovr_types::SpaceId;
+use rovr_types::{DisplayId, SpaceId};
 
 mod hotkey;
 use serde_json::json;
@@ -34,6 +35,25 @@ use tracing_subscriber::EnvFilter;
 /// Bounded per-subscriber backlog. A subscriber that falls this far behind is
 /// evicted (its channel is full), so the state loop never blocks on it.
 const SUBSCRIBER_BACKLOG: usize = 64;
+const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const WINDOW_CREATED_EVENT_KIND: u32 = 1;
+
+fn event_requests_immediate_refresh(event_kind: u32) -> bool {
+    event_kind == WINDOW_CREATED_EVENT_KIND
+}
+
+#[derive(Default)]
+struct RefreshWake(std::sync::atomic::AtomicBool);
+
+impl RefreshWake {
+    fn request(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn acknowledge(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rovr-daemon", version)]
@@ -53,6 +73,13 @@ struct Envelope {
     /// measure state-loop queueing delay (head-of-line blocking behind
     /// periodic observation work).
     queued_at: std::time::Instant,
+    event_wake: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SpaceHistory {
+    current: Option<SpaceId>,
+    previous: Option<SpaceId>,
 }
 
 struct Daemon {
@@ -61,11 +88,9 @@ struct Daemon {
     config: Config,
     config_path: PathBuf,
     state_path: PathBuf,
-    /// The space that was current before the current one; updated whenever
-    /// observation sees a change. Backs `space focus-recent`.
-    previous_space: std::cell::Cell<Option<SpaceId>>,
-    /// The currently focused Space as of the last observation.
-    current_space_cell: std::cell::Cell<Option<SpaceId>>,
+    /// Per-display current/previous Spaces for `space focus-recent`.
+    space_history: std::cell::RefCell<HashMap<DisplayId, SpaceHistory>>,
+    refresh_wake: Arc<RefreshWake>,
 }
 
 fn main() -> Result<()> {
@@ -81,18 +106,31 @@ fn main() -> Result<()> {
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
+    let refresh_wake = std::sync::Arc::new(RefreshWake::default());
+    let watcher_wake = refresh_wake.clone();
     let event_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync> =
-        std::sync::Arc::new(|_window_id| {
-            if let Some(event_tx) = EVENT_TX.get() {
-                let (response, response_rx) = mpsc::channel();
-                let request = Request::new(0, Command::Refresh);
-                let _ = event_tx.try_send(Envelope {
+        std::sync::Arc::new(move |event_kind| {
+            if !event_requests_immediate_refresh(event_kind) || !watcher_wake.request() {
+                return;
+            }
+            let Some(event_tx) = EVENT_TX.get() else {
+                watcher_wake.acknowledge();
+                return;
+            };
+            let (response, response_rx) = mpsc::channel();
+            let request = Request::new(0, Command::Refresh);
+            if event_tx
+                .try_send(Envelope {
                     request,
                     response,
                     queued_at: std::time::Instant::now(),
-                });
-                drop(response_rx);
+                    event_wake: true,
+                })
+                .is_err()
+            {
+                watcher_wake.acknowledge();
             }
+            drop(response_rx);
         });
     platform.set_event_watcher(event_watcher);
     let mut engine = Engine::new(config.clone());
@@ -116,8 +154,8 @@ fn main() -> Result<()> {
         config,
         config_path,
         state_path,
-        previous_space: std::cell::Cell::new(None),
-        current_space_cell: std::cell::Cell::new(None),
+        space_history: std::cell::RefCell::new(HashMap::new()),
+        refresh_wake,
     };
 
     run_daemon(socket_path, daemon)
@@ -307,6 +345,7 @@ fn handle_client(
         request,
         response: response_tx,
         queued_at: std::time::Instant::now(),
+        event_wake: false,
     })?;
 
     let response = response_rx.recv()?;
@@ -334,54 +373,19 @@ fn state_loop(
         warmup_ms = t_warm.elapsed().as_millis() as u64,
         "startup observation warm-up complete"
     );
-    // Fixed cadence. Deliberately NOT adaptive: faster polling during
-    // activity hammers WindowServer with SLS/AX work exactly while the
-    // user is switching Spaces, which visibly stutters animations
-    // (regression verified live). Observation is serialized here instead.
-    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100));
-    // Absolute observation deadline. recv_timeout restarts after every
-    // request, so a steady request stream (rapid hotkeys) would otherwise
-    // postpone observation indefinitely and commands would resolve "the
-    // focused window" against stale state (wrong-window regression).
+    // Full snapshots are an idle recovery watchdog. Window creation events
+    // enqueue an immediate Refresh for spawn tiling; focus events are resolved
+    // on demand by focus-defaulting window commands and recovered here when
+    // idle. Interactive Space/Workspace commands remain observation-free.
+    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100))
+        .max(MIN_RECOVERY_INTERVAL);
     let mut last_observed_at = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(interval) {
-            Ok(envelope) => {
-                // Observe BEFORE handling so the request sees state no older
-                // than one interval, even mid-burst.
-                if last_observed_at.elapsed() >= interval {
-                    let t_obs = std::time::Instant::now();
-                    if daemon.refresh_observation() {
-                        deliver_notification(&subscribers, &Notification::StateChanged);
-                    }
-                    let obs_ms = t_obs.elapsed().as_millis() as u64;
-                    if obs_ms > 100 {
-                        tracing::info!(obs_ms, "slow periodic observation");
-                    }
-                    last_observed_at = std::time::Instant::now();
-                }
-                let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
-                if queue_wait_ms > 50 {
-                    tracing::info!(
-                        queue_wait_ms,
-                        id = envelope.request.id,
-                        "request waited on busy state loop"
-                    );
-                }
-                let t_handle = std::time::Instant::now();
-                let result = daemon.handle(envelope.request);
-                tracing::debug!(
-                    handle_ms = t_handle.elapsed().as_millis() as u64,
-                    queue_wait_ms,
-                    "envelope handled"
-                );
-                let _ = envelope.response.send(result.response);
-                for notif in &result.notifications {
-                    deliver_notification(&subscribers, notif);
-                }
-            }
+        let envelope = match rx.recv_timeout(interval) {
+            Ok(envelope) => envelope,
             Err(RecvTimeoutError::Timeout) => {
                 let t_obs = std::time::Instant::now();
+                daemon.engine.abandon_pending_space_cursors();
                 if daemon.refresh_observation() {
                     deliver_notification(&subscribers, &Notification::StateChanged);
                 }
@@ -390,8 +394,66 @@ fn state_loop(
                     tracing::info!(obs_ms, "slow periodic observation");
                 }
                 last_observed_at = std::time::Instant::now();
+                continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if envelope.event_wake {
+            daemon.refresh_wake.acknowledge();
+        }
+
+        // Some commands must NOT pay the pre-handle observation:
+        // - Refresh observes inside handle() — two enumerations per
+        //   AX window-create event visibly delayed spawn→tile.
+        // - Workspace/Space focus are direct id switches; a full
+        //   snapshot (~100-500ms) before posting the swipe was THE
+        //   external-display switch lag.
+        // - Focus-defaulting window commands re-observe themselves
+        //   inside handle() at resolution time anyway.
+        let skip_pre_observe = match &envelope.request.command {
+            Command::Refresh => true,
+            Command::Workspace(_) | Command::Space(_) => true,
+            Command::Window(wc) if window_command_defaults_to_focus(wc) => true,
+            _ => false,
+        };
+        if !skip_pre_observe && last_observed_at.elapsed() >= interval {
+            let t_obs = std::time::Instant::now();
+            daemon.engine.abandon_pending_space_cursors();
+            if daemon.refresh_observation() {
+                deliver_notification(&subscribers, &Notification::StateChanged);
+            }
+            let obs_ms = t_obs.elapsed().as_millis() as u64;
+            if obs_ms > 100 {
+                tracing::info!(obs_ms, "slow periodic observation");
+            }
+            last_observed_at = std::time::Instant::now();
+        }
+        let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
+        if queue_wait_ms > 50 {
+            tracing::info!(
+                queue_wait_ms,
+                id = envelope.request.id,
+                "request waited on busy state loop"
+            );
+        }
+        let observes_internally = match &envelope.request.command {
+            Command::Refresh => true,
+            Command::Window(command) if window_command_defaults_to_focus(command) => true,
+            _ => false,
+        };
+        let t_handle = std::time::Instant::now();
+        let result = daemon.handle(envelope.request);
+        if observes_internally {
+            last_observed_at = std::time::Instant::now();
+        }
+        tracing::debug!(
+            handle_ms = t_handle.elapsed().as_millis() as u64,
+            queue_wait_ms,
+            "envelope handled"
+        );
+        let _ = envelope.response.send(result.response);
+        for notif in &result.notifications {
+            deliver_notification(&subscribers, notif);
         }
     }
 }
@@ -774,22 +836,39 @@ impl Daemon {
                     let engine_ms = t0.elapsed().as_millis() as u64;
                     return match result {
                         Ok(actions) => {
-                            // Record at dispatch so focus-recent and repeated
-                            // hotkeys see the new current space immediately.
-                            if let Some(Action::FocusSpace { space }) =
-                                actions.iter().find(|a| matches!(a, Action::FocusSpace { .. }))
-                            {
-                                self.note_space_switched_to(*space);
-                            }
+                            let target = actions.iter().find_map(|action| match action {
+                                Action::FocusSpace { space } => Some(*space),
+                                _ => None,
+                            });
                             let t1 = std::time::Instant::now();
                             let exec = execute_actions_result(&mut *self.platform, actions);
-                            tracing::debug!(
-                                workspace = %name,
-                                engine_ms,
-                                execute_ms = t1.elapsed().as_millis() as u64,
-                                total_ms = t0.elapsed().as_millis() as u64,
-                                "workspace focus timing"
-                            );
+                            if exec.is_ok() {
+                                if let Some(space) = target {
+                                    self.engine.note_space_focus_dispatched(space);
+                                    self.note_space_switched_to(space);
+                                }
+                            }
+                            let total_ms = t0.elapsed().as_millis() as u64;
+                            // INFO when slow so switch lag is visible without
+                            // debug logging; the hotkey path pays this on
+                            // every alt-N press.
+                            if total_ms > 50 {
+                                tracing::info!(
+                                    workspace = %name,
+                                    engine_ms,
+                                    execute_ms = t1.elapsed().as_millis() as u64,
+                                    total_ms,
+                                    "workspace focus timing (slow)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    workspace = %name,
+                                    engine_ms,
+                                    execute_ms = t1.elapsed().as_millis() as u64,
+                                    total_ms,
+                                    "workspace focus timing"
+                                );
+                            }
                             match exec {
                                 Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
                                     .with_notifications(vec![Notification::StateChanged]),
@@ -850,16 +929,49 @@ impl Daemon {
                 }
             }
             Command::Space(command) => {
+                if let SpaceCommand::Next { display } | SpaceCommand::Prev { display } = &command {
+                    let delta = if matches!(command, SpaceCommand::Next { .. }) { 1 } else { -1 };
+                    return match self.engine.focus_space_step(display.as_deref(), delta) {
+                        Ok(actions) => {
+                            let target = actions.iter().find_map(|action| match action {
+                                Action::FocusSpaceStep { target, .. } => Some(*target),
+                                _ => None,
+                            });
+                            match execute_actions_result(&mut *self.platform, actions) {
+                                Ok(()) => {
+                                    if let Some(space) = target {
+                                        self.engine.note_space_focus_dispatched(space);
+                                        self.note_space_switched_to(space);
+                                    }
+                                    HandleResult::ok(id, json!({ "accepted": true }))
+                                        .with_notifications(vec![Notification::StateChanged])
+                                }
+                                Err(err) => {
+                                    if let Some(space) = target {
+                                        self.engine.cancel_pending_space_focus(space);
+                                    }
+                                    HandleResult::err(id, "PLATFORM_ERROR", err.to_string())
+                                }
+                            }
+                        }
+                        Err(
+                            EngineError::NoAdjacentSpace
+                            | EngineError::DisplayNotFound(_)
+                            | EngineError::NoFocusedSpace,
+                        ) => HandleResult::err(id, "ENGINE_ERROR", "no adjacent space"),
+                        Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
+                    };
+                }
                 if let SpaceCommand::FocusRecent = command {
                     return match self.focus_recent_space() {
                         Some((result, previous)) => {
-                            // Record the toggle NOW: the second press must see
-                            // this space as "previous" even if observation has
-                            // not caught up yet.
-                            self.note_space_switched_to(previous);
-                            match self.execute_and_refresh(result) {
-                                Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
-                                    .with_notifications(vec![Notification::StateChanged]),
+                            match execute_actions_result(&mut *self.platform, result) {
+                                Ok(()) => {
+                                    self.engine.note_space_focus_dispatched(previous);
+                                    self.note_space_switched_to(previous);
+                                    HandleResult::ok(id, json!({ "accepted": true }))
+                                        .with_notifications(vec![Notification::StateChanged])
+                                }
                                 Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                             }
                         }
@@ -871,13 +983,15 @@ impl Daemon {
                     };
                 }
                 if let SpaceCommand::Focus { space } = command {
-                    // Deliberate focus: record at dispatch (see FocusRecent).
-                    self.note_space_switched_to(space);
                     let result = self.engine.focus_space(space);
                     match result {
-                        Ok(actions) => match self.execute_and_refresh(actions) {
-                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
-                                .with_notifications(vec![Notification::StateChanged]),
+                        Ok(actions) => match execute_actions_result(&mut *self.platform, actions) {
+                            Ok(()) => {
+                                self.engine.note_space_focus_dispatched(space);
+                                self.note_space_switched_to(space);
+                                HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged])
+                            }
                             Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
                         },
                         Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
@@ -912,7 +1026,11 @@ impl Daemon {
                     SpaceCommand::Create { anchor } => self.engine.create_space(anchor),
                     SpaceCommand::Destroy { space } => self.engine.destroy_space(space),
                     SpaceCommand::Move { space, after } => self.engine.move_space(space, after),
-                    SpaceCommand::ToggleInsets | SpaceCommand::Focus { .. } | SpaceCommand::FocusRecent => unreachable!("handled above"),
+                    SpaceCommand::ToggleInsets
+                    | SpaceCommand::Focus { .. }
+                    | SpaceCommand::FocusRecent
+                    | SpaceCommand::Next { .. }
+                    | SpaceCommand::Prev { .. } => unreachable!("handled above"),
                 };
                 match result {
                     Ok(actions) => match self.execute_and_refresh(actions) {
@@ -934,6 +1052,17 @@ impl Daemon {
                     }
                     match Config::load(&raw) {
                         Ok(config) => {
+                            // Hotkeys must follow the reloaded config — without
+                            // this, new/changed [[bind]] entries only applied
+                            // on daemon restart (the dead-code warnings were
+                            // pointing at exactly this gap).
+                            if let Err(err) = hotkey::reload(&config) {
+                                return HandleResult::err(
+                                    id,
+                                    "CONFIG_ERROR",
+                                    format!("hotkey update failed: {err}"),
+                                );
+                            }
                             self.config = config.clone();
                             self.config_path = raw;
                             self.engine.reload_config(config);
@@ -1010,43 +1139,95 @@ impl Daemon {
                 warn!(%err, "periodic snapshot failed");
             }
         }
-        // Track the previous Space for `space focus-recent`: whenever
-        // observation sees the current Space change, the old one becomes
-        // "previous". Focused-space lookup mirrors QueryCommand::Current.
-        let current_space = self
-            .engine
-            .observed
-            .spaces
-            .values()
-            .find(|s| s.focused)
-            .map(|s| s.id);
-        if let (Some(prev_current), Some(new_current)) = (self.current_space(), current_space) {
-            if new_current != prev_current {
-                self.previous_space.set(Some(prev_current));
-            }
+        // macOS reports one focused Space per display. Process every display
+        // in sorted order so HashMap iteration cannot affect recent history.
+        let mut focused_by_display: HashMap<DisplayId, SpaceId> = HashMap::new();
+        for space in self.engine.observed.spaces.values().filter(|s| s.focused) {
+            focused_by_display
+                .entry(space.display_id)
+                .and_modify(|current| {
+                    let current_space = self.engine.observed.spaces.get(current).unwrap();
+                    if (space.position, space.id) < (current_space.position, current_space.id) {
+                        *current = space.id;
+                    }
+                })
+                .or_insert(space.id);
         }
-        if let Some(cs) = current_space {
-            self.current_space_cell.set(Some(cs));
+        let mut displays: Vec<_> = focused_by_display.into_iter().collect();
+        displays.sort_by_key(|(display, _)| *display);
+        let mut history = self.space_history.borrow_mut();
+        for (display, current) in displays {
+            let entry = history.entry(display).or_default();
+            if entry.current != Some(current) {
+                entry.previous = entry.current;
+                entry.current = Some(current);
+            }
         }
         changed
     }
 
-    fn current_space(&self) -> Option<SpaceId> {
-        self.current_space_cell.get()
+    fn active_display(&self) -> Option<DisplayId> {
+        self.engine
+            .observed
+            .displays
+            .values()
+            .filter(|display| display.focused)
+            .map(|display| display.id)
+            .min()
+            .or_else(|| {
+                self.engine
+                    .observed
+                    .displays
+                    .values()
+                    .find(|display| display.is_main)
+                    .map(|display| display.id)
+            })
+            .or_else(|| self.engine.observed.displays.keys().copied().min())
+            .or_else(|| {
+                self.engine
+                    .observed
+                    .spaces
+                    .values()
+                    .filter(|space| space.focused)
+                    .map(|space| space.display_id)
+                    .min()
+            })
     }
 
-    /// Record a deliberate Space switch AT DISPATCH TIME. Observation-based
-    /// tracking (in `refresh_observation`) only catches up on a later tick;
-    /// without this, two quick `focus-recent` presses both read the same
-    /// stale "previous" and toggle stops being two-way.
+    fn current_space(&self) -> Option<SpaceId> {
+        let history = self.space_history.borrow();
+        self.active_display()
+            .and_then(|display| history.get(&display).and_then(|state| state.current))
+            .or_else(|| {
+                self.engine
+                    .observed
+                    .spaces
+                    .values()
+                    .filter(|space| space.focused)
+                    .min_by_key(|space| (space.display_id, space.position, space.id))
+                    .map(|space| space.id)
+            })
+    }
+
+    /// Record a deliberate Space switch AT DISPATCH TIME, on the display that
+    /// contains the target. This preserves rapid two-way toggles before the
+    /// next observation catches up.
     fn note_space_switched_to(&self, new_current: SpaceId) {
-        if self.current_space_cell.get() == Some(new_current) {
+        let Some(display) = self
+            .engine
+            .observed
+            .spaces
+            .get(&new_current)
+            .map(|space| space.display_id)
+        else {
             return;
+        };
+        let mut history = self.space_history.borrow_mut();
+        let entry = history.entry(display).or_default();
+        if entry.current != Some(new_current) {
+            entry.previous = entry.current;
+            entry.current = Some(new_current);
         }
-        if let Some(old) = self.current_space_cell.get() {
-            self.previous_space.set(Some(old));
-        }
-        self.current_space_cell.set(Some(new_current));
     }
 
     /// Resolve an optional Space id against the currently focused one.
@@ -1059,7 +1240,12 @@ impl Daemon {
     /// Also returns the space being focused so the caller can record the
     /// switch immediately (two-way toggle without waiting for observation).
     fn focus_recent_space(&mut self) -> Option<(Vec<Action>, SpaceId)> {
-        let previous = self.previous_space.get()?;
+        let display = self.active_display()?;
+        let previous = self
+            .space_history
+            .borrow()
+            .get(&display)
+            .and_then(|state| state.previous)?;
         if !self.engine.observed.spaces.contains_key(&previous) {
             return None;
         }
@@ -1168,6 +1354,21 @@ mod tests {
         WindowSnapshot,
     };
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn refresh_wake_coalesces_until_acknowledged() {
+        let wake = RefreshWake::default();
+        assert!(wake.request());
+        assert!(!wake.request());
+        wake.acknowledge();
+        assert!(wake.request());
+    }
+
+    #[test]
+    fn only_window_creation_requests_an_immediate_refresh() {
+        assert!(event_requests_immediate_refresh(WINDOW_CREATED_EVENT_KIND));
+        assert!(!event_requests_immediate_refresh(2));
+    }
 
     /// M4b: a slow or disconnected subscriber is evicted and never blocks the
     /// state loop, because delivery uses a non-blocking try_send into a bounded
@@ -1278,8 +1479,8 @@ mod tests {
 
     fn test_daemon() -> Daemon {
         Daemon {
-            previous_space: std::cell::Cell::new(None),
-            current_space_cell: std::cell::Cell::new(None),
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -1331,6 +1532,7 @@ mod tests {
                 },
                 label: None,
                 focused: true,
+                is_main: false,
                 generation: 1,
             }],
             complete: true,
@@ -1442,8 +1644,8 @@ mod tests {
             executed: vec![],
         };
         let mut daemon = Daemon {
-            previous_space: std::cell::Cell::new(None),
-            current_space_cell: std::cell::Cell::new(None),
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
             engine: Engine::new(Config::default()),
             platform: Box::new(platform),
             config: Config::default(),
@@ -1460,8 +1662,13 @@ mod tests {
             ResponseOutcome::Error { .. }
         ));
 
-        daemon.current_space_cell.set(Some(SpaceId(3)));
-        daemon.previous_space.set(Some(SpaceId(7)));
+        daemon.space_history.borrow_mut().insert(
+            DisplayId(1),
+            SpaceHistory {
+                current: Some(SpaceId(3)),
+                previous: Some(SpaceId(7)),
+            },
+        );
 
         let result = daemon.handle(Request::new(2, Command::Space(SpaceCommand::FocusRecent)));
         assert!(matches!(
@@ -1478,16 +1685,109 @@ mod tests {
             ResponseOutcome::Ok { .. }
         ));
         assert_eq!(daemon.current_space(), Some(SpaceId(3)));
-        assert_eq!(daemon.previous_space.get(), Some(SpaceId(7)));
+        assert_eq!(
+            daemon
+                .space_history
+                .borrow()
+                .get(&DisplayId(1))
+                .and_then(|state| state.previous),
+            Some(SpaceId(7))
+        );
 
         // A tracked previous Space that no longer exists errors instead of
         // emitting an action against a ghost Space.
-        daemon.previous_space.set(Some(SpaceId(999)));
+        daemon
+            .space_history
+            .borrow_mut()
+            .get_mut(&DisplayId(1))
+            .unwrap()
+            .previous = Some(SpaceId(999));
         let result = daemon.handle(Request::new(3, Command::Space(SpaceCommand::FocusRecent)));
         assert!(matches!(
             result.response.outcome,
             ResponseOutcome::Error { .. }
         ));
+    }
+
+    #[test]
+    fn focus_recent_is_scoped_to_the_active_display() {
+        let mut daemon = test_daemon();
+        daemon.platform = Box::new(MockPlatform {
+            snapshot: PlatformSnapshot {
+                windows: vec![],
+                spaces: vec![
+                    SpaceSnapshot {
+                        id: SpaceId(11),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: true,
+                        generation: 1,
+                        position: 0,
+                    },
+                    SpaceSnapshot {
+                        id: SpaceId(12),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: false,
+                        generation: 1,
+                        position: 1,
+                    },
+                    SpaceSnapshot {
+                        id: SpaceId(21),
+                        display_id: DisplayId(2),
+                        label: None,
+                        focused: true,
+                        generation: 1,
+                        position: 0,
+                    },
+                    SpaceSnapshot {
+                        id: SpaceId(22),
+                        display_id: DisplayId(2),
+                        label: None,
+                        focused: false,
+                        generation: 1,
+                        position: 1,
+                    },
+                ],
+                displays: vec![
+                    DisplaySnapshot {
+                        id: DisplayId(1),
+                        frame: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 1.0,
+                        },
+                        label: None,
+                        focused: true,
+                        is_main: true,
+                        generation: 1,
+                    },
+                    DisplaySnapshot {
+                        id: DisplayId(2),
+                        frame: Rect {
+                            x: 1.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 1.0,
+                        },
+                        label: None,
+                        focused: false,
+                        is_main: false,
+                        generation: 1,
+                    },
+                ],
+                complete: true,
+            },
+            executed: vec![],
+        });
+        daemon.refresh_observation();
+        daemon.note_space_switched_to(SpaceId(12));
+        daemon.note_space_switched_to(SpaceId(22));
+        daemon.note_space_switched_to(SpaceId(12));
+
+        let (_, target) = daemon.focus_recent_space().expect("display 1 history");
+        assert_eq!(target, SpaceId(11));
     }
 
     /// M4b: a successful Window mutation emits StateChanged so subscribers learn

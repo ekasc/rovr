@@ -26,6 +26,11 @@ pub enum Action {
     FocusSpace {
         space: SpaceId,
     },
+    /// Focus `target` by moving `delta` positions from the optimistic current Space.
+    FocusSpaceStep {
+        target: SpaceId,
+        delta: i32,
+    },
     CreateSpace {
         anchor: SpaceId,
     },
@@ -72,4 +77,21 @@ pub enum Action {
     ToggleNativeFullscreen {
         window: WindowId,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_space_step_serializes_with_target_and_delta() {
+        let value = serde_json::to_value(Action::FocusSpaceStep {
+            target: SpaceId(42),
+            delta: -3,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "focus_space_step");
+        assert_eq!(value["target"], 42);
+        assert_eq!(value["delta"], -3);
+    }
 }

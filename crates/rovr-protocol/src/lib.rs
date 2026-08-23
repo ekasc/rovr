@@ -1,5 +1,6 @@
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 pub mod command_parser;
+pub mod hotkey;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,6 +156,18 @@ pub enum SpaceCommand {
     },
     /// Switch to the space that was current before this one.
     FocusRecent,
+    /// Step to the next space (wrapping) on a display. `display` is None
+    /// (whichever display currently has keyboard focus), "main", or a
+    /// numeric id — lets hotkeys target the external display from anywhere.
+    Next {
+        #[serde(default)]
+        display: Option<String>,
+    },
+    /// Same as `Next`, stepping backwards.
+    Prev {
+        #[serde(default)]
+        display: Option<String>,
+    },
     /// Collapse/restore all configured gap+padding for the session.
     ToggleInsets,
 }

@@ -11,7 +11,7 @@
 //  - Callers are authenticated with getpeereid(): the peer uid must equal the
 //    uid claimed in the request AND the owner of /dev/console (the GUI session
 //    user). A process of any other user — or a non-GUI-session root process —
-//    is refused. Sockets are UID-specific (/tmp/rovr-sa_<uid>.sock), so an
+//    is refused. Sockets are in /tmp/rovr-<uid>/ (0700), so an
 //    injection is always bound to the requesting console session.
 //  - Artifacts are validated before every use: regular files (O_NOFOLLOW),
 //    owned by root, expected modes, inside the root-owned install directory,
@@ -149,8 +149,18 @@ static void send_response(int fd, uint32_t status, int32_t dock_pid)
 
 static void handle_connection(int fd)
 {
-    // A stuck client must never wedge the helper: bounded I/O windows.
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    // Authenticate before reading any caller-controlled bytes. The listener
+    // checks this immediately after accept too; repeating here keeps this
+    // function safe if reused.
+    uid_t peer_uid = UINT32_MAX;
+    gid_t peer_gid = 0;
+    if (getpeereid(fd, &peer_uid, &peer_gid) != 0 ||
+        (uint32_t)peer_uid != console_session_uid()) {
+        send_response(fd, ROVR_SA_ST_UNAUTHORIZED, 0);
+        return;
+    }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -167,16 +177,8 @@ static void handle_connection(int fd)
         return;
     }
 
-    // Authenticate the caller: peer credentials (kernel audit identity, not
-    // $USER/$UID) must match BOTH the claimed uid AND the GUI console user.
-    uid_t peer_uid = UINT32_MAX;
-    gid_t peer_gid = 0;
-    if (getpeereid(fd, &peer_uid, &peer_gid) != 0) {
-        send_response(fd, ROVR_SA_ST_UNAUTHORIZED, 0);
-        return;
-    }
-    uint32_t console_uid = console_session_uid();
-    if ((uint32_t)peer_uid != req.uid || (uint32_t)peer_uid != console_uid) {
+    // The authenticated kernel identity must also match the claimed uid.
+    if ((uint32_t)peer_uid != req.uid) {
         send_response(fd, ROVR_SA_ST_UNAUTHORIZED, 0);
         return;
     }
@@ -236,22 +238,32 @@ int main(int argc, char **argv)
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, ROVR_HELPER_SOCKET_PATH, sizeof(addr.sun_path) - 1);
         if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0) return 1;
-        chmod(ROVR_HELPER_SOCKET_PATH, 0666); // connect-only; auth is per-peer
+        chmod(ROVR_HELPER_SOCKET_PATH, 0222); // connect-only; auth is per-peer
         if (listen(listener, 8) != 0) return 1;
         fprintf(stderr, "rovr-sa-helper listening (standalone) on %s\n", ROVR_HELPER_SOCKET_PATH);
     }
 
     if (listener < 0) return 1;
 
-    // Event-driven accept loop: no polling, no timers, no SA probing here.
-    // Lifecycle detection stays in the unprivileged Rovr daemon.
+    // Event-driven accept loop. Authenticate immediately, then isolate each
+    // bounded frame read so one silent peer cannot starve other callers.
     for (;;) {
         int conn = accept(listener, NULL, NULL);
         if (conn < 0) {
             if (errno == EINTR) continue;
             return 1;
         }
-        handle_connection(conn);
-        close(conn);
+        uid_t peer_uid = UINT32_MAX;
+        gid_t peer_gid = 0;
+        if (getpeereid(conn, &peer_uid, &peer_gid) != 0 ||
+            (uint32_t)peer_uid != console_session_uid()) {
+            send_response(conn, ROVR_SA_ST_UNAUTHORIZED, 0);
+            close(conn);
+            continue;
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            handle_connection(conn);
+            close(conn);
+        });
     }
 }
