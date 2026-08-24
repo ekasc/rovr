@@ -1325,9 +1325,11 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
 static EVENT_TX: std::sync::OnceLock<mpsc::SyncSender<Envelope>> = std::sync::OnceLock::new();
 
 fn default_socket_path() -> PathBuf {
-    // Keyed on the REAL uid (getuid), never $UID: a daemon started from one
-    // environment and a CLI spawned by skhd/launchd from another must agree.
-    PathBuf::from(format!("/tmp/rovr-{}.sock", rovr_platform::unix_uid()))
+    // Shared helper: /tmp/rovr-<getuid()>/daemon.sock — the SAME runtime
+    // directory and uid keying as the SA socket. ($UID is not consulted:
+    // launchd environments omit it, so env-based keying would desync the
+    // daemon from its CLI.)
+    rovr_platform::daemon_socket_path()
 }
 
 fn default_config_path() -> PathBuf {

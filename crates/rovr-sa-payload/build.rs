@@ -34,6 +34,11 @@ fn main() {
             "-F/System/Library/PrivateFrameworks",
             "-weak_framework",
             "SkyLight",
+            // Dock.app runs arm64e; the payload must be built for the same
+            // architecture or dlopen inside it fails PAC/protection checks
+            // (upstream builds this -arch arm64e too).
+            "-arch",
+            "arm64e",
             "-o",
         ])
         .arg(&dylib)

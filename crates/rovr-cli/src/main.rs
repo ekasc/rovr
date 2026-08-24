@@ -808,6 +808,11 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         ));
     }
     let exe = std::env::current_exe().context("locate rovr executable")?;
+    // Resolve symlinks first: installs are typically ~/.local/bin/rovr ->
+    // <target>/<profile>/rovr, and current_exe() does NOT resolve them, which
+    // would make the ancestor walk land in ~/.local where cargo never puts
+    // build-script output.
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     // exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir where
     // cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
     let target_root = exe
@@ -817,6 +822,9 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         .unwrap_or_else(|| PathBuf::from("."));
     let find = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
         let base = target_root.join("build");
+        if !base.is_dir() {
+            return None;
+        }
         let mut hits: Vec<PathBuf> = std::fs::read_dir(&base)
             .ok()?
             .flatten()

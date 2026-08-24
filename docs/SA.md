@@ -107,4 +107,12 @@ Replacing the installed payload dylib does NOT update code already mapped into D
 
 ## Verification status
 
-The payload, loader, helper and install lifecycle compile and the protocol client + reinjection state machine are unit-tested, but injection requires SIP relaxation (recovery-mode reboot) and has NOT been verified end-to-end on a live macOS yet. Automatic reinjection (Dock restart AND reboot recovery) is NOT marked done: both must be demonstrated in a real interactive session per docs/ROADMAP.md before claiming `[x]`. Until then, SA-gated capabilities remain `[~] implemented but not verified end-to-end` in `docs/ROADMAP.md`.
+The payload, loader, helper and install lifecycle compile and the protocol client + reinjection state machine are unit-tested. **Verified live on macOS 26.5 (25F84, M2 arm64) as of 2026-08-24:**
+
+- Injection into the real Dock succeeds (arm64e payload + loader with PAC ABI v0 patch; see `docs/SA_SIP.md` history: plain-arm64 builds fail `thread_create_running` with `(os/kern) protection failure`, and modern clang's ABI-v1-stamped executables are refused by the v0 Dock — both fixed in the respective `build.rs`).
+- Protocol v2 verified end-to-end against a scratch host (`scripts/sa-interop/run.sh`): constructor, socket bind/identity, handshake, honest capability degradation outside Dock, opcode NAKs, framing discipline, stale-socket recovery.
+- Space lifecycle verified against the live Dock: focus, reorder (move after X), destroy, and create all executed and re-observed via `rovr query spaces`.
+- Cosmetics verified live: opacity, sticky, shadow (user-confirmed visually), layer transitions, PiP/scale toggle — all ACKed and reverted.
+- Automatic reinjection verified across a real Dock restart: `killall Dock` → new Dock generation → helper reinjected → handshake recovered in ~6 s → full attribs (`0x7ff`) re-resolved by the fresh injection (the long-running original Dock had not resolved `add_space`; the fresh process did).
+
+**Still unverified:** reboot recovery (helper-driven reinjection after a cold boot) and the update-simulation path (installing a rebuilt payload over a running one). Until demonstrated, those remain `[~]`.

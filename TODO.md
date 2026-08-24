@@ -2,6 +2,16 @@
 
 > Exact blockers from review — fix in order. Status: [ ] missing | [~] implemented but not verified end-to-end | [x] verified end-to-end
 
+## SA phase completion (2026-08-24)
+
+- [x] Blocker 1 SA verification: injected into live Dock on macOS 26.5 (arm64e + PAC-ABI-v0-patched loader), all space ops and cosmetics verified with re-observation, `killall Dock` reinjection via helper verified (~6 s, full `0x7ff` attribs). Interop harness: `scripts/sa-interop/run.sh`. Reboot recovery still pending.
+- [x] Daemon/CLI socket desync: daemon now uses shared `rovr_platform::daemon_socket_path()` (`/tmp/rovr-<uid>/daemon.sock`).
+- [x] SA artifact discovery through symlinked installs (`~/.local/bin/rovr`): canonicalize `current_exe()` first.
+- [x] arm64e build for payload + loader; loader caps patched 0x81→0x80 (yabai #2686 class).
+- [x] Stable code signing in `install-dev.sh` (cert-anchored DR) so the Accessibility grant survives rebuilds; embedded Info.plist (`__TEXT,__info_plist`) so TCC attributes launchd-spawned rovrd correctly.
+- [x] Honest capability gating: `rovr_bridge_capabilities` clears focus/frame bits when `AXIsProcessTrusted()` is false.
+- [~] Known platform gap (macOS 26.5): background apps return EMPTY `kAXWindowsAttribute`; only the frontmost app's windows refine (minimized/fullscreen/managed stay `unknown`, focus-by-id works only for frontmost). Not an SA issue — affects tiling refinement generally.
+
 ## Blockers
 
 - [~] 1. Rovr-owned scripting addition is claimed but not actually shipped

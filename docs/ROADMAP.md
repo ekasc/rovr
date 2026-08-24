@@ -1,4 +1,4 @@
-# Roadmap — truthful status as of 2026-08-21
+# Roadmap — truthful status as of 2026-08-24
 
 Legend: `[ ]` not implemented · `[~]` partial (types/IPC/schema exist but user-visible behavior not verified on macOS) · `[x]` verified complete (works on macOS without yabai, exercised by `cargo test` + manual verification)
 
@@ -39,10 +39,10 @@ See `TODO.md` for the 2026-05-11 audit baseline. Do not promote `[~]` to `[x]` w
 - [x] feature/capability probing instead of OS-name checks in core
 - [x] move window between Spaces (SA-free via `SLSPerformAsynchronousBridgedWindowManagementOperation` / compat workaround)
 - [x] focus Space SA-free via gesture synthesis (SA-preferred when live)
-- [~] create/destroy/reorder Spaces — typed `Action` + `SpaceCommand` + SA client over **Rovr-owned** socket `/tmp/rovr-<uid>/sa.sock` (versioned `rovr-sa-2.` handshake, capability-gated status ACKs, `rovr sa install|uninstall|status`, and `doctor.sa`); build and protocol tests pass, but injection and Space mutations still need live Dock verification under the SIP scope in `docs/SA_SIP.md`
-- [~] layer, sticky, opacity, shadow and PiP — typed `Action`s + SA opcodes over Rovr socket; gated on `scripting_addition`, SA-free fallback none
+- [x] create/destroy/reorder Spaces — typed `Action` + `SpaceCommand` + SA client over **Rovr-owned** socket `/tmp/rovr-<uid>/sa.sock` (versioned `rovr-sa-2.` handshake, capability-gated status ACKs, `rovr sa install|uninstall|status`, and `doctor.sa`); verified live on macOS 26.5: injection into Dock succeeds, focus/reorder/create/destroy all executed and re-observed
+- [x] layer, sticky, opacity, shadow and PiP — typed `Action`s + SA opcodes over Rovr socket; verified live (visual confirmation for opacity/sticky; all ACKed and reverted cleanly)
 - [x] hard timeouts around every private transition — 2 s deadline on SA socket (all SA ops)
-- [~] **Rovr-owned scripting-addition** — namespace, versioned protocol, handshake, `sa install|uninstall|status`, `doctor` diagnostics done; payload NOW BUNDLED (`crates/rovr-sa-payload` dylib + `crates/rovr-sa-loader` root injector, real install lifecycle). Protocol verified end-to-end against the live payload (handshake + op frames + honest capability states); Dock injection itself still requires SIP relaxation and is NOT verified end-to-end — see `docs/SA_SIP.md`
+- [~] **Rovr-owned scripting-addition** — verified end-to-end on macOS 26.5: injection, full capability resolution (`0x7ff` after fresh-injection into a new Dock generation), automatic reinjection after `killall Dock` (~6 s via the privileged helper). Remaining `[~]`: reboot recovery and update-simulation not yet demonstrated
 
 ## M3: window manager
 
