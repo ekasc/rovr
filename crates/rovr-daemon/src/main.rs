@@ -1104,6 +1104,16 @@ impl Daemon {
 
     fn refresh_observation(&mut self) -> bool {
         let mut changed = false;
+        // Capabilities are probed live by the platform (SA attribs follow
+        // install/uninstall/reinjection). Re-sync the engine's copy every
+        // tick so lifecycle decisions — e.g. CreateSpace for missing
+        // persistent workspaces — use CURRENT capabilities, not the ones
+        // captured once at daemon startup.
+        let fresh_caps = self.platform.capabilities();
+        if fresh_caps != self.engine.capabilities {
+            self.engine.capabilities = fresh_caps;
+            changed = true;
+        }
         // Event-driven: display topology callback sets the flag on reconfiguration.
         if self.platform.needs_refresh() {
             self.engine.observed.bump_generation();

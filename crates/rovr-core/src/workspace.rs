@@ -114,6 +114,13 @@ impl WorkspaceRegistry {
         self.0.get(name).and_then(|w| w.backing_space)
     }
 
+    /// Force the next `remap_after_snapshot` to do a full ordinal→position
+    /// reassignment (clears remembered positions). Used by explicit config
+    /// reloads so the configured order is re-applied verbatim.
+    pub fn mark_dirty(&mut self) {
+        self.1 = true;
+    }
+
     pub fn name_for_space(&self, space: SpaceId) -> Option<&str> {
         self.0
             .iter()

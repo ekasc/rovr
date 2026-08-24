@@ -384,6 +384,11 @@ impl Engine {
         self.rules = config.compile_rules().unwrap_or_default();
         self.config = config;
         self.workspaces.ensure_from_config(&self.config.workspaces);
+        // An explicit reload means "re-apply the configured topology": force
+        // the full ordinal→position reassignment so alt-N always lands on
+        // desktop N, discarding any last_position drift accumulated while
+        // Spaces were created/destroyed outside the workspace lifecycle.
+        self.workspaces.mark_dirty();
         let moves = self
             .workspaces
             .remap_after_snapshot(&self.observed.spaces, &self.observed.displays);
