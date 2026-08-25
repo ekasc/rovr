@@ -14,13 +14,13 @@
 
 ## Blockers
 
-- [~] 1. Rovr-owned scripting addition is claimed but not actually shipped
+- [x] 1. Rovr-owned scripting addition is shipped and verified end-to-end
   - `crates/rovr-sa-payload`: real ObjC payload dylib (Rovr socket `/tmp/rovr-<uid>/sa.sock`, `rovr-sa-2.0` handshake, honest capability attribs, opcodes 0x02–0x05/0x07–0x0B/0x0D; SkyLight cosmetics direct, space lifecycle via vendored yabai MIT pattern tables with attribution). Scan bounds-guarded so it cannot walk off mapped memory.
   - `crates/rovr-sa-loader`: root injector (adapted from yabai loader.m, attribution preserved).
   - `rovr sa install|uninstall` wired for real (artifact discovery, root check, SIP check, copy to `/Library/Application Support/rovr/`, inject, poll handshake). `rovr sa status` reports all five states (`not_installed`, `installed_not_injected`, `injected_compatible`, `incompatible_protocol`, `capability_missing`).
   - Client framing bug found & fixed via live interop test (`len = 3 + payload_len`); socket path now keyed on `getuid()` matching the payload.
-  - PREVIOUSLY VERIFIED against protocol v1 in an isolated host process: constructor, socket bind, handshake, and opacity/sticky frames. Protocol v2 adds the private runtime directory, exact frame lengths, peer checks, and status ACKs; unit-tested, but the isolated-host interop test still needs to be rerun.
-  - NOT VERIFIED: injection into real Dock and actual space/cosmetic effects — requires SIP relaxation (recovery reboot), see docs/SA_SIP.md.
+  - VERIFIED live on macOS 26.5 (see "SA phase completion" above): real-Dock injection via arm64e + PAC-ABI-v0-patched loader, all space ops and cosmetics with re-observation, killall-Dock reinjection (~6 s, full `0x7ff` attribs).
+  - STILL OPEN: isolated-host interop harness rerun under protocol v2; reboot recovery (needs a SIP-relaxed reboot).
 
 - [~] 2. Snapshot timeout leaks hung threads
   - Replaced spawn-and-abandon with ONE `BoundedWorker` thread (`crates/rovr-platform/src/bounded_worker.rs`): at most one observation in flight, fail-fast while wedged, detectable via `wedged_since` (exposed in `doctor.snapshot_wedged_ms`), recovery only after the timed-out closure is observed complete (no queued retries).
@@ -156,3 +156,16 @@
 ### Deferred known gaps
 
 - [x] P2: hotkey key syntax is parsed by the shared protocol seam and validated before config load/reload.
+
+## PR #22 merge readiness (2026-08-25)
+
+- [x] Regression test: runtime capability refresh after SA install/reinjection unlocks
+  the previously gated CreateSpace (`capabilities_refresh_at_runtime_unlocks_persistent_creation`,
+  rovr-daemon; drives `Daemon::refresh_observation` with a mutable-capability platform).
+- [x] Regression tests: config reload restores ordinal→position identity over manual
+  Mission Control drags (`reload_config_restores_ordinal_position_identity_after_drag`
+  through `Engine::reload_config`, plus `mark_dirty_discards_last_positions_and_forces_ordinal_reassignment`
+  at the registry seam). Both mutation-verified: each fails when its half of c4a8c69 is reverted.
+- [x] TODO.md Blocker 1 contradiction resolved: SA verified live; genuinely open items
+  (protocol-v2 interop rerun, reboot recovery) listed explicitly instead of stale NOT VERIFIED text.
+- Full checks: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 141 passed.

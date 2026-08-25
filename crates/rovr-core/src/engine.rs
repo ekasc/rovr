@@ -1635,6 +1635,71 @@ mod tests {
         );
     }
 
+    /// c4a8c69 regression: an explicit config reload must force a full
+    /// ordinal→position reassignment so alt-N lands on desktop N again, even
+    /// after Mission Control drags moved workspaces onto non-ordinal slots
+    /// (which resume-by-position otherwise deliberately preserves).
+    #[test]
+    fn reload_config_restores_ordinal_position_identity_after_drag() {
+        let workspace = |name: &str| rovr_config::WorkspaceConfig {
+            name: name.into(),
+            layout: rovr_types::LayoutKind::Bsp,
+            display: None,
+            persistent: true,
+            plugin: None,
+        };
+        let mut engine = Engine::new(Config {
+            workspaces: vec![workspace("code"), workspace("chat")],
+            ..Default::default()
+        });
+        engine.capabilities.create_space = false; // no lifecycle noise
+
+        let spaces_at = |id_a: u64, pos_a: u32, id_b: u64, pos_b: u32| PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![
+                space_snap(id_a, 1, pos_a, false),
+                space_snap(id_b, 1, pos_b, true),
+            ],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+
+        // Healthy session: code→11@position0, chat→12@position1.
+        let _ = engine.apply_event(Event::Snapshot(spaces_at(11, 0, 12, 1)));
+        assert_eq!(engine.workspaces.backing_for("code"), Some(SpaceId(11)));
+        assert_eq!(engine.workspaces.backing_for("chat"), Some(SpaceId(12)));
+
+        // User drags chat ahead of code in Mission Control: the Spaces keep
+        // their ids, positions swap, and the drag must be preserved until an
+        // explicit reload says the configured order wins.
+        let _ = engine.apply_event(Event::Snapshot(spaces_at(12, 0, 11, 1)));
+        assert_eq!(
+            (
+                engine.workspaces.0["code"].last_position,
+                engine.workspaces.0["chat"].last_position
+            ),
+            (Some(1), Some(0)),
+            "snapshot must track the dragged slot per workspace"
+        );
+
+        // Explicit reload with the SAME config (the exact production reload
+        // shape): the next snapshot must reapply ordinal→position identity —
+        // code owns position 0, chat owns position 1 — discarding the drag.
+        engine.reload_config(Config {
+            workspaces: vec![workspace("code"), workspace("chat")],
+            ..Default::default()
+        });
+        let _ = engine.apply_event(Event::Snapshot(spaces_at(12, 0, 11, 1)));
+        assert_eq!(
+            (
+                engine.workspaces.backing_for("code"),
+                engine.workspaces.backing_for("chat")
+            ),
+            (Some(SpaceId(12)), Some(SpaceId(11))),
+            "reload must restore ordinal N → position N despite prior drag"
+        );
+    }
+
     /// Full observation context: one display, one focused Space, two tiled
     /// windows side by side (window 1 focused).
     fn snapshot_with_state(engine: &Engine) -> PlatformSnapshot {

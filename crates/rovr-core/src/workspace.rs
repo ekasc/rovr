@@ -731,4 +731,41 @@ mod tests {
         assert_eq!(reg.backing_for("code"), Some(SpaceId(12)));
         assert_eq!(moves.len(), 2);
     }
+
+    /// c4a8c69 regression: mark_dirty must defeat resume-by-position so an
+    /// explicit reload can re-apply the configured order over a manually
+    /// dragged arrangement.
+    #[test]
+    fn mark_dirty_discards_last_positions_and_forces_ordinal_reassignment() {
+        let mut reg = registry_with(&[("code", true, Some(11), 0), ("chat", true, Some(12), 1)]);
+        // Dragged arrangement: chat was pulled ahead of code in Mission
+        // Control; ids stay, positions swap, registry remembers the slots.
+        reg.0.get_mut("code").unwrap().last_position = Some(1);
+        reg.0.get_mut("chat").unwrap().last_position = Some(0);
+        let mut spaces = HashMap::new();
+        spaces.insert(SpaceId(11), space(11, 1, 1));
+        spaces.insert(SpaceId(12), space(12, 1, 0));
+        let displays = HashMap::new();
+
+        // Not dirty: resume-by-position keeps each workspace on its dragged
+        // slot — a legitimate drag must be stable across snapshots.
+        let moves = reg.remap_after_snapshot(&spaces, &displays);
+        assert_eq!(
+            (reg.backing_for("code"), reg.backing_for("chat")),
+            (Some(SpaceId(11)), Some(SpaceId(12))),
+            "resume-by-position must preserve a legitimate drag when not dirty"
+        );
+        assert!(moves.is_empty());
+
+        // Dirty (what a reload does): remembered positions are discarded and
+        // the configured ordinal order wins.
+        reg.mark_dirty();
+        let moves = reg.remap_after_snapshot(&spaces, &displays);
+        assert_eq!(
+            (reg.backing_for("code"), reg.backing_for("chat")),
+            (Some(SpaceId(12)), Some(SpaceId(11))),
+            "dirty remap must reassign strictly by ordinal"
+        );
+        assert_eq!(moves.len(), 2);
+    }
 }

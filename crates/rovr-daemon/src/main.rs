@@ -1359,11 +1359,11 @@ fn default_state_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rovr_platform::MockPlatform;
+    use rovr_platform::{MockPlatform, PlatformError};
     use rovr_protocol::ResponseOutcome;
     use rovr_types::{
-        DisplayId, DisplaySnapshot, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot, WindowId,
-        WindowSnapshot,
+        Capabilities, DisplayId, DisplaySnapshot, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot,
+        WindowId, WindowSnapshot,
     };
     use std::sync::mpsc::sync_channel;
 
@@ -1499,6 +1499,131 @@ mod tests {
             config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
             state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
         }
+    }
+
+    /// Platform whose capabilities change at runtime — models the SA appearing
+    /// (install/reinjection) or disappearing (uninstall) while the daemon runs.
+    /// Capability state and the execution log live behind shared handles so
+    /// the test can flip capabilities after the platform is boxed into a Daemon.
+    struct MutableCapPlatform {
+        create_space: Arc<std::sync::atomic::AtomicBool>,
+        snapshot: PlatformSnapshot,
+        executed: Arc<std::sync::Mutex<Vec<Action>>>,
+    }
+
+    fn create_space_requests(executed: &std::sync::Mutex<Vec<Action>>) -> Vec<SpaceId> {
+        executed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|a| match a {
+                Action::CreateSpace { anchor } => Some(*anchor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    impl Platform for MutableCapPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                create_space: self.create_space.load(std::sync::atomic::Ordering::Relaxed),
+                ..Capabilities::default()
+            }
+        }
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            Ok(self.snapshot.clone())
+        }
+        fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+            self.executed.lock().unwrap().push(action.clone());
+            Ok(())
+        }
+    }
+
+    /// The SA can appear after startup (install/reinjection). Capabilities
+    /// must be re-probed every tick; the next reconcile cycle must emit the
+    /// CreateSpace that was previously gated off for the missing persistent
+    /// workspace (regression for the stale-caps half of c4a8c69).
+    #[test]
+    fn capabilities_refresh_at_runtime_unlocks_persistent_creation() {
+        let config = Config {
+            workspaces: vec![
+                rovr_config::WorkspaceConfig {
+                    name: "code".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+                rovr_config::WorkspaceConfig {
+                    name: "chat".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+            ],
+            ..Default::default()
+        };
+        // One space exists: "code" claims it, "chat" stays missing and needs
+        // CreateSpace — exactly the situation gated by capabilities.
+        let create_space = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(config);
+        daemon.config = daemon.engine.config.clone();
+        daemon.platform = Box::new(MutableCapPlatform {
+            create_space: create_space.clone(),
+            snapshot: PlatformSnapshot {
+                windows: vec![],
+                spaces: vec![SpaceSnapshot {
+                    id: SpaceId(11),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: true,
+                    generation: 0,
+                    position: 0,
+                }],
+                displays: vec![DisplaySnapshot {
+                    id: DisplayId(1),
+                    frame: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1000.0,
+                        height: 800.0,
+                    },
+                    label: None,
+                    focused: true,
+                    is_main: true,
+                    generation: 0,
+                }],
+                complete: true,
+            },
+            executed: executed.clone(),
+        });
+
+        // Tick 1: create_space unavailable (pre-SA). No CreateSpace may be
+        // requested even though a persistent workspace has no backing.
+        daemon.refresh_observation();
+        assert!(
+            create_space_requests(executed.as_ref()).is_empty(),
+            "gated capability must not produce CreateSpace"
+        );
+        assert_eq!(
+            daemon.engine.workspaces.backing_for("code"),
+            Some(SpaceId(11))
+        );
+
+        // SA install/reinjection happens out of band: create_space appears.
+        create_space.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Tick 2: the refreshed capability must unlock exactly one CreateSpace
+        // for the still-missing workspace, anchored on the existing space.
+        daemon.refresh_observation();
+        assert_eq!(
+            create_space_requests(executed.as_ref()),
+            vec![SpaceId(11)],
+            "capability refresh must let the next reconcile emit the previously gated CreateSpace"
+        );
     }
 
     /// Builds a daemon whose observed state contains one window on one space on
