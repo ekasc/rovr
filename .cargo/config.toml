@@ -1,8 +1,0 @@
-# Embed an Info.plist into rovrd's __TEXT segment (yabai's approach): TCC
-# attributes Accessibility to the CFBundleIdentifier inside the binary, which
-# makes the grant survive rebuilds and apply under launchd.
-[target.'cfg(target_os = "macos")']
-rustflags = [
-  "-C", "link-arg=-Wl,-sectcreate,__TEXT,__info_plist",
-  "-C", "link-arg=/Users/ekassinghchhabra/Projects/rust/rovr/crates/rovr-daemon/Info.plist",
-]
