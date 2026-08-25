@@ -711,6 +711,12 @@ uint64_t rovr_bridge_capabilities(void) {
         capabilities |= ROVR_CAP_SET_WINDOW_FRAME;
         capabilities |= ROVR_CAP_FOCUS_WINDOW;
     }
+    // Honest TCC visibility: doctor surfaces whether this process is trusted
+    // for AX at all — a missing grant otherwise looks identical to every app
+    // having an empty AX window list.
+    if (!AXIsProcessTrusted()) {
+        capabilities &= ~(ROVR_CAP_SET_WINDOW_FRAME | ROVR_CAP_FOCUS_WINDOW);
+    }
     if (g_sls_copy_managed_display_spaces) {
         capabilities |= ROVR_CAP_OBSERVE_SPACES;
     }

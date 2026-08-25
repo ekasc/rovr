@@ -46,4 +46,4 @@ Full model in `docs/SA.md` ("Privileged helper security model").
 
 ## Verification status
 
-The SIP check logic is implemented in `rovr sa install`, but the actual injection flow has NOT been exercised end-to-end yet (requires a recovery-mode reboot). The exact `csrutil` invocations above must be verified per supported macOS minor before claiming `[x]`; do not promote the SA roadmap items until then.
+The SIP check logic is implemented in `rovr sa install`, and the injection flow **was exercised end-to-end on 2026-08-24** on macOS 26.5 with exactly the relaxations above (`--without debug --without fs` + `-arm64e_preview_abi`). Injection into the live Dock, all space mutations, and cosmetics were verified (see `docs/SA.md`). Two build-level requirements were discovered during verification: the payload AND loader must be built `-arch arm64e` to match Dock, and the loader's Mach-O caps byte must be patched from ABI v1 (`0x81`, modern clang default) to v0 (`0x80`, what Dock runs) — both handled in the crates' `build.rs`. Reboot recovery remains undemonstrated.
