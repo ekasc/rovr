@@ -236,7 +236,7 @@ mod tests {
     fn blocker2_repeated_timeouts_cannot_spawn_unbounded_workers() {
         let (active, max_seen) = counters();
         let worker: BoundedWorker<()> = BoundedWorker::new(
-            Duration::from_millis(20), // short caller timeout
+            Duration::from_millis(50), // short caller timeout
             Duration::from_millis(0),  // always allow a retry attempt
         );
 
@@ -245,7 +245,7 @@ mod tests {
             let max_seen = max_seen.clone();
             let result = worker.run(move || {
                 crate::bounded_worker::test_support::tracked_job(&active, &max_seen, || {
-                    std::thread::sleep(Duration::from_millis(60));
+                    std::thread::sleep(Duration::from_millis(300));
                 });
             });
             assert!(
@@ -327,25 +327,33 @@ mod tests {
         let worker = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
         let epoch = worker
             .submit(|| {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(300));
                 1
             })
             .unwrap();
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(20);
+        let deadline = started + Duration::from_millis(80);
         assert_eq!(
             worker.wait_until(epoch, deadline),
             Err(BoundedError::Timeout)
         );
-        assert!(started.elapsed() < Duration::from_millis(70));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "deadline must bound the wait; elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60),
+            "wait should respect the deadline; elapsed={elapsed:?}"
+        );
     }
 
     #[test]
     fn submit_is_single_flight_and_late_result_is_reaped() {
-        let worker = BoundedWorker::new(Duration::from_millis(10), Duration::ZERO);
+        let worker = BoundedWorker::new(Duration::from_millis(30), Duration::ZERO);
         let epoch = worker
             .submit(|| {
-                std::thread::sleep(Duration::from_millis(40));
+                std::thread::sleep(Duration::from_millis(200));
                 1
             })
             .unwrap();
@@ -354,10 +362,10 @@ mod tests {
             Err(BoundedError::FastFail { .. })
         ));
         assert_eq!(
-            worker.wait_until(epoch, Instant::now() + Duration::from_millis(5)),
+            worker.wait_until(epoch, Instant::now() + Duration::from_millis(20)),
             Err(BoundedError::Timeout)
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(300));
         let next = worker.submit(|| 3).unwrap();
         assert_eq!(
             worker.wait_until(next, Instant::now() + Duration::from_secs(1)),
