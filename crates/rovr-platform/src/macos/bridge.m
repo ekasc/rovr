@@ -132,6 +132,7 @@ static void rovr_ax_set_enhanced_ui(AXUIElementRef app, bool on) {
 enum {
     ROVR_EVENT_WINDOW_CREATED = 1,
     ROVR_EVENT_WINDOW_FOCUSED = 2,
+    ROVR_EVENT_WINDOW_DESTROYED = 4,
 };
 
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
@@ -159,6 +160,8 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
         kind = ROVR_EVENT_WINDOW_CREATED;
     } else if (CFStringCompare(notification, kAXFocusedWindowChangedNotification, 0) == kCFCompareEqualTo) {
         kind = ROVR_EVENT_WINDOW_FOCUSED;
+    } else if (CFStringCompare(notification, kAXUIElementDestroyedNotification, 0) == kCFCompareEqualTo) {
+        kind = ROVR_EVENT_WINDOW_DESTROYED;
     } else {
         return;
     }
@@ -197,7 +200,7 @@ static void rovr_observe_app(pid_t pid) {
         return;
     }
     bool any = false;
-    const CFStringRef notifications[] = { kAXCreatedNotification, kAXFocusedWindowChangedNotification };
+    const CFStringRef notifications[] = { kAXCreatedNotification, kAXFocusedWindowChangedNotification, kAXUIElementDestroyedNotification };
     for (unsigned long i = 0; i < sizeof(notifications) / sizeof(notifications[0]); ++i) {
         AXError err = AXObserverAddNotification(observer, app, notifications[i], (void *)(intptr_t)pid);
         if (err == kAXErrorSuccess || err == kAXErrorNotificationAlreadyRegistered) any = true;
@@ -238,6 +241,8 @@ static void rovr_prune_observers(void) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(removed[i].observer), kCFRunLoopDefaultMode);
         CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(removed[i].observer));
         AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXCreatedNotification);
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXFocusedWindowChangedNotification);
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXUIElementDestroyedNotification);
         CFRelease(removed[i].observer);
         CFRelease(removed[i].app);
     }

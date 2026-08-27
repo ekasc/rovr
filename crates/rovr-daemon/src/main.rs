@@ -26,7 +26,7 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
-use rovr_types::{DisplayId, SpaceId};
+use rovr_types::{DisplayId, SpaceId, WindowId};
 
 mod hotkey;
 use serde_json::json;
@@ -37,9 +37,10 @@ use tracing_subscriber::EnvFilter;
 const SUBSCRIBER_BACKLOG: usize = 64;
 const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const WINDOW_CREATED_EVENT_KIND: u32 = 1;
+const WINDOW_DESTROYED_EVENT_KIND: u32 = 4;
 
 fn event_requests_immediate_refresh(event_kind: u32) -> bool {
-    event_kind == WINDOW_CREATED_EVENT_KIND
+    event_kind == WINDOW_CREATED_EVENT_KIND || event_kind == WINDOW_DESTROYED_EVENT_KIND
 }
 
 #[derive(Default)]
@@ -765,11 +766,22 @@ impl Daemon {
                     | WindowCommand::WarpDirection { .. } => unreachable!(),
                 };
                 match result {
-                    Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
-                            .with_notifications(vec![Notification::StateChanged]),
-                        Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
-                    },
+                    Ok(actions) => {
+                        let close_window = actions.iter().find_map(|a| match a {
+                            Action::CloseWindow { window } => Some(*window),
+                            _ => None,
+                        });
+                        let exec = if let Some(wid) = close_window {
+                            self.execute_close_and_refresh(wid, actions)
+                        } else {
+                            self.execute_and_refresh(actions)
+                        };
+                        match exec {
+                            Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
+                                .with_notifications(vec![Notification::StateChanged]),
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                        }
+                    }
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                 }
             }
@@ -1392,6 +1404,23 @@ impl Daemon {
         Ok(())
     }
 
+    fn execute_close_and_refresh(&mut self, window: WindowId, actions: Vec<Action>) -> Result<()> {
+        execute_actions_result(&mut *self.platform, actions)?;
+        // Optimistically exclude the closing window so the remaining windows
+        // retile instantly, even though CGWindowList may still report it
+        // during the AppKit close animation.
+        let mut snapshot = self.platform.snapshot()?;
+        snapshot.windows.retain(|w| w.id != window);
+        let followup = self.engine.apply_event(Event::Snapshot(snapshot));
+        if !followup.is_empty() {
+            execute_actions_result(&mut *self.platform, followup)?;
+            self.engine
+                .flight_recorder
+                .record("reconcile.verification", "followup actions executed");
+        }
+        Ok(())
+    }
+
     /// Reset config-scoped runtime state, re-observe the real topology, and
     /// remove empty unclaimed Spaces one at a time. Space IDs remain
     /// authoritative; every deletion is observed as absent before another
@@ -1532,6 +1561,9 @@ mod tests {
     #[test]
     fn only_window_creation_requests_an_immediate_refresh() {
         assert!(event_requests_immediate_refresh(WINDOW_CREATED_EVENT_KIND));
+        assert!(event_requests_immediate_refresh(
+            WINDOW_DESTROYED_EVENT_KIND
+        ));
         assert!(!event_requests_immediate_refresh(2));
     }
 

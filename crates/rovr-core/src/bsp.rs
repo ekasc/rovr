@@ -610,6 +610,41 @@ mod tests {
     }
 
     #[test]
+    fn remove_three_to_two_expands_to_full_height() {
+        let mut t = BspTree::new();
+        for id in [43646, 43704, 43706] {
+            t.insert(WindowId(id));
+        }
+        assert_eq!(
+            t.leaves(),
+            vec![WindowId(43646), WindowId(43704), WindowId(43706)]
+        );
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1470.0,
+            height: 918.0,
+        };
+        let before = t.placements(area, 0.0);
+        assert_eq!(before.len(), 3);
+        // middle leaf was top-right 735x459
+        assert!(before
+            .iter()
+            .any(|(id, r)| *id == WindowId(43704) && r.height == 459.0));
+        t.remove(WindowId(43704));
+        assert_eq!(t.leaves(), vec![WindowId(43646), WindowId(43706)]);
+        let after = t.placements(area, 0.0);
+        assert_eq!(after.len(), 2);
+        for (_, r) in &after {
+            assert!(
+                (r.height - 918.0).abs() < 0.1,
+                "remaining windows must be full height after collapse, got {r:?}"
+            );
+            assert!((r.width - 735.0).abs() < 0.1);
+        }
+    }
+
+    #[test]
     fn swap_windows() {
         let mut t = BspTree::new();
         for id in 1..=3 {
