@@ -43,7 +43,7 @@ extern "C" fn rovr_ax_event_trampoline(event_kind: i32, _window_id: u32) {
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
 const ROVR_BUNDLE_MAX: usize = 256;
-const AX_JOB_TIMEOUT: Duration = Duration::from_millis(500);
+const AX_JOB_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Maximum time the gesture path waits for a PREVIOUS swipe animation to
 /// land before posting the next sequence. Waiting for actual landing (not a
@@ -721,11 +721,21 @@ impl MacPlatform {
                 "window enumeration failed with status {window_status}"
             )));
         }
-        let pids: HashSet<i32> = windows.iter().map(|window| window.pid.0).collect();
-        let refinements = ax_workers
-            .lock()
-            .map_err(|_| PlatformError::Operation("AX worker pool poisoned".to_string()))?
-            .refine(&pids);
+        let pids: HashSet<i32> = windows
+            .iter()
+            .filter(|window| {
+                window.space_id.is_some() || (window.frame.height > 300.0 && window.frame.y < 100.0)
+            })
+            .map(|window| window.pid.0)
+            .collect();
+        let refinements = if pids.is_empty() {
+            Vec::new()
+        } else {
+            ax_workers
+                .lock()
+                .map_err(|_| PlatformError::Operation("AX worker pool poisoned".to_string()))?
+                .refine(&pids)
+        };
         let refinements: HashMap<u32, AxRefinement> = refinements
             .into_iter()
             .map(|refinement| (refinement.id, refinement))
