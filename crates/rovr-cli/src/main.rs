@@ -228,6 +228,12 @@ struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigSubcommand {
+    #[command(about = "Print a minimal starter config or all resolved defaults")]
+    Dump {
+        #[arg(long, help = "Include every resolved default value")]
+        full: bool,
+    },
+    #[command(about = "Reload config and self-heal workspace/Space topology")]
     Reload {
         path: Option<String>,
     },
@@ -332,8 +338,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if let TopCommand::Config(args) = &cli.command {
-        if let ConfigSubcommand::GenSkhd { path } = &args.command {
-            return run_gen_skhd(path.as_deref());
+        match &args.command {
+            ConfigSubcommand::Dump { full } => return run_config_dump(*full),
+            ConfigSubcommand::GenSkhd { path } => return run_gen_skhd(path.as_deref()),
+            ConfigSubcommand::Reload { .. } | ConfigSubcommand::Check { .. } => {}
         }
     }
     if let TopCommand::Sa(args) = &cli.command {
@@ -566,6 +574,9 @@ fn map_command(command: TopCommand) -> Command {
             SpaceSubcommand::ToggleInsets => SpaceCommand::ToggleInsets,
         }),
         TopCommand::Config(args) => Command::Config(match args.command {
+            ConfigSubcommand::Dump { .. } => {
+                unreachable!("config dump is handled in main() before map_command")
+            }
             ConfigSubcommand::Reload { path } => ConfigCommand::Reload { path },
             ConfigSubcommand::Check { path } => ConfigCommand::Check { path },
             ConfigSubcommand::GenSkhd { .. } => {
@@ -607,6 +618,26 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Subscribe => {
             unreachable!("subscribe is handled in main() before map_command is called")
         }
+    }
+}
+
+fn run_config_dump(full: bool) -> Result<()> {
+    print!("{}", render_config_dump(full)?);
+    Ok(())
+}
+
+fn render_config_dump(full: bool) -> Result<String> {
+    if full {
+        let mut output = toml::to_string_pretty(&rovr_config::Config::default())?;
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        Ok(output)
+    } else {
+        Ok(format!(
+            "config-version = {}\n",
+            rovr_config::CURRENT_CONFIG_VERSION
+        ))
     }
 }
 
@@ -1407,6 +1438,27 @@ mod tests {
             command: SpaceSubcommand::FocusRecent,
         }));
         assert_eq!(command, Command::Space(SpaceCommand::FocusRecent));
+    }
+
+    #[test]
+    fn config_dump_is_small_by_default_and_full_on_request() {
+        let minimal = render_config_dump(false).expect("render minimal config");
+        assert_eq!(minimal, "config-version = 1\n");
+
+        let full = render_config_dump(true).expect("render full config");
+        let parsed = rovr_config::Config::parse(&full).expect("full dump round trips");
+        assert_eq!(parsed.config_version, rovr_config::CURRENT_CONFIG_VERSION);
+        assert_eq!(parsed.general.layout, rovr_types::LayoutKind::Bsp);
+        assert!(full.contains("[general]"));
+
+        let cli =
+            Cli::try_parse_from(["rovr", "config", "dump", "--full"]).expect("dump --full parses");
+        assert!(matches!(
+            cli.command,
+            TopCommand::Config(ConfigArgs {
+                command: ConfigSubcommand::Dump { full: true }
+            })
+        ));
     }
 
     /// M4b: `rovr subscribe` consumes the subscription ACK (and errors if it is

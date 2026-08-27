@@ -66,6 +66,13 @@ Default path:
 
 Example: see [`config/rovr.example.toml`](config/rovr.example.toml).
 
+New configurations should declare `config-version = 1`. Omitting the key is
+treated as version 1 for compatibility; unsupported versions fail validation
+before any configuration is applied.
+
+Use `rovr config dump` for the minimal starter file or
+`rovr config dump --full` to inspect every resolved default.
+
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
