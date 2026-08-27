@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rovr_config::{CompiledRule, Config, ScratchpadConfig};
+use rovr_config::{CompiledRule, Config, ScratchpadConfig, Selector};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
@@ -26,34 +26,26 @@ fn window_matches_rule(
     observed: &ObservedState,
     workspaces: &WorkspaceRegistry,
 ) -> bool {
-    let app_ok = match &rule.app {
-        Some(re) => {
-            let bundle_hit = w.bundle_id.as_deref().is_some_and(|b| re.is_match(b));
-            let app_hit = re.is_match(&w.app);
-            bundle_hit || app_hit
+    rule.predicate.all_of.iter().all(|selector| match selector {
+        Selector::App(pattern) => {
+            w.bundle_id
+                .as_deref()
+                .is_some_and(|bundle| pattern.is_match(bundle))
+                || pattern.is_match(&w.app)
         }
-        None => true,
-    };
-    let title_ok = match &rule.title {
-        Some(re) => re.is_match(&w.title),
-        None => true,
-    };
-    let workspace_ok = match &rule.workspace {
-        Some(ws) => {
-            // Match against logical workspace name backing the window's space
-            let ws_name = w
+        Selector::Title(pattern) => pattern.is_match(&w.title),
+        Selector::Workspace(workspace) => {
+            let workspace_name = w
                 .space_id
-                .and_then(|sid| workspaces.name_for_space(sid))
+                .and_then(|space| workspaces.name_for_space(space))
                 .or_else(|| {
                     w.space_id
-                        .and_then(|sid| observed.spaces.get(&sid))
-                        .and_then(|s| s.label.as_deref())
+                        .and_then(|space| observed.spaces.get(&space))
+                        .and_then(|space| space.label.as_deref())
                 });
-            ws_name == Some(ws.as_str())
+            workspace_name == Some(workspace.as_str())
         }
-        None => true,
-    };
-    app_ok && title_ok && workspace_ok
+    })
 }
 
 /// A window floats when some `floating == Some(true)` rule matches it.
@@ -1041,6 +1033,7 @@ mod tests {
                 desired_display: None,
                 ordinal: 0,
                 last_position: None,
+                dynamic: false,
             },
         );
 

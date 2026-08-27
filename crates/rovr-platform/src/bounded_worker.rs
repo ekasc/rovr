@@ -3,10 +3,10 @@
 //! AX and SkyLight calls can hang indefinitely (app dying mid-call, Dock
 //! restart). Spawning a thread per snapshot and abandoning it on timeout leaks
 //! one thread per hang — repeated reconciliation creates unbounded hung
-//! workers. This module replaces that with ONE dedicated worker thread for
-//! the platform's entire lifetime:
+//! workers. This module provides a persistent dedicated worker thread whose
+//! owner chooses the isolation scope (global snapshot or one application):
 //!
-//! - at most ONE observation job is in flight platform-wide;
+//! - at most ONE job is in flight per worker;
 //! - a wedged worker causes fast-fail callers (bounded wait, no new threads,
 //!   nothing queued behind the hang);
 //! - the wedge is detectable (`wedged_since`); recovery occurs only after the
@@ -99,58 +99,104 @@ impl<R: Send + 'static> BoundedWorker<R> {
         self.wedged_at.get()
     }
 
-    /// Run `job` on the lone worker with a bounded wait.
-    pub fn run(&self, job: impl FnOnce() -> R + Send + 'static) -> Result<R, BoundedError> {
-        // Reap a timed-out job if it eventually completed. Recovery is then
-        // an ordinary fresh submission; while it is still running we never
-        // enqueue another closure behind it.
+    /// Submit a job without waiting for it. A worker accepts no more than one
+    /// job at a time; a late result is reaped before a new epoch is issued.
+    pub fn submit(&self, job: impl FnOnce() -> R + Send + 'static) -> Result<u64, BoundedError> {
+        self.reap_finished()?;
         if self.in_flight.get() {
-            match self.rx.try_recv() {
-                Ok(_) => {
-                    self.in_flight.set(false);
-                    self.wedged_at.set(None);
-                }
-                Err(TryRecvError::Empty) => {
-                    let since = self.wedged_at.get().unwrap_or_else(Instant::now);
-                    return Err(BoundedError::FastFail { since });
-                }
-                Err(TryRecvError::Disconnected) => return Err(BoundedError::Dead),
-            }
+            let since = self.wedged_at.get().unwrap_or_else(Instant::now);
+            return Err(BoundedError::FastFail { since });
         }
 
         let epoch = self.epoch.get().wrapping_add(1);
         self.epoch.set(epoch);
-        self.in_flight.set(true);
-
         self.tx
             .try_send(Job {
                 epoch,
                 job: Box::new(job),
             })
             .map_err(|_| BoundedError::Dead)?;
+        self.in_flight.set(true);
+        Ok(epoch)
+    }
 
+    /// Poll for the result of `epoch` without blocking. Results from older
+    /// epochs are discarded and can never be mistaken for the requested job.
+    pub fn poll(&self, epoch: u64) -> Result<Option<R>, BoundedError> {
         loop {
-            match self.rx.recv_timeout(self.job_timeout) {
-                Ok((e, result)) if e == epoch => {
+            match self.rx.try_recv() {
+                Ok((result_epoch, result)) => {
                     self.in_flight.set(false);
                     self.wedged_at.set(None);
-                    return Ok(result);
+                    if result_epoch == epoch {
+                        return Ok(Some(result));
+                    }
                 }
-                Ok(_) => {
-                    // Stale response from a pre-recovery job that finally
-                    // finished. Keep waiting for OUR epoch within the same
-                    // bounded budget.
-                    continue;
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => return Err(BoundedError::Dead),
+            }
+        }
+    }
+
+    /// Wait for `epoch` against one absolute deadline.
+    pub fn wait_until(&self, epoch: u64, deadline: Instant) -> Result<R, BoundedError> {
+        loop {
+            if let Some(result) = self.poll(epoch)? {
+                return Ok(result);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                self.mark_wedged();
+                return Err(BoundedError::Timeout);
+            };
+            match self.rx.recv_timeout(remaining) {
+                Ok((result_epoch, result)) => {
+                    self.in_flight.set(false);
+                    self.wedged_at.set(None);
+                    if result_epoch == epoch {
+                        return Ok(result);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if self.wedged_at.get().is_none() {
-                        self.wedged_at.set(Some(Instant::now()));
-                    }
+                    self.mark_wedged();
                     return Err(BoundedError::Timeout);
                 }
                 Err(RecvTimeoutError::Disconnected) => return Err(BoundedError::Dead),
             }
         }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        if self.in_flight.get() {
+            let _ = self.reap_finished();
+        }
+        !self.in_flight.get()
+    }
+
+    fn reap_finished(&self) -> Result<(), BoundedError> {
+        if !self.in_flight.get() {
+            return Ok(());
+        }
+        match self.rx.try_recv() {
+            Ok(_) => {
+                self.in_flight.set(false);
+                self.wedged_at.set(None);
+                Ok(())
+            }
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => Err(BoundedError::Dead),
+        }
+    }
+
+    fn mark_wedged(&self) {
+        if self.wedged_at.get().is_none() {
+            self.wedged_at.set(Some(Instant::now()));
+        }
+    }
+
+    /// Run `job` on the lone worker with a bounded wait.
+    pub fn run(&self, job: impl FnOnce() -> R + Send + 'static) -> Result<R, BoundedError> {
+        let epoch = self.submit(job)?;
+        self.wait_until(epoch, Instant::now() + self.job_timeout)
     }
 }
 
@@ -274,5 +320,67 @@ mod tests {
             assert_eq!(worker.run(move || i * 2).unwrap(), i * 2);
         }
         assert!(worker.wedged_since().is_none());
+    }
+
+    #[test]
+    fn all_waits_share_the_callers_absolute_deadline() {
+        let worker = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
+        let epoch = worker
+            .submit(|| {
+                std::thread::sleep(Duration::from_millis(80));
+                1
+            })
+            .unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(20);
+        assert_eq!(
+            worker.wait_until(epoch, deadline),
+            Err(BoundedError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_millis(70));
+    }
+
+    #[test]
+    fn submit_is_single_flight_and_late_result_is_reaped() {
+        let worker = BoundedWorker::new(Duration::from_millis(10), Duration::ZERO);
+        let epoch = worker
+            .submit(|| {
+                std::thread::sleep(Duration::from_millis(40));
+                1
+            })
+            .unwrap();
+        assert!(matches!(
+            worker.submit(|| 2),
+            Err(BoundedError::FastFail { .. })
+        ));
+        assert_eq!(
+            worker.wait_until(epoch, Instant::now() + Duration::from_millis(5)),
+            Err(BoundedError::Timeout)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let next = worker.submit(|| 3).unwrap();
+        assert_eq!(
+            worker.wait_until(next, Instant::now() + Duration::from_secs(1)),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn slow_worker_does_not_hide_healthy_result_at_shared_deadline() {
+        let slow = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
+        let healthy = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
+        let slow_epoch = slow
+            .submit(|| {
+                std::thread::sleep(Duration::from_millis(80));
+                1
+            })
+            .unwrap();
+        let healthy_epoch = healthy.submit(|| 2).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(
+            slow.wait_until(slow_epoch, deadline),
+            Err(BoundedError::Timeout)
+        );
+        assert_eq!(healthy.wait_until(healthy_epoch, deadline), Ok(2));
     }
 }

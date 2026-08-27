@@ -21,6 +21,14 @@
 typedef AXError (*rovr_ax_get_window_fn)(AXUIElementRef element, CGWindowID *window_id);
 static rovr_ax_get_window_fn g_ax_get_window = NULL;
 
+// Accessibility messaging is IPC to another process and may otherwise wait
+// indefinitely when that process stops servicing its AX port.
+static const float ROVR_AX_MESSAGING_TIMEOUT_SECONDS = 0.5f;
+
+static void rovr_ax_apply_timeout(AXUIElementRef element) {
+    if (element) AXUIElementSetMessagingTimeout(element, ROVR_AX_MESSAGING_TIMEOUT_SECONDS);
+}
+
 // Private SkyLight symbols. SkyLight.framework is not a linked public
 // framework, so every entry point is resolved at runtime with dlsym against
 // the default search order. A NULL pointer means the capability is absent on
@@ -91,25 +99,6 @@ static uint32_t rovr_display_for_rect(CGRect rect) {
         return 0;
     }
     return displays[0];
-}
-
-static uint32_t rovr_focused_window_id(void) {
-    if (!g_ax_get_window) return 0;
-    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
-    if (!frontmost) return 0;
-
-    AXUIElementRef app = AXUIElementCreateApplication(frontmost.processIdentifier);
-    if (!app) return 0;
-
-    CFTypeRef focused = NULL;
-    AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &focused);
-    CFRelease(app);
-    if (error != kAXErrorSuccess || !focused) return 0;
-
-    CGWindowID window_id = 0;
-    g_ax_get_window((AXUIElementRef)focused, &window_id);
-    CFRelease(focused);
-    return window_id;
 }
 
 // yabai's AX_ENHANCED_UI_WORKAROUND: Electron/Chromium set
@@ -200,16 +189,11 @@ static bool rovr_observer_registered_for_pid(pid_t pid) {
 // already runs, so callbacks are delivered there.
 static void rovr_observe_app(pid_t pid) {
     if (rovr_observer_registered_for_pid(pid)) return;
-    pthread_mutex_lock(&g_observers_lock);
-    if (g_observed_app_count >= ROVR_OBSERVER_MAX) {
-        pthread_mutex_unlock(&g_observers_lock);
-        return;
-    }
     AXUIElementRef app = AXUIElementCreateApplication(pid);
+    rovr_ax_apply_timeout(app);
     AXObserverRef observer = NULL;
     if (!app || AXObserverCreate(pid, rovr_ax_notification_handler, &observer) != kAXErrorSuccess || !observer) {
         if (app) CFRelease(app);
-        pthread_mutex_unlock(&g_observers_lock);
         return;
     }
     bool any = false;
@@ -221,7 +205,13 @@ static void rovr_observe_app(pid_t pid) {
     if (!any) {
         CFRelease(observer);
         CFRelease(app);
+        return;
+    }
+    pthread_mutex_lock(&g_observers_lock);
+    if (g_observed_app_count >= ROVR_OBSERVER_MAX) {
         pthread_mutex_unlock(&g_observers_lock);
+        CFRelease(observer);
+        CFRelease(app);
         return;
     }
     CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), kCFRunLoopDefaultMode);
@@ -233,19 +223,24 @@ static void rovr_observe_app(pid_t pid) {
 
 // Drop observer entries whose process has exited (called each snapshot).
 static void rovr_prune_observers(void) {
+    struct observed_app removed[ROVR_OBSERVER_MAX];
+    int removed_count = 0;
     pthread_mutex_lock(&g_observers_lock);
     for (int i = g_observed_app_count - 1; i >= 0; --i) {
         pid_t pid = g_observed_apps[i].pid;
         if (kill(pid, 0) == 0 || errno != ESRCH) continue;
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(g_observed_apps[i].observer), kCFRunLoopDefaultMode);
-        CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(g_observed_apps[i].observer));
-        AXObserverRemoveNotification(g_observed_apps[i].observer, g_observed_apps[i].app, kAXCreatedNotification);
-        CFRelease(g_observed_apps[i].observer);
-        CFRelease(g_observed_apps[i].app);
+        removed[removed_count++] = g_observed_apps[i];
         g_observed_apps[i] = g_observed_apps[g_observed_app_count - 1];
         g_observed_app_count--;
     }
     pthread_mutex_unlock(&g_observers_lock);
+    for (int i = 0; i < removed_count; i++) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(removed[i].observer), kCFRunLoopDefaultMode);
+        CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(removed[i].observer));
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXCreatedNotification);
+        CFRelease(removed[i].observer);
+        CFRelease(removed[i].app);
+    }
 }
 
 // Electron/Chromium accessibility enablement: these apps hide their AX tree
@@ -317,6 +312,7 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
 
     AXUIElementRef app = AXUIElementCreateApplication(target_pid);
     if (!app) return NULL;
+    rovr_ax_apply_timeout(app);
 
     CFTypeRef value = NULL;
     AXError error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
@@ -330,7 +326,6 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
         usleep(100000); // give the app a moment to build its AX tree
         error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
     }
-    CFRelease(app);
     if (error != kAXErrorSuccess || !value || CFGetTypeID(value) != CFArrayGetTypeID()) {
         if (value) CFRelease(value);
         return NULL;
@@ -343,10 +338,38 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
         CGWindowID candidate_id = 0;
         if (g_ax_get_window(window, &candidate_id) == kAXErrorSuccess && candidate_id == target_id) {
             result = (AXUIElementRef)CFRetain(window);
+            rovr_ax_apply_timeout(result);
             break;
         }
     }
     CFRelease(windows);
+
+    // Some apps (e.g. WezTerm nightly) expose no kAXWindowsAttribute array at
+    // all and ignore AXManualAccessibility, but still report their main/focused
+    // window. Match those against the target id so observation and the
+    // fullscreen/close button presses keep working for them. (Uses `app`,
+    // hence this runs before the release below.)
+    if (!result) {
+        const CFStringRef single_attrs[2] = { kAXMainWindowAttribute, kAXFocusedWindowAttribute };
+        for (int a = 0; a < 2 && !result; ++a) {
+            CFTypeRef single = NULL;
+            if (AXUIElementCopyAttributeValue(app, single_attrs[a], &single) != kAXErrorSuccess || !single) {
+                if (single) CFRelease(single);
+                continue;
+            }
+            if (CFGetTypeID(single) == AXUIElementGetTypeID()) {
+                CGWindowID candidate_id = 0;
+                if (g_ax_get_window((AXUIElementRef)single, &candidate_id) == kAXErrorSuccess &&
+                    candidate_id == target_id) {
+                    result = (AXUIElementRef)CFRetain(single);
+                    rovr_ax_apply_timeout(result);
+                }
+            }
+            CFRelease(single);
+        }
+    }
+
+    CFRelease(app);
     return result;
 }
 
@@ -523,6 +546,27 @@ static uint64_t rovr_space_id_for_window(uint32_t wid) {
 // minimized or transient). Used for cross-space window focus.
 uint64_t rovr_bridge_window_space_id(uint32_t window_id) {
     return rovr_space_id_for_window(window_id);
+}
+
+int32_t rovr_bridge_window_pid(uint32_t target_id) {
+    CFArrayRef window_info = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!window_info) return 0;
+    int32_t result = 0;
+    CFIndex count = CFArrayGetCount(window_info);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
+        CFNumberRef number = CFDictionaryGetValue(entry, kCGWindowNumber);
+        int window_id = 0;
+        if (!number || !CFNumberGetValue(number, kCFNumberIntType, &window_id) ||
+            (uint32_t)window_id != target_id) continue;
+        CFNumberRef pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
+        if (pid) CFNumberGetValue(pid, kCFNumberSInt32Type, &result);
+        break;
+    }
+    CFRelease(window_info);
+    return result;
 }
 
 // 0 = false, 1 = true, 2 = unknown (AX unavailable / race / attribute missing).
@@ -735,35 +779,26 @@ uint64_t rovr_bridge_capabilities(void) {
     return capabilities;
 }
 
-int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) {
+int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void *context) {
     if (!callback) return 1;
 
-    // Bounds for the per-snapshot caches. 512 windows / 64 apps is far beyond
-    // any real session; overflow simply leaves extra windows unrefined (they
-    // stay "unknown" on the Rust side, which is conservative and honest).
     #define ROVR_ENUM_MAX_WINDOWS 512
-    #define ROVR_ENUM_MAX_PIDS 64
-
     @autoreleasepool {
-        const uint32_t focused_window_id = rovr_focused_window_id();
         CFArrayRef list = CGWindowListCopyWindowInfo(
             kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID);
         if (!list) return 2;
 
-        // ---- Pass 1: collect candidates with the same filters as before ----
-        struct {
-            uint32_t window_id;
-            pid_t pid;
-            CGRect bounds;
-            CFDictionaryRef entry; // backed by `list`, alive through pass 3
-        } cand[ROVR_ENUM_MAX_WINDOWS];
-        int cand_count = 0;
-        pid_t pids[ROVR_ENUM_MAX_PIDS];
-        int pid_count = 0;
+        struct space_display_entry space_displays[ROVR_SPACE_DISPLAY_MAX];
+        const int space_display_count =
+            rovr_build_space_display_map(space_displays, ROVR_SPACE_DISPLAY_MAX);
+        struct window_space_entry window_spaces[ROVR_WINDOW_SPACE_MAX];
+        const int window_space_count =
+            rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
 
+        int emitted = 0;
         CFIndex count = CFArrayGetCount(list);
-        for (CFIndex i = 0; i < count && cand_count < ROVR_ENUM_MAX_WINDOWS; i++) {
+        for (CFIndex i = 0; i < count && emitted < ROVR_ENUM_MAX_WINDOWS; i++) {
             CFDictionaryRef entry = CFArrayGetValueAtIndex(list, i);
             CFNumberRef layer_number = CFDictionaryGetValue(entry, kCGWindowLayer);
             int layer = 0;
@@ -782,132 +817,25 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             if (!CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds)) continue;
             if (bounds.size.width <= 1.0 || bounds.size.height <= 1.0) continue;
 
-            cand[cand_count].window_id = (uint32_t)window_id;
-            cand[cand_count].pid = owner_pid;
-            cand[cand_count].bounds = bounds;
-            cand[cand_count].entry = entry;
-            cand_count++;
-
-            BOOL known_pid = NO;
-            for (int p = 0; p < pid_count; ++p) {
-                if (pids[p] == owner_pid) { known_pid = YES; break; }
-            }
-            if (!known_pid && pid_count < ROVR_ENUM_MAX_PIDS) {
-                pids[pid_count++] = owner_pid;
-            }
-        }
-
-        // ---- Pass 2: resolve AX elements ONCE PER APP -----------------------
-        // Previously each candidate window re-copied the full CG window list
-        // plus its app's full AX window array — O(N^2) IPC that made every
-        // snapshot cost ~350 ms and blocked the state loop behind it. One
-        // kAXWindowsAttribute query per app makes a snapshot O(apps + windows).
-        uint32_t ax_ids[ROVR_ENUM_MAX_WINDOWS];
-        AXUIElementRef ax_elems[ROVR_ENUM_MAX_WINDOWS];
-        int ax_count = 0;
-        const BOOL dbg = getenv("ROVR_BRIDGE_DEBUG") != NULL;
-        rovr_prune_observers();
-        for (int p = 0; p < pid_count; ++p) {
-            rovr_observe_app(pids[p]);
-            @autoreleasepool {
-                AXUIElementRef app = AXUIElementCreateApplication(pids[p]);
-                if (!app) continue;
-                CFTypeRef value = NULL;
-                bool got_windows =
-                    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
-                    value && CFGetTypeID(value) == CFArrayGetTypeID();
-                // Electron/Chromium apps gate their ENTIRE accessibility tree
-                // behind this flag until an assistive client asks for it.
-                // Without it their windows are invisible to us (0 windows)
-                // and can never be tiled. Setting it is harmless for apps
-                // that ignore unknown attributes. Enabled once per pid per
-                // process lifetime; the next snapshot picks up the tree.
-                if (got_windows && CFArrayGetCount((CFArrayRef)value) == 0 &&
-                    !rovr_manual_ax_already_requested(pids[p])) {
-                    rovr_ax_enable_manual_accessibility(app);
-                }
-                if (got_windows) {
-                    CFArrayRef windows = (CFArrayRef)value;
-                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: %ld ax windows\n", pids[p], (long)CFArrayGetCount(windows));
-                    for (CFIndex j = 0; j < CFArrayGetCount(windows) && ax_count < ROVR_ENUM_MAX_WINDOWS; j++) {
-                        AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(windows, j);
-                        if (!w || CFGetTypeID(w) != AXUIElementGetTypeID()) continue;
-                        CGWindowID gid = 0;
-                        if (g_ax_get_window(w, &gid) == kAXErrorSuccess && gid != 0) {
-                            ax_ids[ax_count] = (uint32_t)gid;
-                            ax_elems[ax_count] = (AXUIElementRef)CFRetain(w);
-                            ax_count++;
-                        }
-                    }
-                    CFRelease(value);
-                } else {
-                    if (!rovr_manual_ax_already_requested(pids[p])) {
-                        rovr_ax_enable_manual_accessibility(app);
-                    }
-                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: kAXWindowsAttribute failed\n", pids[p]);
-                }
-                CFRelease(app);
-            }
-        }
-        if (dbg) fprintf(stderr, "[rovr-enum] candidates=%d pids=%d ax_mapped=%d\n", cand_count, pid_count, ax_count);
-
-        // ---- Pass 3: emit windows, refining from the cached AX elements ----
-        struct space_display_entry space_displays[ROVR_SPACE_DISPLAY_MAX];
-        const int space_display_count =
-            rovr_build_space_display_map(space_displays, ROVR_SPACE_DISPLAY_MAX);
-        struct window_space_entry window_spaces[ROVR_WINDOW_SPACE_MAX];
-        const int window_space_count =
-            rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
-        for (int i = 0; i < cand_count; i++) {
-            uint32_t window_id = cand[i].window_id;
-            pid_t owner_pid = cand[i].pid;
-            CGRect bounds = cand[i].bounds;
-
             rovr_bridge_window window = {0};
-            window.id = window_id;
+            window.id = (uint32_t)window_id;
             window.pid = owner_pid;
-
-            // Best-effort AX refinement from the per-app cache. Transient
-            // windows missing from AX simply stay unknown.
-            AXUIElementRef ax_window = NULL;
-            for (int a = 0; a < ax_count; ++a) {
-                if (ax_ids[a] == window_id) { ax_window = ax_elems[a]; break; }
-            }
-
-            window.space_id = rovr_lookup_space_for_window(window_spaces, window_space_count, window_id);
-            if (window.space_id == 0 && ax_window) {
-                // Real app window missing from the on-screen map: likely
-                // MINIMIZED. Fall back to the direct (expensive) query —
-                // bounded by the number of real app windows, not all
-                // candidates, so overlays never trigger it.
-                window.space_id = rovr_space_id_for_window(window.id);
-            }
-            uint32_t space_display =
-                rovr_lookup_display_for_space(space_displays, space_display_count, window.space_id);
+            window.space_id = rovr_lookup_space_for_window(
+                window_spaces, window_space_count, window.id);
+            uint32_t space_display = rovr_lookup_display_for_space(
+                space_displays, space_display_count, window.space_id);
             window.display_id = space_display != 0 ? space_display : rovr_display_for_rect(bounds);
-            window.focused = focused_window_id == window.id ? 1 : 0;
             window.x = bounds.origin.x;
             window.y = bounds.origin.y;
             window.width = bounds.size.width;
             window.height = bounds.size.height;
-            // Conservative defaults: unknown = 2. Rust side maps unknown
-            // managed => false (don't tile), unknown minimized/fullscreen => false.
             window.minimized = 2;
             window.fullscreen = 2;
             window.managed = 2;
-
-            if (ax_window) {
-                int minimized = rovr_ax_bool_for_window(ax_window, kAXMinimizedAttribute);
-                int fullscreen = rovr_ax_bool_for_window(ax_window, CFSTR("AXFullScreen"));
-                int managed = rovr_ax_managed_for_window(ax_window);
-                window.minimized = (uint8_t)(minimized == 2 ? 2 : (minimized ? 1 : 0));
-                window.fullscreen = (uint8_t)(fullscreen == 2 ? 2 : (fullscreen ? 1 : 0));
-                window.managed = (uint8_t)(managed == 2 ? 2 : (managed ? 1 : 0));
-            }
-
-            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowOwnerName), window.app, sizeof(window.app));
-            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowName), window.title, sizeof(window.title));
-
+            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowOwnerName),
+                                window.app, sizeof(window.app));
+            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowName),
+                                window.title, sizeof(window.title));
             NSRunningApplication *application =
                 [NSRunningApplication runningApplicationWithProcessIdentifier:owner_pid];
             if (application.bundleIdentifier) {
@@ -915,15 +843,112 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
                                                maxLength:sizeof(window.bundle_id)
                                                 encoding:NSUTF8StringEncoding];
             }
-
             callback(&window, context);
+            emitted++;
         }
-
-        for (int a = 0; a < ax_count; ++a) {
-            CFRelease(ax_elems[a]);
-        }
-
         CFRelease(list);
+        return 0;
+    }
+}
+
+int rovr_bridge_refine_windows_for_pid(
+    int32_t pid,
+    rovr_ax_window_callback callback,
+    void *context) {
+    if (pid <= 0 || !callback || !g_ax_get_window) return 1;
+
+    #define ROVR_AX_MAX_WINDOWS 512
+    @autoreleasepool {
+        rovr_prune_observers();
+        rovr_observe_app(pid);
+        AXUIElementRef app = AXUIElementCreateApplication(pid);
+        if (!app) return 2;
+        rovr_ax_apply_timeout(app);
+
+        uint32_t ids[ROVR_AX_MAX_WINDOWS];
+        AXUIElementRef elements[ROVR_AX_MAX_WINDOWS];
+        int ax_count = 0;
+        CFTypeRef value = NULL;
+        bool got_windows =
+            AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
+            value && CFGetTypeID(value) == CFArrayGetTypeID();
+        if (got_windows && CFArrayGetCount((CFArrayRef)value) == 0 &&
+            !rovr_manual_ax_already_requested(pid)) {
+            rovr_ax_enable_manual_accessibility(app);
+        }
+        if (got_windows) {
+            CFArrayRef windows = (CFArrayRef)value;
+            for (CFIndex i = 0;
+                 i < CFArrayGetCount(windows) && ax_count < ROVR_AX_MAX_WINDOWS;
+                 i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                if (!window || CFGetTypeID(window) != AXUIElementGetTypeID()) continue;
+                rovr_ax_apply_timeout(window);
+                CGWindowID gid = 0;
+                if (g_ax_get_window(window, &gid) == kAXErrorSuccess && gid != 0) {
+                    ids[ax_count] = (uint32_t)gid;
+                    elements[ax_count++] = (AXUIElementRef)CFRetain(window);
+                }
+            }
+            CFRelease(value);
+        } else {
+            if (value) CFRelease(value);
+            if (!rovr_manual_ax_already_requested(pid)) {
+                rovr_ax_enable_manual_accessibility(app);
+            }
+        }
+
+        uint32_t focused_id = 0;
+        CFTypeRef focused = NULL;
+        if (AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &focused) ==
+                kAXErrorSuccess && focused &&
+            CFGetTypeID(focused) == AXUIElementGetTypeID()) {
+            g_ax_get_window((AXUIElementRef)focused, &focused_id);
+        }
+
+        if (ax_count == 0) {
+            const CFStringRef attrs[2] = { kAXMainWindowAttribute, kAXFocusedWindowAttribute };
+            for (int a = 0; a < 2 && ax_count < ROVR_AX_MAX_WINDOWS; a++) {
+                CFTypeRef single = NULL;
+                if (AXUIElementCopyAttributeValue(app, attrs[a], &single) != kAXErrorSuccess ||
+                    !single) {
+                    if (single) CFRelease(single);
+                    continue;
+                }
+                if (CFGetTypeID(single) == AXUIElementGetTypeID()) {
+                    rovr_ax_apply_timeout((AXUIElementRef)single);
+                    CGWindowID gid = 0;
+                    if (g_ax_get_window((AXUIElementRef)single, &gid) == kAXErrorSuccess &&
+                        gid != 0) {
+                        bool seen = false;
+                        for (int i = 0; i < ax_count; i++) {
+                            if (ids[i] == (uint32_t)gid) { seen = true; break; }
+                        }
+                        if (!seen) {
+                            ids[ax_count] = (uint32_t)gid;
+                            elements[ax_count++] = (AXUIElementRef)CFRetain(single);
+                        }
+                    }
+                }
+                CFRelease(single);
+            }
+        }
+        if (focused) CFRelease(focused);
+
+        for (int i = 0; i < ax_count; i++) {
+            rovr_bridge_ax_window refinement = {
+                .id = ids[i],
+                .focused = ids[i] == focused_id ? 1 : 0,
+                .minimized = (uint8_t)rovr_ax_bool_for_window(
+                    elements[i], kAXMinimizedAttribute),
+                .fullscreen = (uint8_t)rovr_ax_bool_for_window(
+                    elements[i], CFSTR("AXFullScreen")),
+                .managed = (uint8_t)rovr_ax_managed_for_window(elements[i]),
+            };
+            callback(&refinement, context);
+            CFRelease(elements[i]);
+        }
+        CFRelease(app);
         return 0;
     }
 }
@@ -966,6 +991,7 @@ int rovr_bridge_set_window_frame(
     pid_t window_pid = 0;
     AXUIElementGetPid(window, &window_pid);
     __block AXUIElementRef app = window_pid > 0 ? AXUIElementCreateApplication(window_pid) : NULL;
+    rovr_ax_apply_timeout(app);
     bool eui_toggled = false;
     if (app && rovr_ax_get_enhanced_ui(app)) {
         rovr_ax_set_enhanced_ui(app, false);
@@ -1025,6 +1051,7 @@ static int rovr_ax_press_window_button(uint32_t window_id, CFStringRef button_at
     int result = 2;
     AXUIElementRef button = NULL;
     if (AXUIElementCopyAttributeValue(window, button_attribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
+        rovr_ax_apply_timeout(button);
         if (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) {
             result = 0;
         }

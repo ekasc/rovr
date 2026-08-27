@@ -5,8 +5,12 @@ use rovr_types::LayoutKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version", rename = "config-version")]
+    pub config_version: u32,
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
@@ -21,6 +25,25 @@ pub struct Config {
     pub scratchpads: Vec<ScratchpadConfig>,
     #[serde(default, rename = "bind")]
     pub binds: Vec<KeybindConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            config_version: CURRENT_CONFIG_VERSION,
+            general: GeneralConfig::default(),
+            focus: FocusConfig::default(),
+            animations: AnimationConfig::default(),
+            workspaces: Vec::new(),
+            rules: Vec::new(),
+            scratchpads: Vec::new(),
+            binds: Vec::new(),
+        }
+    }
+}
+
+fn default_config_version() -> u32 {
+    CURRENT_CONFIG_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,9 +133,9 @@ pub struct ScratchpadConfig {
     pub app: Option<String>,
     pub title: Option<String>,
 }
-/// A keybind maps a macOS hotkey string to a rovr CLI command. The daemon does
-/// not yet register global hotkeys itself; this table is the single source of
-/// truth for skhd and for a future built-in listener. `key` uses skhd syntax
+/// A keybind maps a macOS hotkey string to a typed Rovr command. This table is
+/// the single source of truth for the built-in listener and `gen-skhd` migration
+/// output. `key` uses skhd syntax
 /// like "cmd - h" or "alt + shift - r". `command` is the rovr CLI invocation
 /// without the leading "rovr", e.g. "window focus 1" or
 /// "layout rotate --space 1".
@@ -122,17 +145,28 @@ pub struct KeybindConfig {
     pub command: String,
 }
 
-/// A rule with its regex matchers compiled once at config load/reload time.
-/// Field order mirrors [`RuleConfig`]; the Vec returned by
-/// [`Config::compile_rules`] preserves config order so evaluation is
-/// deterministic. Runtime matching MUST use these compiled regexes — not
-/// equality/substring checks — so validation and behavior cannot diverge.
+/// One typed, compiled window-selection condition. Runtime rule evaluation is
+/// exhaustive over this enum rather than coupling behavior to parallel
+/// optional fields.
+#[derive(Debug, Clone)]
+pub enum Selector {
+    App(Regex),
+    Title(Regex),
+    Workspace(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Predicate {
+    /// Every selector must match. An empty predicate matches every window.
+    pub all_of: Vec<Selector>,
+}
+
+/// A rule with its predicate compiled once at config load/reload time. The Vec
+/// returned by [`Config::compile_rules`] preserves config order so evaluation
+/// is deterministic.
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
-    pub app: Option<Regex>,
-    pub title: Option<Regex>,
-    /// Match condition: window's logical workspace name (exact).
-    pub workspace: Option<String>,
+    pub predicate: Predicate,
     #[allow(dead_code)]
     pub floating: Option<bool>,
     pub target_workspace: Option<String>,
@@ -178,6 +212,10 @@ pub enum ConfigError {
     InvalidBindCommand { key: String, reason: String },
     #[error("opacity must be between 0.0 and 1.0")]
     InvalidOpacity,
+    #[error(
+        "unsupported config-version {found}; this Rovr build supports config-version {supported}"
+    )]
+    UnsupportedConfigVersion { found: u32, supported: u32 },
 }
 
 impl Config {
@@ -193,6 +231,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.config_version != CURRENT_CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedConfigVersion {
+                found: self.config_version,
+                supported: CURRENT_CONFIG_VERSION,
+            });
+        }
         if self.general.gap < 0 {
             return Err(ConfigError::NegativeGap);
         }
@@ -280,30 +324,28 @@ impl Config {
         self.rules
             .iter()
             .map(|rule| {
-                let app =
-                    match &rule.app {
-                        Some(pattern) => Some(Regex::new(pattern).map_err(|source| {
-                            ConfigError::InvalidRegex {
-                                field: "app",
-                                source,
-                            }
-                        })?),
-                        None => None,
-                    };
-                let title =
-                    match &rule.title {
-                        Some(pattern) => Some(Regex::new(pattern).map_err(|source| {
-                            ConfigError::InvalidRegex {
-                                field: "title",
-                                source,
-                            }
-                        })?),
-                        None => None,
-                    };
+                let mut all_of = Vec::new();
+                if let Some(pattern) = &rule.app {
+                    all_of.push(Selector::App(Regex::new(pattern).map_err(|source| {
+                        ConfigError::InvalidRegex {
+                            field: "app",
+                            source,
+                        }
+                    })?));
+                }
+                if let Some(pattern) = &rule.title {
+                    all_of.push(Selector::Title(Regex::new(pattern).map_err(|source| {
+                        ConfigError::InvalidRegex {
+                            field: "title",
+                            source,
+                        }
+                    })?));
+                }
+                if let Some(workspace) = &rule.workspace {
+                    all_of.push(Selector::Workspace(workspace.clone()));
+                }
                 Ok(CompiledRule {
-                    app,
-                    title,
-                    workspace: rule.workspace.clone(),
+                    predicate: Predicate { all_of },
                     floating: rule.floating,
                     target_workspace: rule.target_workspace.clone(),
                     opacity: rule.opacity,
@@ -317,6 +359,31 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_config_version_means_version_one() {
+        let config = Config::parse("").expect("empty config uses supported defaults");
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(Config::default().config_version, CURRENT_CONFIG_VERSION);
+    }
+
+    #[test]
+    fn explicit_supported_config_version_is_accepted() {
+        let config = Config::parse("config-version = 1").expect("version one is supported");
+        assert_eq!(config.config_version, 1);
+    }
+
+    #[test]
+    fn unsupported_config_version_is_rejected() {
+        let error = Config::parse("config-version = 2").unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedConfigVersion {
+                found: 2,
+                supported: 1
+            }
+        ));
+    }
 
     #[test]
     fn accepts_valid_binds() {
@@ -557,9 +624,15 @@ mod tests {
         let rules = cfg.compile_rules().unwrap();
         assert_eq!(rules.len(), 2);
         // Deterministic order: first config rule first.
-        assert!(rules[0].app.as_ref().unwrap().is_match("Finder"));
-        assert!(!rules[0].app.as_ref().unwrap().is_match("Finder Helper"));
-        assert!(rules[1].title.as_ref().unwrap().is_match("Settings"));
+        let Selector::App(app) = &rules[0].predicate.all_of[0] else {
+            panic!("first selector must be app");
+        };
+        assert!(app.is_match("Finder"));
+        assert!(!app.is_match("Finder Helper"));
+        let Selector::Title(title) = &rules[1].predicate.all_of[0] else {
+            panic!("second rule selector must be title");
+        };
+        assert!(title.is_match("Settings"));
         assert_eq!(rules[1].target_workspace.as_deref(), Some("main"));
     }
 }

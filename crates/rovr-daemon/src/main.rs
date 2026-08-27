@@ -64,6 +64,11 @@ struct Args {
     socket: Option<PathBuf>,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Override persisted state path (useful for isolated verification)"
+    )]
+    state: Option<PathBuf>,
 }
 
 struct Envelope {
@@ -102,7 +107,7 @@ fn main() -> Result<()> {
     let _foreground = args.foreground;
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
     let config_path = args.config.unwrap_or_else(default_config_path);
-    let state_path = default_state_path();
+    let state_path = args.state.unwrap_or_else(default_state_path);
     let config = load_config_or_default(&config_path)?;
 
     let mut platform: Box<dyn Platform> = make_platform()?;
@@ -138,17 +143,7 @@ fn main() -> Result<()> {
     if let Err(err) = engine.load_state(&state_path) {
         warn!(%err, "no persisted state (first run expected)");
     }
-    match platform.snapshot() {
-        Ok(snapshot) => {
-            execute_actions(
-                &mut *platform,
-                engine.apply_event(Event::Snapshot(snapshot)),
-            );
-        }
-        Err(err) => warn!(%err, "initial platform snapshot failed"),
-    }
-
-    let daemon = Daemon {
+    let mut daemon = Daemon {
         engine,
         platform,
         config,
@@ -157,6 +152,15 @@ fn main() -> Result<()> {
         space_history: std::cell::RefCell::new(HashMap::new()),
         refresh_wake,
     };
+    match daemon.platform.snapshot() {
+        Ok(snapshot) => {
+            let actions = daemon.engine.apply_event(Event::Snapshot(snapshot));
+            if let Err(err) = execute_actions_result(&mut *daemon.platform, actions) {
+                warn!(%err, "initial platform reconciliation failed");
+            }
+        }
+        Err(err) => warn!(%err, "initial platform snapshot failed"),
+    }
 
     run_daemon(socket_path, daemon)
 }
@@ -394,6 +398,7 @@ fn state_loop(
                     tracing::info!(obs_ms, "slow periodic observation");
                 }
                 last_observed_at = std::time::Instant::now();
+                deliver_notification(&subscribers, &heartbeat_notification());
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -456,6 +461,14 @@ fn state_loop(
             deliver_notification(&subscribers, notif);
         }
     }
+}
+
+fn heartbeat_notification() -> Notification {
+    let unix_ms = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    Notification::Heartbeat { unix_ms }
 }
 
 fn deliver_notification(
@@ -836,16 +849,64 @@ impl Daemon {
                     let engine_ms = t0.elapsed().as_millis() as u64;
                     return match result {
                         Ok(actions) => {
-                            let target = actions.iter().find_map(|action| match action {
-                                Action::FocusSpace { space } => Some(*space),
-                                _ => None,
-                            });
+                            // A dynamic spawn (i3-style alt-N) registered a new
+                            // workspace — persist so it survives a restart.
+                            let spawned = actions
+                                .iter()
+                                .any(|a| matches!(a, Action::CreateSpace { .. }));
                             let t1 = std::time::Instant::now();
-                            let exec = execute_actions_result(&mut *self.platform, actions);
+                            // A known-workspace focus is one-shot and the next
+                            // periodic tick will confirm it. A dynamic spawn
+                            // is different: the CreateSpace must land, the
+                            // engine must OBSERVE the new Space, the awaited
+                            // binding must fire, and only then does the
+                            // queued FocusSpace dispatch. Without the
+                            // follow-up snapshot+apply_event the user is
+                            // stuck waiting up to one reconcile interval
+                            // (~1s) for the focus to land, with the new
+                            // Space visibly flashing in and out of focus as
+                            // the window server settles. Drive the loop
+                            // synchronously on the spawn path.
+                            let exec = if spawned {
+                                match execute_actions_result(&mut *self.platform, actions) {
+                                    Ok(()) => match self.platform.snapshot() {
+                                        Ok(snap) => {
+                                            let observed_spaces: Vec<SpaceId> =
+                                                snap.spaces.iter().map(|s| s.id).collect();
+                                            let followup =
+                                                self.engine.apply_event(Event::Snapshot(snap));
+                                            let focus_target = self
+                                                .engine
+                                                .workspaces
+                                                .backing_for(name);
+                                            tracing::info!(
+                                                workspace = %name,
+                                                observed_spaces = ?observed_spaces,
+                                                focus_target = ?focus_target,
+                                                followup_count = followup.len(),
+                                                followup = ?followup,
+                                                "workspace focus spawn followup"
+                                            );
+                                            execute_actions_result(
+                                                &mut *self.platform,
+                                                followup,
+                                            )
+                                        }
+                                        Err(err) => Err(err.into()),
+                                    },
+                                    Err(err) => Err(err),
+                                }
+                            } else {
+                                execute_actions_result(&mut *self.platform, actions)
+                            };
+                            let target_space = self.engine.workspaces.backing_for(name);
                             if exec.is_ok() {
-                                if let Some(space) = target {
+                                if let Some(space) = target_space {
                                     self.engine.note_space_focus_dispatched(space);
                                     self.note_space_switched_to(space);
+                                }
+                                if spawned {
+                                    self.persist_state();
                                 }
                             }
                             let total_ms = t0.elapsed().as_millis() as u64;
@@ -887,11 +948,21 @@ impl Daemon {
                     }
                 };
                 match result {
-                    Ok(actions) => match self.execute_and_refresh(actions) {
-                        Ok(()) => HandleResult::ok(id, json!({ "accepted": true }))
-                            .with_notifications(vec![Notification::StateChanged]),
-                        Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
-                    },
+                    Ok(actions) => {
+                        let spawned = actions
+                            .iter()
+                            .any(|a| matches!(a, Action::CreateSpace { .. }));
+                        match self.execute_and_refresh(actions) {
+                            Ok(()) => {
+                                if spawned {
+                                    self.persist_state();
+                                }
+                                HandleResult::ok(id, json!({ "accepted": true }))
+                                    .with_notifications(vec![Notification::StateChanged])
+                            }
+                            Err(err) => HandleResult::err(id, "PLATFORM_ERROR", err.to_string()),
+                        }
+                    }
                     Err(err) => HandleResult::err(id, "ENGINE_ERROR", err.to_string()),
                 }
             }
@@ -1065,10 +1136,25 @@ impl Daemon {
                             }
                             self.config = config.clone();
                             self.config_path = raw;
-                            self.engine.reload_config(config);
-                            self.persist_state();
-                            HandleResult::ok(id, json!({ "reloaded": true }))
-                                .with_notifications(vec![Notification::ConfigReloaded])
+                            match self.reload_config_and_self_heal(config) {
+                                Ok(healed_spaces) => {
+                                    self.persist_state();
+                                    HandleResult::ok(
+                                        id,
+                                        json!({
+                                            "reloaded": true,
+                                            "healed_spaces": healed_spaces,
+                                        }),
+                                    )
+                                    .with_notifications(vec![Notification::ConfigReloaded])
+                                }
+                                Err(err) => HandleResult::err(
+                                    id,
+                                    "PLATFORM_ERROR",
+                                    format!("config reloaded but topology heal failed: {err}"),
+                                )
+                                .with_notifications(vec![Notification::ConfigReloaded]),
+                            }
                         }
                         Err(err) => {
                             let msg = err.to_string();
@@ -1148,6 +1234,11 @@ impl Daemon {
                     .record("snapshot.error", err.to_string());
                 warn!(%err, "periodic snapshot failed");
             }
+        }
+        for diagnostic in self.platform.drain_diagnostics() {
+            self.engine
+                .flight_recorder
+                .record(diagnostic.kind, diagnostic.detail);
         }
         // macOS reports one focused Space per display. Process every display
         // in sorted order so HashMap iteration cannot affect recent history.
@@ -1300,17 +1391,71 @@ impl Daemon {
         }
         Ok(())
     }
+
+    /// Reset config-scoped runtime state, re-observe the real topology, and
+    /// remove empty unclaimed Spaces one at a time. Space IDs remain
+    /// authoritative; every deletion is observed as absent before another
+    /// decision, so Mission Control position compaction cannot corrupt logical
+    /// workspace identity.
+    fn reload_config_and_self_heal(&mut self, config: Config) -> Result<usize> {
+        const MAX_HEALED_SPACES: usize = 64;
+        const VERIFY_POLLS: usize = 20;
+        const VERIFY_INTERVAL: Duration = Duration::from_millis(50);
+        self.engine.reload_config(config);
+
+        for healed_spaces in 0..MAX_HEALED_SPACES {
+            self.engine.capabilities = self.platform.capabilities();
+            let snapshot = self.platform.snapshot()?;
+            if !snapshot.complete {
+                anyhow::bail!("cannot self-heal from an incomplete platform snapshot");
+            }
+            let actions = self.engine.apply_event(Event::Snapshot(snapshot));
+            let topology_mutated = actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::CreateSpace { .. }
+                        | Action::DestroySpace { .. }
+                        | Action::MoveSpace { .. }
+                )
+            });
+            if !actions.is_empty() {
+                execute_actions_result(&mut *self.platform, actions)?;
+            }
+            if topology_mutated {
+                // Persistent-workspace creation and ordinary dynamic cleanup
+                // are asynchronous. Execute once and let the normal refresh
+                // loop verify them; never issue the same topology mutation in
+                // a tight reload loop against a stale snapshot.
+                return Ok(healed_spaces);
+            }
+
+            let Some(heal) = self.engine.next_topology_heal_action() else {
+                return Ok(healed_spaces);
+            };
+            let Action::DestroySpace { space } = heal else {
+                unreachable!("topology heal only emits DestroySpace")
+            };
+            execute_actions_result(&mut *self.platform, vec![Action::DestroySpace { space }])?;
+
+            let mut verified = false;
+            for _ in 0..VERIFY_POLLS {
+                let observed = self.platform.snapshot()?;
+                if observed.complete && observed.spaces.iter().all(|item| item.id != space) {
+                    verified = true;
+                    break;
+                }
+                thread::sleep(VERIFY_INTERVAL);
+            }
+            if !verified {
+                anyhow::bail!("space {} still observed after self-heal deletion", space.0);
+            }
+        }
+
+        anyhow::bail!("topology did not converge after {MAX_HEALED_SPACES} deletions")
+    }
     fn persist_state(&self) {
         if let Err(err) = self.engine.save_state(&self.state_path) {
             warn!(%err, "failed to persist daemon state");
-        }
-    }
-}
-
-fn execute_actions(platform: &mut dyn Platform, actions: Vec<Action>) {
-    for action in actions {
-        if let Err(err) = platform.execute(&action) {
-            warn!(%err, ?action, "platform action failed");
         }
     }
 }
@@ -1359,7 +1504,7 @@ fn default_state_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rovr_platform::{MockPlatform, PlatformError};
+    use rovr_platform::{MockPlatform, PlatformDiagnostic, PlatformError};
     use rovr_protocol::ResponseOutcome;
     use rovr_types::{
         Capabilities, DisplayId, DisplaySnapshot, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot,
@@ -1374,6 +1519,14 @@ mod tests {
         assert!(!wake.request());
         wake.acknowledge();
         assert!(wake.request());
+    }
+
+    #[test]
+    fn subscription_heartbeat_is_typed_and_timestamped() {
+        assert!(matches!(
+            heartbeat_notification(),
+            Notification::Heartbeat { unix_ms } if unix_ms > 0
+        ));
     }
 
     #[test]
@@ -1537,6 +1690,249 @@ mod tests {
             self.executed.lock().unwrap().push(action.clone());
             Ok(())
         }
+    }
+
+    struct HealingPlatform {
+        snapshot: Arc<std::sync::Mutex<PlatformSnapshot>>,
+        destroyed: Arc<std::sync::Mutex<Vec<SpaceId>>>,
+    }
+
+    impl Platform for HealingPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                destroy_space: true,
+                ..Capabilities::default()
+            }
+        }
+
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            Ok(self.snapshot.lock().unwrap().clone())
+        }
+
+        fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+            if let Action::DestroySpace { space } = action {
+                self.destroyed.lock().unwrap().push(*space);
+                self.snapshot
+                    .lock()
+                    .unwrap()
+                    .spaces
+                    .retain(|candidate| candidate.id != *space);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn config_reload_self_heals_empty_orphan_spaces_one_by_one() {
+        let snapshot = Arc::new(std::sync::Mutex::new(PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![
+                SpaceSnapshot {
+                    id: SpaceId(11),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: true,
+                    generation: 1,
+                    position: 0,
+                },
+                SpaceSnapshot {
+                    id: SpaceId(12),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: false,
+                    generation: 1,
+                    position: 1,
+                },
+                SpaceSnapshot {
+                    id: SpaceId(13),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: false,
+                    generation: 1,
+                    position: 2,
+                },
+            ],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 1,
+            }],
+            complete: true,
+        }));
+        let destroyed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut daemon = test_daemon();
+        daemon.platform = Box::new(HealingPlatform {
+            snapshot: snapshot.clone(),
+            destroyed: destroyed.clone(),
+        });
+        let config = Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "1".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: None,
+                persistent: true,
+                plugin: None,
+            }],
+            ..Config::default()
+        };
+
+        let healed = daemon.reload_config_and_self_heal(config).unwrap();
+
+        assert_eq!(healed, 2);
+        assert_eq!(*destroyed.lock().unwrap(), vec![SpaceId(13), SpaceId(12)]);
+        assert_eq!(snapshot.lock().unwrap().spaces.len(), 1);
+        assert_eq!(daemon.engine.workspaces.backing_for("1"), Some(SpaceId(11)));
+    }
+
+    /// i3-style alt-N must dispatch the CreateSpace, observe the new Space,
+    /// bind it to the dynamic workspace, and emit the queued FocusSpace
+    /// synchronously — not wait one reconcile interval for the periodic
+    /// state loop to notice. Regression for the "huge delay" reported when
+    /// the fast path skipped the post-snapshot apply_event.
+    #[test]
+    fn workspace_focus_spawn_synchronous_focus_path() {
+        struct SpawnFocusPlatform {
+            snapshot: Arc<std::sync::Mutex<PlatformSnapshot>>,
+            executed: Arc<std::sync::Mutex<Vec<Action>>>,
+        }
+        impl Platform for SpawnFocusPlatform {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    create_space: true,
+                    destroy_space: true,
+                    focus_space: true,
+                    ..Capabilities::default()
+                }
+            }
+            fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+                Ok(self.snapshot.lock().unwrap().clone())
+            }
+            fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+                let mut snap = self.snapshot.lock().unwrap();
+                let mut executed = self.executed.lock().unwrap();
+                executed.push(action.clone());
+                match action {
+                    Action::CreateSpace { .. } => {
+                        let display_id = snap.spaces.first().map(|s| s.display_id);
+                        let next_id = snap.spaces.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
+                        if let Some(display) = display_id {
+                            let new_pos = snap.spaces.len() as u32;
+                            snap.spaces.push(SpaceSnapshot {
+                                id: SpaceId(next_id),
+                                display_id: display,
+                                label: None,
+                                focused: false,
+                                generation: 1,
+                                position: new_pos,
+                            });
+                        }
+                    }
+                    Action::FocusSpace { space } => {
+                        for s in snap.spaces.iter_mut() {
+                            s.focused = s.id == *space;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+        let snapshot = Arc::new(std::sync::Mutex::new(PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![SpaceSnapshot {
+                id: SpaceId(1),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 1,
+                position: 0,
+            }],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 1,
+            }],
+            complete: true,
+        }));
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "1".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: None,
+                persistent: true,
+                plugin: None,
+            }],
+            ..Config::default()
+        });
+        daemon.config = daemon.engine.config.clone();
+        daemon.platform = Box::new(SpawnFocusPlatform {
+            snapshot: snapshot.clone(),
+            executed: executed.clone(),
+        });
+        // Seed the engine's observed state from the platform snapshot so
+        // creation_anchor can find a focused Space.
+        let _ = daemon
+            .engine
+            .apply_event(Event::Snapshot(snapshot.lock().unwrap().clone()));
+
+        let result = daemon.handle(Request::new(
+            1,
+            Command::Workspace(WorkspaceCommand::Focus { name: "2".into() }),
+        ));
+        let outcome_ok = matches!(result.response.outcome, ResponseOutcome::Ok { .. });
+        if !outcome_ok {
+            let err = match result.response.outcome {
+                ResponseOutcome::Error { ref error } => {
+                    format!("{}: {}", error.code, error.message)
+                }
+                _ => "non-ok".to_string(),
+            };
+            panic!("spawn + focus must succeed, got {err}");
+        }
+
+        let executed = executed.lock().unwrap().clone();
+        let create_indexes: Vec<usize> = executed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| matches!(a, Action::CreateSpace { .. }).then_some(i))
+            .collect();
+        assert_eq!(
+            create_indexes.len(),
+            1,
+            "exactly one CreateSpace, got {executed:?}"
+        );
+        let focus_indexes: Vec<usize> = executed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| matches!(a, Action::FocusSpace { .. }).then_some(i))
+            .collect();
+        assert_eq!(
+            focus_indexes.len(),
+            1,
+            "exactly one FocusSpace must fire synchronously after the spawn, got {executed:?}"
+        );
+        assert!(
+            focus_indexes[0] > create_indexes[0],
+            "FocusSpace must come after CreateSpace: {executed:?}"
+        );
     }
 
     /// The SA can appear after startup (install/reinjection). Capabilities
@@ -1748,6 +2144,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recoverable_platform_diagnostics_enter_flight_recorder_once() {
+        let mut daemon = test_daemon();
+        daemon.platform = Box::new(MockPlatform {
+            diagnostics: vec![PlatformDiagnostic {
+                kind: "ax.refine_timeout",
+                detail: "pid=42 operation=refine error=platform worker timed out".to_string(),
+            }],
+            ..MockPlatform::default()
+        });
+
+        daemon.refresh_observation();
+        daemon.refresh_observation();
+
+        let records = daemon.engine.flight_recorder.snapshot();
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| record.kind == "ax.refine_timeout")
+            .collect();
+        assert_eq!(matching.len(), 1, "drained diagnostics must not replay");
+        assert!(matching[0].detail.contains("pid=42"));
+        assert!(matching[0].detail.contains("operation=refine"));
+    }
+
     /// `space focus-recent` focuses the previously current Space, tracked
     /// from observation. Without a tracked previous Space it errors cleanly.
     #[test]
@@ -1779,6 +2199,7 @@ mod tests {
                 complete: true,
             },
             executed: vec![],
+            diagnostics: vec![],
         };
         let mut daemon = Daemon {
             space_history: std::cell::RefCell::new(HashMap::new()),
@@ -1917,6 +2338,7 @@ mod tests {
                 complete: true,
             },
             executed: vec![],
+            diagnostics: vec![],
         });
         daemon.refresh_observation();
         daemon.note_space_switched_to(SpaceId(12));

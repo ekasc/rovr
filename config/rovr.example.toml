@@ -1,3 +1,5 @@
+config-version = 1
+
 [general]
 layout = "bsp"
 gap = 10
@@ -45,3 +47,8 @@ workspace = "chat"
 # [[bind]]
 # key = "alt - r"
 # command = "layout rotate --space 1"
+
+# Reload config and self-heal logical workspace/Space topology.
+[[bind]]
+key = "shift + alt - r"
+command = "config reload"

@@ -19,6 +19,15 @@ pub enum PlatformError {
     Operation(String),
 }
 
+/// A recoverable platform-layer failure that did not fail the enclosing
+/// operation. The daemon drains these into its bounded flight recorder so
+/// partial snapshots remain diagnosable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformDiagnostic {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
 /// Diagnostics for the automatic SA reinjection lifecycle. Exposed by
 /// `rovr doctor`; never contains secrets or privileged internals.
 #[derive(Debug, Clone)]
@@ -86,6 +95,10 @@ pub trait Platform: Send {
     /// instead of hiding it behind generic timeouts.
     fn snapshot_wedged_ms(&self) -> Option<u64> {
         None
+    }
+    /// Drain recoverable failures accumulated since the previous call.
+    fn drain_diagnostics(&mut self) -> Vec<PlatformDiagnostic> {
+        Vec::new()
     }
     /// Automatic SA reinjection lifecycle diagnostics; None on platforms
     /// without the macOS scripting addition.
