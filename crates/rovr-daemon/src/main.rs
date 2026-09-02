@@ -1391,12 +1391,36 @@ impl Daemon {
     }
 
     fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
-        execute_actions_result(&mut *self.platform, actions)?;
+        let destroy_spaces: Vec<SpaceId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::DestroySpace { space } => Some(*space),
+                _ => None,
+            })
+            .collect();
+        if let Err(e) = execute_actions_result(&mut *self.platform, actions) {
+            for space in destroy_spaces {
+                self.engine.clear_pending_destroy(space);
+            }
+            return Err(e);
+        }
         // Re-snapshot to verify mutations landed, then reconcile any residual drift.
         let snapshot = self.platform.snapshot()?;
         let followup = self.engine.apply_event(Event::Snapshot(snapshot));
         if !followup.is_empty() {
-            execute_actions_result(&mut *self.platform, followup)?;
+            let followup_destroy: Vec<SpaceId> = followup
+                .iter()
+                .filter_map(|a| match a {
+                    Action::DestroySpace { space } => Some(*space),
+                    _ => None,
+                })
+                .collect();
+            if let Err(e) = execute_actions_result(&mut *self.platform, followup) {
+                for space in followup_destroy {
+                    self.engine.clear_pending_destroy(space);
+                }
+                return Err(e);
+            }
             self.engine
                 .flight_recorder
                 .record("reconcile.verification", "followup actions executed");
@@ -1405,15 +1429,30 @@ impl Daemon {
     }
 
     fn execute_close_and_refresh(&mut self, window: WindowId, actions: Vec<Action>) -> Result<()> {
-        execute_actions_result(&mut *self.platform, actions)?;
-        // Optimistically exclude the closing window so the remaining windows
-        // retile instantly, even though CGWindowList may still report it
-        // during the AppKit close animation.
-        let mut snapshot = self.platform.snapshot()?;
-        snapshot.windows.retain(|w| w.id != window);
+        self.engine.mark_pending_close(window);
+        let res = execute_actions_result(&mut *self.platform, actions);
+        if res.is_err() {
+            self.engine.clear_pending_close(window);
+            return res;
+        }
+        let snapshot = self.platform.snapshot()?;
         let followup = self.engine.apply_event(Event::Snapshot(snapshot));
         if !followup.is_empty() {
-            execute_actions_result(&mut *self.platform, followup)?;
+            let followup_destroy: Vec<SpaceId> = followup
+                .iter()
+                .filter_map(|a| match a {
+                    Action::DestroySpace { space } => Some(*space),
+                    _ => None,
+                })
+                .collect();
+            let res2 = execute_actions_result(&mut *self.platform, followup);
+            if res2.is_err() {
+                self.engine.clear_pending_close(window);
+                for space in followup_destroy {
+                    self.engine.clear_pending_destroy(space);
+                }
+            }
+            res2?;
             self.engine
                 .flight_recorder
                 .record("reconcile.verification", "followup actions executed");

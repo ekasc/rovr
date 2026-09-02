@@ -83,6 +83,7 @@ int32_t rovr_bridge_window_pid(uint32_t window_id);
 uint64_t rovr_bridge_window_space_id(uint32_t window_id);
 int rovr_bridge_space_is_fullscreen(uint64_t space_id);
 int rovr_bridge_space_is_system(uint64_t space_id); // type==2 system space (yabai space_is_system, MIT)
+int rovr_bridge_is_display_animating(uint32_t display_id); // SLSManagedDisplayIsAnimating, 1 if animating
 int rovr_bridge_sls_managed_for_window(uint32_t window_id); // SLS fallback for background apps where AX returns Unknown (yabai level/parent check, MIT)
 int32_t rovr_bridge_dock_pid(void);
 

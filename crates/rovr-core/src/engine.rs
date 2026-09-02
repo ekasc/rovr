@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rovr_config::Config;
-use rovr_types::{Direction, DisplayId, PlatformSnapshot, Rect, SpaceId, WindowId};
+use rovr_types::{Direction, DisplayId, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot, WindowId};
 use std::path::Path;
 use thiserror::Error;
 
@@ -71,15 +71,27 @@ pub struct Engine {
     pub insets_off: bool,
     /// i3-style dynamic spawn: workspace awaiting its backing Space to
     /// materialize so the queued FocusSpace can fire (alt-N on an unknown
-    /// name registers the workspace and creates its Space).
-    pending_workspace_focus: Option<(String, u32)>,
+    /// name registers the workspace and creates its Space). Now a queue so
+    /// rapid alt-2 -> alt-3 does not overwrite.
+    pending_workspace_focus: VecDeque<(String, u32)>,
     /// Window waiting to be moved once `move-to-workspace`'s target Space
-    /// materializes (same dynamic spawn flow as above).
-    pending_workspace_move: Option<(WindowId, String)>,
+    /// materializes (same dynamic spawn flow as above). Queue for FIFO.
+    pending_workspace_move: VecDeque<(WindowId, String)>,
     /// Dynamic spawns awaiting their created Space. `before` snapshots the
     /// SpaceIds observed when the CreateSpace was requested, so the binding
     /// step can identify the NEW Space and never adopt a pre-existing one.
-    awaited_creations: Vec<AwaitedCreation>,
+    /// Serialized: only one in-flight per global at a time to avoid swap.
+    awaited_creations: VecDeque<AwaitedCreation>,
+    /// Queue for creations that arrived while another creation was in-flight.
+    /// Serialized FIFO ensures alt-2 -> alt-3 does not swap identities.
+    pending_creations: VecDeque<PendingCreationRequest>,
+    /// Windows with a CloseWindow in flight. Excluded from placement so the
+    /// remaining windows retile instantly, but kept in BSP until observation
+    /// confirms destruction (prevents churn if close is cancelled).
+    pending_close: std::collections::HashSet<WindowId>,
+    /// Spaces with a DestroySpace in flight. Workspace/layout kept until a
+    /// later complete snapshot proves the Space is gone.
+    pending_destroy: HashMap<SpaceId, String>,
     /// Post-spawn protection: recently spawned/moved-into dynamic workspaces
     /// are immune to the empty-space sweep until this instant, because focus
     /// and window arrival land asynchronously (often one observe-tick later).
@@ -90,6 +102,16 @@ struct AwaitedCreation {
     name: String,
     display: Option<DisplayId>,
     before: Vec<SpaceId>,
+}
+
+enum CreationIntent {
+    Focus,
+    MoveWindow(WindowId),
+}
+
+struct PendingCreationRequest {
+    name: String,
+    intent: CreationIntent,
 }
 
 fn load_plugins_from_disk(registry: &mut PluginRegistry) {
@@ -366,6 +388,56 @@ impl Engine {
             .ok_or(EngineError::NoFocusedSpace)
     }
 
+    fn try_start_next_pending_creation(&mut self) -> Option<Action> {
+        if !self.awaited_creations.is_empty() {
+            return None;
+        }
+        let req = self.pending_creations.pop_front()?;
+        // Workspace may have been removed via config reload while queued.
+        if !self.workspaces.0.contains_key(&req.name) {
+            return self.try_start_next_pending_creation();
+        }
+        // If it now has a backing (e.g., remap bound it), just queue the
+        // fulfillment and try next creation.
+        if let Some(space) = self.workspaces.backing_for(&req.name) {
+            if self.observed.spaces.contains_key(&space) {
+                match req.intent {
+                    CreationIntent::Focus => {
+                        self.pending_workspace_focus.push_back((req.name, 0));
+                    }
+                    CreationIntent::MoveWindow(w) => {
+                        self.pending_workspace_move.push_back((w, req.name));
+                    }
+                }
+                return self.try_start_next_pending_creation();
+            }
+        }
+        let anchor = self.creation_anchor().ok()?;
+        let display = self.observed.spaces.get(&anchor).map(|s| s.display_id);
+        self.awaited_creations.push_back(AwaitedCreation {
+            name: req.name.clone(),
+            display,
+            before: self.observed.spaces.keys().copied().collect(),
+        });
+        match req.intent {
+            CreationIntent::Focus => self.pending_workspace_focus.push_back((req.name, 0)),
+            CreationIntent::MoveWindow(w) => self.pending_workspace_move.push_back((w, req.name)),
+        }
+        Some(Action::CreateSpace { anchor })
+    }
+
+    pub fn mark_pending_close(&mut self, window: WindowId) {
+        self.pending_close.insert(window);
+    }
+
+    pub fn clear_pending_close(&mut self, window: WindowId) {
+        self.pending_close.remove(&window);
+    }
+
+    pub fn clear_pending_destroy(&mut self, space: SpaceId) {
+        self.pending_destroy.remove(&space);
+    }
+
     /// Register `name` as an i3-style dynamic (non-persistent) workspace if it
     /// is unknown. Returns false when a PERSISTENT workspace of that name has
     /// no backing — its recreation belongs to the snapshot lifecycle, and a
@@ -399,7 +471,8 @@ impl Engine {
         if self.awaited_creations.is_empty() {
             return;
         }
-        let mut still_awaited: Vec<AwaitedCreation> = Vec::new();
+        let mut still_awaited: VecDeque<AwaitedCreation> = VecDeque::new();
+        // Deterministic: sort candidates by position, id so same-display creations don't swap.
         for awaited in std::mem::take(&mut self.awaited_creations) {
             let AwaitedCreation {
                 name,
@@ -418,7 +491,7 @@ impl Engine {
                 .values()
                 .filter_map(|w| w.backing_space)
                 .collect();
-            let pick = self
+            let mut candidates: Vec<&SpaceSnapshot> = self
                 .observed
                 .spaces
                 .values()
@@ -428,6 +501,10 @@ impl Engine {
                         && !claimed.contains(&s.id)
                         && !before.contains(&s.id)
                 })
+                .collect();
+            candidates.sort_by_key(|s| (s.position, s.id));
+            let pick = candidates
+                .into_iter()
                 .find(|s| match desired_display {
                     Some(d) => s.display_id == *d,
                     None => true,
@@ -443,7 +520,7 @@ impl Engine {
                         format!("workspace {name} bound to created space {sid:?}"),
                     );
                 }
-                None => still_awaited.push(awaited),
+                None => still_awaited.push_back(awaited),
             }
         }
         self.awaited_creations = still_awaited;
@@ -504,8 +581,16 @@ impl Engine {
         }
         let freshly_bound: std::collections::HashSet<&str> =
             moves.iter().map(|m| m.name.as_str()).collect();
-        let pending_focus = self.pending_workspace_focus.clone().map(|(n, _)| n);
-        let pending_move = self.pending_workspace_move.clone();
+        let pending_focus_names: std::collections::HashSet<&str> = self
+            .pending_workspace_focus
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let pending_move_names: std::collections::HashSet<&str> = self
+            .pending_workspace_move
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
         let mut doomed: Vec<(String, SpaceId)> = Vec::new();
         let mut stale_dynamic: Vec<String> = Vec::new();
         for (name, ws) in &self.workspaces.0 {
@@ -516,8 +601,8 @@ impl Engine {
                 continue;
             };
             if freshly_bound.contains(name.as_str())
-                || pending_focus.as_deref() == Some(name.as_str())
-                || pending_move.iter().any(|(_, n)| n == name)
+                || pending_focus_names.contains(name.as_str())
+                || pending_move_names.contains(name.as_str())
                 || self
                     .dynamic_grace
                     .get(name)
@@ -570,9 +655,10 @@ impl Engine {
             .retain(|name, _| self.workspaces.0.contains_key(name));
         let mut actions = Vec::with_capacity(doomed.len());
         for (name, sid) in doomed {
-            self.workspaces.0.remove(&name);
-            self.layouts.remove(&sid);
-            self.dynamic_grace.remove(&name);
+            if self.pending_destroy.contains_key(&sid) {
+                continue;
+            }
+            self.pending_destroy.insert(sid, name.clone());
             self.flight_recorder.record(
                 "workspace.destroy_empty",
                 format!("workspace {name}: backing space empty and unfocused"),
@@ -591,15 +677,11 @@ impl Engine {
     /// before the very first attempt lands. Pending entries whose workspace
     /// disappeared (config reload) are dropped.
     fn fulfill_pending_workspace_actions(&mut self, out: &mut Vec<Action>) {
-        if let Some((name, attempts)) = self.pending_workspace_focus.clone() {
+        if let Some((name, attempts)) = self.pending_workspace_focus.front().cloned() {
             match self.workspaces.backing_for(&name) {
                 Some(space) => {
                     if attempts == 0 {
-                        // First time we see the bound Space: fire once and
-                        // clear. The platform retries transiently inside
-                        // execute_focus_space; the engine never re-issues
-                        // the same FocusSpace on its own.
-                        self.pending_workspace_focus = None;
+                        self.pending_workspace_focus.pop_front();
                         let reorder = self.numeric_workspace_reorder_action(&name, space);
                         self.dynamic_grace.insert(
                             name,
@@ -610,30 +692,26 @@ impl Engine {
                         }
                         out.push(Action::FocusSpace { space });
                     } else if self.observed.spaces.get(&space).is_some_and(|s| s.focused) {
-                        // A prior attempt finally confirmed.
-                        self.pending_workspace_focus = None;
+                        self.pending_workspace_focus.pop_front();
                         self.dynamic_grace.insert(
                             name,
                             std::time::Instant::now() + self.dynamic_grace_duration(),
                         );
                     } else {
-                        // A prior attempt did not stick. Stop fighting the
-                        // user's manual navigation; the next alt-N reissues
-                        // the focus through the normal hotkey path.
-                        self.pending_workspace_focus = None;
+                        self.pending_workspace_focus.pop_front();
                     }
                 }
                 None => {
                     if !self.workspaces.0.contains_key(&name) {
-                        self.pending_workspace_focus = None;
+                        self.pending_workspace_focus.pop_front();
                     }
                 }
             }
         }
-        if let Some((window, name)) = self.pending_workspace_move.clone() {
+        if let Some((window, name)) = self.pending_workspace_move.front().cloned() {
             match self.workspaces.backing_for(&name) {
                 Some(space) => {
-                    self.pending_workspace_move = None;
+                    self.pending_workspace_move.pop_front();
                     let reorder = self.numeric_workspace_reorder_action(&name, space);
                     self.dynamic_grace.insert(
                         name,
@@ -646,7 +724,7 @@ impl Engine {
                 }
                 None => {
                     if !self.workspaces.0.contains_key(&name) {
-                        self.pending_workspace_move = None;
+                        self.pending_workspace_move.pop_front();
                     }
                 }
             }
@@ -715,9 +793,12 @@ impl Engine {
         self.workspaces.ensure_from_config(&self.config.workspaces);
         // Reload is also a lifecycle reset. Never let an in-flight create,
         // focus retry, or grace timer act on topology from the old config.
-        self.pending_workspace_focus = None;
-        self.pending_workspace_move = None;
+        self.pending_workspace_focus.clear();
+        self.pending_workspace_move.clear();
         self.awaited_creations.clear();
+        self.pending_creations.clear();
+        self.pending_close.clear();
+        self.pending_destroy.clear();
         self.dynamic_grace.clear();
         let moves = self
             .workspaces
@@ -738,7 +819,10 @@ impl Engine {
     /// forces the daemon to re-observe after every deletion before deciding
     /// the next repair.
     pub fn next_topology_heal_action(&self) -> Option<Action> {
-        if !self.capabilities.destroy_space || !self.awaited_creations.is_empty() {
+        if !self.capabilities.destroy_space
+            || !self.awaited_creations.is_empty()
+            || !self.pending_creations.is_empty()
+        {
             return None;
         }
 
@@ -780,10 +864,32 @@ impl Engine {
     pub fn apply_event(&mut self, event: Event) -> Vec<Action> {
         self.flight_recorder.record("event", format!("{event:?}"));
 
+        let is_snapshot = matches!(&event, Event::Snapshot(_));
         let mut lifecycle_action: Vec<Action> = Vec::new();
         match event {
             Event::Snapshot(snapshot) => {
                 self.apply_snapshot(snapshot);
+                // Confirm pending destroys: Space gone => actually remove workspace/layout.
+                let mut confirmed_destroys = Vec::new();
+                for space in self.pending_destroy.keys() {
+                    if !self.observed.spaces.contains_key(space) {
+                        confirmed_destroys.push(*space);
+                    }
+                }
+                for space in confirmed_destroys {
+                    if let Some(name) = self.pending_destroy.remove(&space) {
+                        if let Some(ws) = self.workspaces.0.remove(&name) {
+                            if let Some(sid) = ws.backing_space {
+                                self.layouts.remove(&sid);
+                            }
+                        }
+                        self.dynamic_grace.remove(&name);
+                    }
+                }
+                // Pending close: keep for this layout's instant retile, but if window already
+                // gone, clear it now; otherwise it will be cleared after layout for cancel case.
+                self.pending_close
+                    .retain(|w| self.observed.windows.contains_key(w));
                 self.reconcile_space_cursors();
                 self.bind_awaited_dynamic_spaces();
                 let moves = self
@@ -794,22 +900,29 @@ impl Engine {
                 self.apply_remap_moves(&moves);
                 let mut lifecycle_actions = self.destroy_empty_dynamic_workspaces(&moves);
                 self.fulfill_pending_workspace_actions(&mut lifecycle_actions);
+                if let Some(next) = self.try_start_next_pending_creation() {
+                    lifecycle_actions.push(next);
+                }
                 // Blocker 4: recreate missing persistent workspaces. One
                 // CreateSpace per cycle, lowest ordinal first; the new Space's
                 // real id is only learned by OBSERVING the next snapshot, and
                 // deterministic remap then binds it to the logical workspace.
-                if let Some(anchor) = self.persistent_creation_anchor() {
-                    self.flight_recorder.record(
-                        "workspace.create_persistent",
-                        "missing persistent workspace — requesting CreateSpace",
-                    );
-                    lifecycle_actions.push(Action::CreateSpace { anchor });
+                // Guarded by in-flight state to avoid leaking extra desktops.
+                if self.awaited_creations.is_empty() && self.pending_creations.is_empty() {
+                    if let Some(anchor) = self.persistent_creation_anchor() {
+                        self.flight_recorder.record(
+                            "workspace.create_persistent",
+                            "missing persistent workspace — requesting CreateSpace",
+                        );
+                        lifecycle_actions.push(Action::CreateSpace { anchor });
+                    }
                 }
                 lifecycle_action = lifecycle_actions;
             }
             Event::WindowDestroyed { window } => {
                 self.observed.windows.remove(&window);
                 self.desired.windows.remove(&window);
+                self.pending_close.remove(&window);
             }
             Event::SpaceDestroyed { space } => {
                 self.observed.spaces.remove(&space);
@@ -817,6 +930,14 @@ impl Engine {
                     if target.space == Some(space) {
                         target.space = None;
                     }
+                }
+                if let Some(name) = self.pending_destroy.remove(&space) {
+                    if let Some(ws) = self.workspaces.0.remove(&name) {
+                        if let Some(sid) = ws.backing_space {
+                            self.layouts.remove(&sid);
+                        }
+                    }
+                    self.dynamic_grace.remove(&name);
                 }
             }
             Event::DisplayRemoved { display } => {
@@ -839,7 +960,15 @@ impl Engine {
             &self.scratchpads,
             &self.rules,
             self.insets_off,
+            &self.pending_close,
         );
+        if is_snapshot && !self.pending_close.is_empty() {
+            // Pending close was used for this snapshot's instant retile. Clear it
+            // so a cancelled close (window still observed) retires correctly next cycle.
+            // Windows that were actually destroyed are already gone from observed and
+            // pending_close was retained only for those still present, so clearing is safe.
+            self.pending_close.clear();
+        }
 
         let mut actions = reconcile(&self.observed, &self.desired);
         actions.extend(lifecycle_action);
@@ -1154,18 +1283,29 @@ impl Engine {
         if !self.ensure_dynamic_workspace(name) {
             return Err(EngineError::WorkspaceNoBacking(name.to_string()));
         }
-        // Already spawning this one: a second CreateSpace would leak an
-        // extra empty desktop.
-        if self.pending_workspace_focus.iter().any(|(n, _)| n == name) {
+        // Already queued or in-flight for this workspace: don't create duplicate.
+        if self.pending_workspace_focus.iter().any(|(n, _)| n == name)
+            || self.pending_creations.iter().any(|r| r.name == name)
+            || self.awaited_creations.iter().any(|a| a.name == name)
+        {
+            return Ok(vec![]);
+        }
+        // Serialized: only one Space creation in-flight globally to avoid swap.
+        if !self.awaited_creations.is_empty() {
+            self.pending_creations.push_back(PendingCreationRequest {
+                name: name.to_string(),
+                intent: CreationIntent::Focus,
+            });
             return Ok(vec![]);
         }
         let anchor = self.creation_anchor()?;
-        self.awaited_creations.push(AwaitedCreation {
+        self.awaited_creations.push_back(AwaitedCreation {
             name: name.to_string(),
             display: Some(self.observed.spaces[&anchor].display_id),
             before: self.observed.spaces.keys().copied().collect(),
         });
-        self.pending_workspace_focus = Some((name.to_string(), 0));
+        self.pending_workspace_focus
+            .push_back((name.to_string(), 0));
         Ok(vec![Action::CreateSpace { anchor }])
     }
 
@@ -1187,18 +1327,28 @@ impl Engine {
         if !self.ensure_dynamic_workspace(name) {
             return Err(EngineError::WorkspaceNoBacking(name.to_string()));
         }
-        // The Space must exist before the window can move to it; queue the
-        // move for when the created Space is observed and bound.
-        if self.pending_workspace_move.iter().any(|(_, n)| n == name) {
+        // Already queued or in-flight for this workspace: don't create duplicate.
+        if self.pending_workspace_move.iter().any(|(_, n)| n == name)
+            || self.pending_creations.iter().any(|r| r.name == name)
+            || self.awaited_creations.iter().any(|a| a.name == name)
+        {
+            return Ok(vec![]);
+        }
+        if !self.awaited_creations.is_empty() {
+            self.pending_creations.push_back(PendingCreationRequest {
+                name: name.to_string(),
+                intent: CreationIntent::MoveWindow(window),
+            });
             return Ok(vec![]);
         }
         let anchor = self.creation_anchor()?;
-        self.awaited_creations.push(AwaitedCreation {
+        self.awaited_creations.push_back(AwaitedCreation {
             name: name.to_string(),
             display: Some(self.observed.spaces[&anchor].display_id),
             before: self.observed.spaces.keys().copied().collect(),
         });
-        self.pending_workspace_move = Some((window, name.to_string()));
+        self.pending_workspace_move
+            .push_back((window, name.to_string()));
         Ok(vec![Action::CreateSpace { anchor }])
     }
 
@@ -1667,6 +1817,7 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         let f2 = desired.windows[&WindowId(2)].frame.unwrap();
@@ -1692,6 +1843,7 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
         let g1 = desired2.windows[&WindowId(1)].frame.unwrap();
         let g2 = desired2.windows[&WindowId(2)].frame.unwrap();
@@ -2412,8 +2564,23 @@ mod tests {
             "empty unfocused dynamic workspace must be destroyed"
         );
         assert!(
+            engine.workspaces.0.contains_key("2"),
+            "workspace kept pending until Space gone"
+        );
+        assert!(
+            engine.pending_destroy.contains_key(&SpaceId(20)),
+            "pending destroy"
+        );
+        let gone = PlatformSnapshot {
+            windows: vec![window_on_space(1, 11)],
+            spaces: vec![space_snap(11, 1, 0, true)],
+            displays: vec![display_snap(1)],
+            complete: true,
+        };
+        engine.apply_event(Event::Snapshot(gone));
+        assert!(
             !engine.workspaces.0.contains_key("2"),
-            "forgotten after destruction"
+            "forgotten after destruction confirmed"
         );
 
         // ...and alt-2 spawns it fresh again.
@@ -2734,6 +2901,7 @@ mod tests {
             &crate::layout_state::ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
         let f1 = desired.windows[&WindowId(1)].frame.unwrap();
         assert!(f1.x > 50.0, "window 1 must now be on the right: {f1:?}");

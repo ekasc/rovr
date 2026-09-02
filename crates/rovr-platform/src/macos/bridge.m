@@ -1345,107 +1345,39 @@ int rovr_bridge_close_window(uint32_t window_id) {
 }
 
 int rovr_bridge_toggle_fullscreen(uint32_t window_id) {
-    // Adapted from yabai window_manager_toggle_window_native_fullscreen (MIT, © Åsmund Vikane).
-    // Uses AXFullScreen attribute directly (reliable for Chrome/dialogs/no-resizable windows)
-    // with Enhanced UI workaround, focus+wait, and post-toggle animation wait.
-    // Falls back to pressing the fullscreen button if attribute set fails.
+    // AX-only mutation. Focus and transition settling are handled outside the 150ms AX worker
+    // (see mod.rs ToggleNativeFullscreen). Keeps the worker deadline tight.
     pid_t pid = 0;
     AXUIElementRef window = rovr_ax_window_for_id(window_id, &pid);
     if (!window) return 1;
-
-    // Focus first so space switch happens before toggling.
-    @autoreleasepool {
-        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-        [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-    }
-    AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
-
-    // Bounded wait for window's Space to become current (~1.5s, 50ms poll).
-    uint64_t sid = rovr_space_id_for_window(window_id);
-    if (sid != 0) {
-        for (int i = 0; i < 30; i++) {
-            uint64_t cur = rovr_bridge_current_space_for_space(sid);
-            if (cur == sid) break;
-            usleep(50000);
-        }
-    }
-
-    // Read current AXFullScreen.
     bool is_fullscreen = false;
     CFTypeRef fv = NULL;
     if (AXUIElementCopyAttributeValue(window, CFSTR("AXFullScreen"), &fv) == kAXErrorSuccess && fv) {
-        if (CFGetTypeID(fv) == CFBooleanGetTypeID()) {
-            is_fullscreen = CFBooleanGetValue((CFBooleanRef)fv);
-        }
+        if (CFGetTypeID(fv) == CFBooleanGetTypeID()) is_fullscreen = CFBooleanGetValue((CFBooleanRef)fv);
         CFRelease(fv);
     }
-
-    // Enhanced UI workaround around the set.
     AXUIElementRef appElem = pid > 0 ? AXUIElementCreateApplication(pid) : NULL;
     if (appElem) rovr_ax_apply_timeout(appElem);
     bool eui = appElem ? rovr_ax_get_enhanced_ui(appElem) : false;
     if (eui) rovr_ax_set_enhanced_ui(appElem, false);
-
     AXError setErr = AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), is_fullscreen ? kCFBooleanFalse : kCFBooleanTrue);
-
     if (eui) rovr_ax_set_enhanced_ui(appElem, true);
     if (appElem) CFRelease(appElem);
-
     int result = 0;
     if (setErr != kAXErrorSuccess) {
-        // Fallback to button press (preserve old path).
         AXUIElementRef button = NULL;
         if (AXUIElementCopyAttributeValue(window, kAXFullScreenButtonAttribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
             rovr_ax_apply_timeout(button);
             result = (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) ? 0 : 3;
             CFRelease(button);
-        } else {
-            result = 2;
-        }
+        } else result = 2;
     }
     CFRelease(window);
-
-    // Wait for transition. Monterey+ poll space_is_user(active), older poll SLSManagedDisplayIsAnimating.
-    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
-    bool isMontereyPlus = v.majorVersion >= 12;
-    if (isMontereyPlus) {
-        if (g_sls_space_get_type && g_sls_main_connection && sid != 0) {
-            for (int i = 0; i < 15; i++) {
-                uint64_t active = rovr_bridge_current_space_for_space(sid);
-                if (active != 0 && g_sls_space_get_type(g_sls_main_connection(), active) == 0) break;
-                usleep(100000);
-            }
-        } else if (g_sls_managed_display_is_animating && g_sls_main_connection && sid != 0) {
-            CFStringRef uuid = g_sls_copy_managed_display_for_space ? g_sls_copy_managed_display_for_space(g_sls_main_connection(), sid) : NULL;
-            if (uuid) {
-                for (int i = 0; i < 15; i++) {
-                    if (!g_sls_managed_display_is_animating(g_sls_main_connection(), uuid)) break;
-                    usleep(100000);
-                }
-                CFRelease(uuid);
-            } else {
-                usleep(300000);
-            }
-        } else {
-            usleep(300000);
-        }
-    } else {
-        if (g_sls_managed_display_is_animating && g_sls_main_connection && sid != 0) {
-            CFStringRef uuid = g_sls_copy_managed_display_for_space ? g_sls_copy_managed_display_for_space(g_sls_main_connection(), sid) : NULL;
-            if (uuid) {
-                for (int i = 0; i < 15; i++) {
-                    if (!g_sls_managed_display_is_animating(g_sls_main_connection(), uuid)) break;
-                    usleep(100000);
-                }
-                CFRelease(uuid);
-            } else {
-                usleep(300000);
-            }
-        } else {
-            usleep(300000);
-        }
-    }
     return result;
+}
+
+int rovr_bridge_is_display_animating(uint32_t display_id) {
+    return rovr_display_is_animating(display_id) ? 1 : 0;
 }
 
 int32_t rovr_bridge_dock_pid(void) {
