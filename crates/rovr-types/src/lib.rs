@@ -138,6 +138,10 @@ pub struct SpaceSnapshot {
     pub focused: bool,
     pub generation: u64,
     pub position: u32,
+    #[serde(default)]
+    pub is_fullscreen: bool,
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

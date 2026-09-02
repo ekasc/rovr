@@ -45,6 +45,8 @@ typedef CFArrayRef (*rovr_sls_copy_spaces_for_windows_fn)(int cid, int selector,
 typedef int64_t (*rovr_sls_perform_async_bridged_op_fn)(void *operation);
 typedef CGError (*rovr_sls_set_active_menu_bar_display_identifier_fn)(int cid, CFStringRef uuid, CFStringRef uuid2);
 typedef CFStringRef (*rovr_sls_copy_active_menu_bar_display_identifier_fn)(int cid);
+typedef bool (*rovr_sls_managed_display_is_animating_fn)(int cid, CFStringRef uuid);
+typedef CGError (*rovr_sls_register_notify_fn)(int cid, void *handler, uint32_t event, void *context);
 
 static rovr_sls_main_connection_fn g_sls_main_connection = NULL;
 static rovr_sls_copy_managed_display_spaces_fn g_sls_copy_managed_display_spaces = NULL;
@@ -60,6 +62,34 @@ static rovr_sls_perform_async_bridged_op_fn g_sls_perform_async_bridged_op = NUL
 // so cross-display Space switches actually bring the other display forward.
 static rovr_sls_set_active_menu_bar_display_identifier_fn g_sls_set_active_menu_bar_display_identifier = NULL;
 static rovr_sls_copy_active_menu_bar_display_identifier_fn g_sls_copy_active_menu_bar_display_identifier = NULL;
+static rovr_sls_managed_display_is_animating_fn g_sls_managed_display_is_animating = NULL;
+static rovr_sls_register_notify_fn g_sls_register_notify = NULL;
+typedef CFTypeRef (*rovr_sls_window_query_fn)(int cid, CFArrayRef windows, int count);
+typedef CFTypeRef (*rovr_sls_window_query_copy_fn)(CFTypeRef query);
+typedef int (*rovr_sls_window_iter_count_fn)(CFTypeRef iter);
+typedef bool (*rovr_sls_window_iter_advance_fn)(CFTypeRef iter);
+typedef uint32_t (*rovr_sls_window_iter_parent_fn)(CFTypeRef iter);
+typedef int (*rovr_sls_window_iter_level_fn)(CFTypeRef iter);
+typedef CGError (*rovr_sls_get_menu_autohide_fn)(int cid, int *enabled);
+typedef CGError (*rovr_sls_get_revealed_menu_bounds_fn)(CGRect *rect, int cid, uint64_t sid);
+typedef CGError (*rovr_sls_get_display_menubar_height_fn)(uint32_t did, uint32_t *height);
+typedef CGError (*rovr_sls_get_dock_rect_fn)(int cid, CGRect *rect, int *reason);
+typedef Boolean (*rovr_core_dock_autohide_fn)(void);
+typedef void (*rovr_core_dock_orient_fn)(int *orientation, int *pinning);
+typedef CGError (*rovr_sls_request_notifications_fn)(int cid, uint32_t *window_list, int window_count);
+static rovr_sls_window_query_fn g_sls_window_query = NULL;
+static rovr_sls_window_query_copy_fn g_sls_window_query_copy = NULL;
+static rovr_sls_window_iter_count_fn g_sls_window_iter_count = NULL;
+static rovr_sls_window_iter_advance_fn g_sls_window_iter_advance = NULL;
+static rovr_sls_window_iter_parent_fn g_sls_window_iter_parent = NULL;
+static rovr_sls_window_iter_level_fn g_sls_window_iter_level = NULL;
+static rovr_sls_get_menu_autohide_fn g_sls_get_menu_autohide = NULL;
+static rovr_sls_get_revealed_menu_bounds_fn g_sls_get_revealed_menu = NULL;
+static rovr_sls_get_display_menubar_height_fn g_sls_get_menubar_height = NULL;
+static rovr_sls_get_dock_rect_fn g_sls_get_dock_rect = NULL;
+static rovr_core_dock_autohide_fn g_core_dock_autohide = NULL;
+static rovr_core_dock_orient_fn g_core_dock_orient = NULL;
+static rovr_sls_request_notifications_fn g_sls_request_notifications = NULL;
 
 static _Atomic int g_needs_refresh = 0;
 
@@ -173,6 +203,19 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
     // _AXUIElementGetWindow, e.g. error -25212), otherwise those focus
     // changes are silently lost and the daemon serves stale state.
     g_event_trampoline(kind, have_gid ? (uint32_t)gid : 0);
+}
+
+// SLS connection notify handler (yabai mission_control.c: connection_handler, MIT, Åsmund Vikane).
+// Space create/destroy (1327/1328), window ordered/destroyed (808/804), mission control enter (1204).
+static void rovr_sls_connection_handler(uint32_t type, void *data, size_t data_length, void *context, int cid) {
+    (void)data;
+    (void)data_length;
+    (void)context;
+    (void)cid;
+    if (type == 1327 || type == 1328 || type == 808 || type == 804 || type == 1204) {
+        atomic_store(&g_needs_refresh, 1);
+        if (g_event_trampoline) g_event_trampoline(1, 0);
+    }
 }
 
 static bool rovr_observer_registered_for_pid(pid_t pid) {
@@ -747,6 +790,31 @@ int rovr_bridge_init(void) {
     g_sls_copy_active_menu_bar_display_identifier =
         (rovr_sls_copy_active_menu_bar_display_identifier_fn)dlsym(
             RTLD_DEFAULT, "SLSCopyActiveMenuBarDisplayIdentifier");
+    g_sls_managed_display_is_animating =
+        (rovr_sls_managed_display_is_animating_fn)dlsym(RTLD_DEFAULT, "SLSManagedDisplayIsAnimating");
+    g_sls_window_query = (rovr_sls_window_query_fn)dlsym(RTLD_DEFAULT, "SLSWindowQueryWindows");
+    g_sls_window_query_copy = (rovr_sls_window_query_copy_fn)dlsym(RTLD_DEFAULT, "SLSWindowQueryResultCopyWindows");
+    g_sls_window_iter_count = (rovr_sls_window_iter_count_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetCount");
+    g_sls_window_iter_advance = (rovr_sls_window_iter_advance_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorAdvance");
+    g_sls_window_iter_parent = (rovr_sls_window_iter_parent_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetParentID");
+    g_sls_window_iter_level = (rovr_sls_window_iter_level_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetLevel");
+    g_sls_get_menu_autohide = (rovr_sls_get_menu_autohide_fn)dlsym(RTLD_DEFAULT, "SLSGetMenuBarAutohideEnabled");
+    g_sls_get_revealed_menu = (rovr_sls_get_revealed_menu_bounds_fn)dlsym(RTLD_DEFAULT, "SLSGetRevealedMenuBarBounds");
+    g_sls_get_menubar_height = (rovr_sls_get_display_menubar_height_fn)dlsym(RTLD_DEFAULT, "SLSGetDisplayMenubarHeight");
+    g_sls_get_dock_rect = (rovr_sls_get_dock_rect_fn)dlsym(RTLD_DEFAULT, "SLSGetDockRectWithReason");
+    g_core_dock_autohide = (rovr_core_dock_autohide_fn)dlsym(RTLD_DEFAULT, "CoreDockGetAutoHideEnabled");
+    g_core_dock_orient = (rovr_core_dock_orient_fn)dlsym(RTLD_DEFAULT, "CoreDockGetOrientationAndPinning");
+    g_sls_request_notifications = (rovr_sls_request_notifications_fn)dlsym(RTLD_DEFAULT, "SLSRequestNotificationsForWindows");
+    g_sls_register_notify =
+        (rovr_sls_register_notify_fn)dlsym(RTLD_DEFAULT, "SLSRegisterConnectionNotifyProc");
+    if (g_sls_register_notify && g_sls_main_connection) {
+        int cid = g_sls_main_connection();
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1327, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1328, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 808, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 804, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1204, NULL);
+    }
     g_sls_perform_async_bridged_op = (rovr_sls_perform_async_bridged_op_fn)rovr_macho_find_symbol(
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
@@ -802,6 +870,7 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
             rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
 
         int emitted = 0;
+        uint32_t emitted_ids[ROVR_ENUM_MAX_WINDOWS] = {0};
         CFIndex count = CFArrayGetCount(list);
         for (CFIndex i = 0; i < count && emitted < ROVR_ENUM_MAX_WINDOWS; i++) {
             CFDictionaryRef entry = CFArrayGetValueAtIndex(list, i);
@@ -849,7 +918,16 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
                                                 encoding:NSUTF8StringEncoding];
             }
             callback(&window, context);
+            emitted_ids[emitted] = window.id;
             emitted++;
+        }
+        // SLS window notifications on Sequoia+ (yabai update_window_notifications, MIT) — enables 804/808 events.
+        if (emitted > 0 && g_sls_request_notifications && g_sls_main_connection) {
+            NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+            if (v.majorVersion >= 15) {
+                int cid = g_sls_main_connection();
+                g_sls_request_notifications(cid, emitted_ids, emitted);
+            }
         }
         CFRelease(list);
         return 0;
@@ -958,18 +1036,214 @@ int rovr_bridge_refine_windows_for_pid(
     }
 }
 
+// Adapted from yabai display_bounds_constrained (MIT, Åsmund Vikane).
+// Usable area excluding dock/menubar/notch. Tries private SLS path for accuracy
+// (hidden menubar + notch, dock orientation) and falls back to NSScreen visibleFrame.
+static int rovr_display_notch_height(uint32_t did) {
+    if (!CGDisplayIsBuiltin(did)) return 0;
+    if (@available(macos 12.0, *)) {
+        for (NSScreen *screen in [NSScreen screens]) {
+            NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+            if (num && [num unsignedIntValue] == did) {
+                return (int)round(screen.safeAreaInsets.top);
+            }
+        }
+    }
+    return 0;
+}
+
+static bool rovr_menu_bar_hidden(void) {
+    if (g_sls_get_menu_autohide && g_sls_main_connection) {
+        int enabled = 0;
+        if (g_sls_get_menu_autohide(g_sls_main_connection(), &enabled) == kCGErrorSuccess) return enabled != 0;
+    }
+    return false;
+}
+
+static bool rovr_dock_hidden(void) {
+    if (g_core_dock_autohide) return g_core_dock_autohide();
+    return false;
+}
+
+static CGRect rovr_display_constrained_bounds(CGDirectDisplayID did) {
+    CGRect frame = CGDisplayBounds(did);
+    bool canUseSLS = g_sls_main_connection && g_sls_get_dock_rect;
+    if (canUseSLS) {
+        int cid = g_sls_main_connection();
+        if (rovr_menu_bar_hidden()) {
+            int notch = rovr_display_notch_height(did);
+            if (notch > 0) {
+                frame.origin.y += notch;
+                frame.size.height -= notch;
+            }
+        } else {
+            uint64_t sid = 0;
+            if (g_sls_copy_managed_display_spaces) {
+                CFArrayRef spaces = g_sls_copy_managed_display_spaces(cid);
+                if (spaces) {
+                    CFIndex dc = CFArrayGetCount(spaces);
+                    for (CFIndex d = 0; d < dc; d++) {
+                        CFDictionaryRef dr = CFArrayGetValueAtIndex(spaces, d);
+                        CFStringRef uuid = CFDictionaryGetValue(dr, CFSTR("Display Identifier"));
+                        CFArrayRef sarr = CFDictionaryGetValue(dr, CFSTR("Spaces"));
+                        if (!uuid || !sarr) continue;
+                        CFUUIDRef pu = CFUUIDCreateFromString(NULL, uuid);
+                        uint32_t curDid = pu ? CGDisplayGetDisplayIDFromUUID(pu) : 0;
+                        if (pu) CFRelease(pu);
+                        if (curDid == did && CFArrayGetCount(sarr) > 0) {
+                            CFDictionaryRef sr = CFArrayGetValueAtIndex(sarr, 0);
+                            CFNumberRef sidRef = CFDictionaryGetValue(sr, CFSTR("id64"));
+                            if (sidRef) CFNumberGetValue(sidRef, kCFNumberSInt64Type, &sid);
+                            break;
+                        }
+                    }
+                    CFRelease(spaces);
+                }
+            }
+            CGRect menu = {0};
+            bool gotMenu = false;
+            if (sid != 0 && g_sls_get_revealed_menu) {
+                if (g_sls_get_revealed_menu(&menu, cid, sid) == kCGErrorSuccess) gotMenu = true;
+            }
+            if (!gotMenu && g_sls_get_menubar_height) {
+                uint32_t h = 0;
+                if (g_sls_get_menubar_height(did, &h) == kCGErrorSuccess && h > 0) {
+                    menu.size.height = h;
+                    gotMenu = true;
+                }
+            }
+            if (gotMenu && menu.size.height > 0) {
+                if (menu.size.height > 1) menu.size.height += 1;
+                frame.origin.y += menu.size.height;
+                frame.size.height -= menu.size.height;
+            } else {
+                // Fallback notch already handled? Use visibleFrame height delta.
+                for (NSScreen *screen in [NSScreen screens]) {
+                    NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+                    if (num && [num unsignedIntValue] == did) {
+                        CGRect vf = [screen visibleFrame];
+                        CGFloat delta = (frame.size.height - vf.size.height);
+                        if (delta > 0 && delta < 100) {
+                            frame.origin.y += delta;
+                            frame.size.height -= delta;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (!rovr_dock_hidden() && g_sls_get_dock_rect) {
+            CGRect dock = {0}; int reason = 0;
+            if (g_sls_get_dock_rect(cid, &dock, &reason) == kCGErrorSuccess) {
+                // Use yabai's logic: only subtract dock if did == dock display.
+                // Heuristic: if dock rect lies within this display's bounds (before subtraction), apply.
+                if (CGRectIntersectsRect(frame, dock) || CGRectContainsRect(CGDisplayBounds(did), dock)) {
+                    int orient = 0, pinning = 0;
+                    if (g_core_dock_orient) g_core_dock_orient(&orient, &pinning);
+                    else orient = 2; // bottom default
+                    switch (orient) {
+                        case 0: // left
+                            if (dock.size.width > 0) { frame.origin.x += dock.size.width; frame.size.width -= dock.size.width; }
+                            break;
+                        case 1: // right
+                            frame.size.width -= dock.size.width; break;
+                        case 2: // bottom
+                        default: frame.size.height -= dock.size.height; break;
+                    }
+                }
+            }
+        }
+        // Clamp to positive
+        if (frame.size.width < 0) frame.size.width = 0;
+        if (frame.size.height < 0) frame.size.height = 0;
+        return frame;
+    }
+    // Fallback: NSScreen visibleFrame (covers dock+menubar+notch on most configs)
+    @autoreleasepool {
+        for (NSScreen *screen in [NSScreen screens]) {
+            NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+            if (num && [num unsignedIntValue] == did) {
+                return [screen visibleFrame];
+            }
+        }
+    }
+    return frame;
+}
+
+// Adapted from yabai display_manager_display_is_animating (MIT, © Åsmund Vikane).
+static bool rovr_display_is_animating(uint32_t did) {
+    if (!g_sls_managed_display_is_animating || !g_sls_main_connection) return false;
+    CFUUIDRef uuidRef = CGDisplayCreateUUIDFromDisplayID(did);
+    if (!uuidRef) return false;
+    CFStringRef uuid = CFUUIDCreateString(NULL, uuidRef);
+    CFRelease(uuidRef);
+    if (!uuid) return false;
+    bool result = g_sls_managed_display_is_animating(g_sls_main_connection(), uuid);
+    CFRelease(uuid);
+    return result;
+}
+
+// SLS fallback for background apps where AX returns Unknown. Uses level/parent to decide
+// if window is a standard user window (level 0/3/8, parent 0) — yabai window_manager.c / window.c logic (MIT).
+static int rovr_sls_managed_for_window(uint32_t wid) {
+    if (!g_sls_window_query || !g_sls_window_query_copy || !g_sls_window_iter_count || !g_sls_window_iter_advance || !g_sls_window_iter_parent || !g_sls_window_iter_level || !g_sls_main_connection) return 2;
+    int cid = g_sls_main_connection();
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
+    if (!n) return 2;
+    const void *vals[1] = { n };
+    CFArrayRef arr = CFArrayCreate(NULL, vals, 1, &kCFTypeArrayCallBacks);
+    CFRelease(n);
+    if (!arr) return 2;
+    CFTypeRef query = g_sls_window_query(cid, arr, 1);
+    CFRelease(arr);
+    if (!query) return 2;
+    CFTypeRef iter = g_sls_window_query_copy(query);
+    CFRelease(query);
+    if (!iter) return 2;
+    int result = 2;
+    if (g_sls_window_iter_count(iter) == 1 && g_sls_window_iter_advance(iter)) {
+        int level = g_sls_window_iter_level(iter);
+        uint32_t parent = g_sls_window_iter_parent(iter);
+        if (parent != 0) result = 0;
+        else if (level == 0 || level == 3 || level == 8) result = 1;
+        else result = 0;
+    }
+    CFRelease(iter);
+    return result;
+}
+
+int rovr_bridge_sls_managed_for_window(uint32_t wid) {
+    return rovr_sls_managed_for_window(wid);
+}
+
+// Sort displays by center coordinate (x then y) — deterministic arrangement order, yabai display_manager_coordinate_comparator (MIT).
+static int rovr_display_cmp(const void *a, const void *b) {
+    CGDirectDisplayID da = *(const CGDirectDisplayID *)a;
+    CGDirectDisplayID db = *(const CGDirectDisplayID *)b;
+    CGRect fa = CGDisplayBounds(da);
+    CGRect fb = CGDisplayBounds(db);
+    CGPoint ca = CGPointMake(fa.origin.x + fa.size.width * 0.5, fa.origin.y + fa.size.height * 0.5);
+    CGPoint cb = CGPointMake(fb.origin.x + fb.size.width * 0.5, fb.origin.y + fb.size.height * 0.5);
+    if (ca.x < cb.x) return -1;
+    if (ca.x > cb.x) return 1;
+    if (ca.y < cb.y) return -1;
+    if (ca.y > cb.y) return 1;
+    return 0;
+}
+
 int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context) {
     if (!callback) return 1;
 
     CGDirectDisplayID displays[32] = {0};
     uint32_t count = 0;
     if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess) return 2;
+    if (count > 1) qsort(displays, count, sizeof(CGDirectDisplayID), rovr_display_cmp);
 
     CGDirectDisplayID active_display = rovr_active_display_id();
     if (active_display == 0) active_display = CGMainDisplayID();
     CGDirectDisplayID main_display = CGMainDisplayID();
     for (uint32_t i = 0; i < count; i++) {
-        CGRect frame = CGDisplayBounds(displays[i]);
+        CGRect frame = rovr_display_constrained_bounds(displays[i]);
         rovr_bridge_display display = {
             .id = displays[i],
             .focused = displays[i] == active_display ? 1 : 0,
@@ -1071,9 +1345,107 @@ int rovr_bridge_close_window(uint32_t window_id) {
 }
 
 int rovr_bridge_toggle_fullscreen(uint32_t window_id) {
-    // The fullscreen button only exists while the window supports native
-    // fullscreen; error 2 surfaces as "unsupported" to the caller.
-    return rovr_ax_press_window_button(window_id, kAXFullScreenButtonAttribute);
+    // Adapted from yabai window_manager_toggle_window_native_fullscreen (MIT, © Åsmund Vikane).
+    // Uses AXFullScreen attribute directly (reliable for Chrome/dialogs/no-resizable windows)
+    // with Enhanced UI workaround, focus+wait, and post-toggle animation wait.
+    // Falls back to pressing the fullscreen button if attribute set fails.
+    pid_t pid = 0;
+    AXUIElementRef window = rovr_ax_window_for_id(window_id, &pid);
+    if (!window) return 1;
+
+    // Focus first so space switch happens before toggling.
+    @autoreleasepool {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    }
+    AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
+
+    // Bounded wait for window's Space to become current (~1.5s, 50ms poll).
+    uint64_t sid = rovr_space_id_for_window(window_id);
+    if (sid != 0) {
+        for (int i = 0; i < 30; i++) {
+            uint64_t cur = rovr_bridge_current_space_for_space(sid);
+            if (cur == sid) break;
+            usleep(50000);
+        }
+    }
+
+    // Read current AXFullScreen.
+    bool is_fullscreen = false;
+    CFTypeRef fv = NULL;
+    if (AXUIElementCopyAttributeValue(window, CFSTR("AXFullScreen"), &fv) == kAXErrorSuccess && fv) {
+        if (CFGetTypeID(fv) == CFBooleanGetTypeID()) {
+            is_fullscreen = CFBooleanGetValue((CFBooleanRef)fv);
+        }
+        CFRelease(fv);
+    }
+
+    // Enhanced UI workaround around the set.
+    AXUIElementRef appElem = pid > 0 ? AXUIElementCreateApplication(pid) : NULL;
+    if (appElem) rovr_ax_apply_timeout(appElem);
+    bool eui = appElem ? rovr_ax_get_enhanced_ui(appElem) : false;
+    if (eui) rovr_ax_set_enhanced_ui(appElem, false);
+
+    AXError setErr = AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), is_fullscreen ? kCFBooleanFalse : kCFBooleanTrue);
+
+    if (eui) rovr_ax_set_enhanced_ui(appElem, true);
+    if (appElem) CFRelease(appElem);
+
+    int result = 0;
+    if (setErr != kAXErrorSuccess) {
+        // Fallback to button press (preserve old path).
+        AXUIElementRef button = NULL;
+        if (AXUIElementCopyAttributeValue(window, kAXFullScreenButtonAttribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
+            rovr_ax_apply_timeout(button);
+            result = (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) ? 0 : 3;
+            CFRelease(button);
+        } else {
+            result = 2;
+        }
+    }
+    CFRelease(window);
+
+    // Wait for transition. Monterey+ poll space_is_user(active), older poll SLSManagedDisplayIsAnimating.
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    bool isMontereyPlus = v.majorVersion >= 12;
+    if (isMontereyPlus) {
+        if (g_sls_space_get_type && g_sls_main_connection && sid != 0) {
+            for (int i = 0; i < 15; i++) {
+                uint64_t active = rovr_bridge_current_space_for_space(sid);
+                if (active != 0 && g_sls_space_get_type(g_sls_main_connection(), active) == 0) break;
+                usleep(100000);
+            }
+        } else if (g_sls_managed_display_is_animating && g_sls_main_connection && sid != 0) {
+            CFStringRef uuid = g_sls_copy_managed_display_for_space ? g_sls_copy_managed_display_for_space(g_sls_main_connection(), sid) : NULL;
+            if (uuid) {
+                for (int i = 0; i < 15; i++) {
+                    if (!g_sls_managed_display_is_animating(g_sls_main_connection(), uuid)) break;
+                    usleep(100000);
+                }
+                CFRelease(uuid);
+            } else {
+                usleep(300000);
+            }
+        } else {
+            usleep(300000);
+        }
+    } else {
+        if (g_sls_managed_display_is_animating && g_sls_main_connection && sid != 0) {
+            CFStringRef uuid = g_sls_copy_managed_display_for_space ? g_sls_copy_managed_display_for_space(g_sls_main_connection(), sid) : NULL;
+            if (uuid) {
+                for (int i = 0; i < 15; i++) {
+                    if (!g_sls_managed_display_is_animating(g_sls_main_connection(), uuid)) break;
+                    usleep(100000);
+                }
+                CFRelease(uuid);
+            } else {
+                usleep(300000);
+            }
+        } else {
+            usleep(300000);
+        }
+    }
+    return result;
 }
 
 int32_t rovr_bridge_dock_pid(void) {
@@ -1126,12 +1498,14 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
             if (!sid_ref) continue;
             uint64_t sid = 0;
             CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &sid);
+            int stype = g_sls_space_get_type ? g_sls_space_get_type(cid, sid) : -1;
             rovr_bridge_space space = {
                 .id = sid,
                 .display_id = display_id,
-                .type = g_sls_space_get_type ? g_sls_space_get_type(cid, sid) : -1,
+                .type = stype,
                 .focused = sid == active_sid ? 1 : 0,
                 .position = position,
+                .is_system = stype == 2 ? 1 : 0,
             };
             callback(&space, context);
             position++;
@@ -1211,6 +1585,12 @@ int rovr_bridge_focus_space(uint64_t space_id) {
     if (!g_sls_copy_managed_display_for_space || !g_sls_managed_display_get_current_space ||
         !g_sls_copy_managed_display_spaces || !g_sls_main_connection) {
         return 1;
+    }
+    // Guard: posting gesture mid-animation leaves WindowServer between Spaces (blank-screen bug).
+    // Adapted from yabai display_manager_display_is_animating check (MIT).
+    {
+        uint32_t did = rovr_display_for_space(space_id);
+        if (did != 0 && rovr_display_is_animating(did)) return 5;
     }
 
     int cid = g_sls_main_connection();
@@ -1296,6 +1676,10 @@ int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta) {
         target_space_id == 0 || delta == 0) {
         return 1;
     }
+    {
+        uint32_t did = rovr_display_for_space(target_space_id);
+        if (did != 0 && rovr_display_is_animating(did)) return 5;
+    }
 
     int cid = g_sls_main_connection();
     CFStringRef target_uuid =
@@ -1367,4 +1751,14 @@ uint64_t rovr_bridge_current_space_for_space(uint64_t space_id) {
 // cross-display switches (their settle gates are independent).
 uint32_t rovr_bridge_display_for_space(uint64_t space_id) {
     return rovr_display_for_space(space_id);
+}
+
+int rovr_bridge_space_is_fullscreen(uint64_t space_id) {
+    if (!g_sls_space_get_type || !g_sls_main_connection || space_id == 0) return 0;
+    return g_sls_space_get_type(g_sls_main_connection(), space_id) == 4 ? 1 : 0;
+}
+
+int rovr_bridge_space_is_system(uint64_t space_id) {
+    if (!g_sls_space_get_type || !g_sls_main_connection || space_id == 0) return 0;
+    return g_sls_space_get_type(g_sls_main_connection(), space_id) == 2 ? 1 : 0;
 }

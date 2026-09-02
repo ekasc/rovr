@@ -225,7 +225,7 @@ impl WorkspaceRegistry {
             self.0.values().filter_map(|w| w.backing_space).collect();
         let mut unclaimed: Vec<(SpaceId, u32, DisplayId)> = observed_spaces
             .iter()
-            .filter(|(sid, _)| !claimed.contains(sid))
+            .filter(|(sid, snap)| !claimed.contains(sid) && !snap.is_fullscreen && !snap.is_system)
             .map(|(sid, s)| (*sid, s.position, s.display_id))
             .collect();
         unclaimed.sort_by_key(|&(sid, pos, _)| (pos, sid));
@@ -327,6 +327,8 @@ mod tests {
             focused: false,
             generation: 0,
             position: pos,
+            is_fullscreen: false,
+            is_system: false,
         }
     }
 
