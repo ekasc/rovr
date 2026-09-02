@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rovr_config::{CompiledRule, Config, ScratchpadConfig, Selector};
 use rovr_layout::{compute, LayoutRequest};
@@ -10,16 +10,15 @@ use crate::{DesiredState, ObservedState};
 use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 
 /// A window is tileable when the WM manages it and it is not fullscreen
-/// and not minimized. `managed` is false for floating/system windows.
-/// `minimized`/`fullscreen` are observed via AX; Unknown is treated as
-/// tileable for those (with SLS fallback for managed) so background apps
-/// without AX still tile on multi-display — conservative would leave them
-/// floated until frontmost (the reported multi-display bug). SLS fallback
-/// for managed (level/parent) resolves Unknown before this check.
+/// and not minimized. `managed` and `minimized` are conservative: Unknown
+/// means not tileable (avoids tiling a minimized window when AX timed out).
+/// `fullscreen` is permissive (Unknown treated as not fullscreen) because the
+/// Space type already excludes fullscreen spaces; the SLS fallback resolves
+/// managed for background apps.
 fn is_tileable(w: &WindowSnapshot) -> bool {
     w.managed == rovr_types::ObservedBool::Yes
         && w.fullscreen != rovr_types::ObservedBool::Yes
-        && w.minimized != rovr_types::ObservedBool::Yes
+        && w.minimized == rovr_types::ObservedBool::No
 }
 /// Blocker 10: rule matching uses the COMPILED regexes from config load —
 /// never equality/substring checks that would diverge from validation.
@@ -167,6 +166,7 @@ pub fn apply_layout(
     // Runtime gap/padding toggle (space toggle-insets): true collapses all
     // configured insets to zero for the session, false uses config values.
     insets_off: bool,
+    pending_close: &HashSet<WindowId>,
 ) {
     let gap = if insets_off {
         0.0
@@ -208,7 +208,8 @@ pub fn apply_layout(
         let is_floating = !is_tileable(w)
             || matches_float_rule(w, rules, observed, workspaces)
             || matches_open_scratchpad(w, &config.scratchpads, scratchpads)
-            || desired.windows.get(&w.id).is_some_and(|t| t.floating);
+            || desired.windows.get(&w.id).is_some_and(|t| t.floating)
+            || pending_close.contains(&w.id);
         if is_floating {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
@@ -277,6 +278,9 @@ pub fn apply_layout(
                                 tracing::warn!(plugin = %name, %reason, "invalid plugin output discarded, falling back to built-in layout");
                             } else {
                                 for p in placements {
+                                    if pending_close.contains(&p.window) {
+                                        continue;
+                                    }
                                     if let Some(t) = desired.windows.get_mut(&p.window) {
                                         t.frame = Some(p.frame);
                                     }
@@ -296,14 +300,27 @@ pub fn apply_layout(
         let kind = resolve_layout(config, space_id, observed, workspaces);
         if kind == LayoutKind::Bsp {
             // Persistent BSP: sync tree with observed tileable set for this space.
+            // Keep pending_close windows in the tree (so cancel restores ordering) but
+            // exclude them from placements for instant retile.
             let state = layouts.entry(space_id).or_default();
-            let set: std::collections::HashSet<WindowId> = window_ids.iter().copied().collect();
+            let mut set: std::collections::HashSet<WindowId> = window_ids.iter().copied().collect();
+            for &pid in pending_close {
+                if let Some(pw) = observed.windows.get(&pid) {
+                    let eff = pw.space_id;
+                    if eff == Some(space_id) {
+                        set.insert(pid);
+                    }
+                }
+            }
             state.bsp.sync_with_windows(&set);
             // Inset area before BSP placement (compute() did this internally;
             // tree placements expect already-inset area).
             if let Some(inset) = inset_area(area, padding) {
                 let placements = state.bsp.placements(inset, gap);
                 for (win, frame) in placements {
+                    if pending_close.contains(&win) {
+                        continue;
+                    }
                     if let Some(t) = desired.windows.get_mut(&win) {
                         t.frame = Some(frame);
                     }
@@ -430,6 +447,7 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         // Managed windows are tiled.
@@ -549,6 +567,7 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert!(
@@ -663,22 +682,29 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
-        // Managed Unknown stays not tiled (conservative, resolved via SLS fallback in live snapshots).
+        // Managed and minimized Unknown stay not tiled (conservative). Fullscreen Unknown is
+        // permissive because Space type already excludes fullscreen spaces.
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
             None,
             "window 1 with Unknown managed must not be tiled"
         );
-        // Fullscreen/minimized Unknown are now permissive (treated as No) so background windows
-        // with SLS-resolved managed still tile on multi-display without frontmost.
-        for id in [WindowId(2), WindowId(3)] {
-            assert!(
-                desired.windows.get(&id).and_then(|t| t.frame).is_some(),
-                "window {id:?} with Unknown fullscreen/minimized must be tiled (permissive)"
-            );
-        }
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(2))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "window 2 with Unknown fullscreen must be tiled (permissive)"
+        );
+        assert_eq!(
+            desired.windows.get(&WindowId(3)).and_then(|t| t.frame),
+            None,
+            "window 3 with Unknown minimized must not be tiled (conservative)"
+        );
     }
     /// M3c: a window whose bundle id matches a `float = true` rule is skipped
     /// even though the bridge reports it as managed.
@@ -762,6 +788,7 @@ mod tests {
             &ScratchpadState::new(),
             &config.compile_rules().unwrap(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -856,6 +883,7 @@ mod tests {
             &ScratchpadState::new(),
             &config.compile_rules().unwrap(),
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -946,6 +974,7 @@ mod tests {
             &ScratchpadState::new(),
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert!(
@@ -1081,6 +1110,7 @@ mod tests {
             &ScratchpadState::new(),
             &rules,
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             desired.windows[&WindowId(1)].space,
@@ -1102,6 +1132,7 @@ mod tests {
             &ScratchpadState::new(),
             &rules,
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             desired2.windows[&WindowId(1)].space,
@@ -1134,6 +1165,7 @@ mod tests {
             &ScratchpadState::new(),
             &rules,
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -1169,6 +1201,7 @@ mod tests {
                 &ScratchpadState::new(),
                 &rules,
                 false,
+                &std::collections::HashSet::new(),
             );
             assert_eq!(
                 desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
@@ -1191,6 +1224,7 @@ mod tests {
             &ScratchpadState::new(),
             &rules,
             false,
+            &std::collections::HashSet::new(),
         );
         assert!(
             desired
@@ -1385,6 +1419,7 @@ mod tests {
             &pads,
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
@@ -1473,6 +1508,7 @@ mod tests {
             &pads,
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert!(
@@ -1576,6 +1612,7 @@ mod tests {
             &pads,
             &[],
             false,
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(

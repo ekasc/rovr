@@ -43,7 +43,7 @@ extern "C" fn rovr_ax_event_trampoline(event_kind: i32, _window_id: u32) {
 const ROVR_APP_MAX: usize = 256;
 const ROVR_TITLE_MAX: usize = 512;
 const ROVR_BUNDLE_MAX: usize = 256;
-const AX_JOB_TIMEOUT: Duration = Duration::from_millis(150);
+const AX_JOB_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Maximum time the gesture path waits for a PREVIOUS swipe animation to
 /// land before posting the next sequence. Waiting for actual landing (not a
@@ -178,6 +178,7 @@ extern "C" {
     fn rovr_bridge_display_for_space(space_id: u64) -> u32;
     fn rovr_bridge_space_is_fullscreen(space_id: u64) -> i32;
     fn rovr_bridge_space_is_system(space_id: u64) -> i32;
+    fn rovr_bridge_is_display_animating(display_id: u32) -> i32;
     fn rovr_bridge_sls_managed_for_window(window_id: u32) -> i32;
     fn rovr_bridge_dock_pid() -> i32;
 }
@@ -346,6 +347,7 @@ pub struct MacPlatform {
     /// the persistent PID-keyed workers below.
     snapshot_worker: BoundedWorker<Result<PlatformSnapshot, PlatformError>>,
     ax_workers: Arc<Mutex<AxWorkerPool>>,
+    last_known_minimized: std::cell::RefCell<HashMap<WindowId, rovr_types::ObservedBool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +398,7 @@ impl MacPlatform {
                 crate::bounded_worker::DEFAULT_RETRY_INTERVAL,
             ),
             ax_workers: Arc::new(Mutex::new(AxWorkerPool::default())),
+            last_known_minimized: std::cell::RefCell::new(HashMap::new()),
         })
     }
 
@@ -859,18 +862,35 @@ impl Platform for MacPlatform {
     }
 
     fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
-        // Blocker 2: bounded observation through the SINGLE platform worker.
-        // A hung AX/SkyLight call wedges exactly one thread; callers time out
-        // (2 s) or fail fast, and periodic reconciliation can never spawn
-        // additional workers. Recovery retries on the same worker after the
-        // retry interval; stale responses are discarded by epoch.
         let bridge_capabilities = self.bridge_capabilities;
         let ax_workers = Arc::clone(&self.ax_workers);
-        match self
+        let res = self
             .snapshot_worker
-            .run(move || Self::snapshot_inner(bridge_capabilities, &ax_workers))
-        {
-            Ok(inner) => inner,
+            .run(move || Self::snapshot_inner(bridge_capabilities, &ax_workers));
+        match res {
+            Ok(Ok(mut snap)) => {
+                let mut last = self.last_known_minimized.borrow_mut();
+                for w in &mut snap.windows {
+                    if w.minimized == rovr_types::ObservedBool::Unknown {
+                        if let Some(&known) = last.get(&w.id) {
+                            if known != rovr_types::ObservedBool::Unknown {
+                                w.minimized = known;
+                            } else {
+                                w.minimized = rovr_types::ObservedBool::No;
+                            }
+                        } else {
+                            w.minimized = rovr_types::ObservedBool::No;
+                        }
+                    }
+                    if w.minimized != rovr_types::ObservedBool::Unknown {
+                        last.insert(w.id, w.minimized);
+                    }
+                }
+                let present: HashSet<WindowId> = snap.windows.iter().map(|w| w.id).collect();
+                last.retain(|k, _| present.contains(k));
+                Ok(snap)
+            }
+            Ok(Err(e)) => Err(e),
             Err(err) => Err(PlatformError::Operation(format!(
                 "snapshot unavailable: {err}"
             ))),
@@ -956,11 +976,26 @@ impl Platform for MacPlatform {
                     }
                 }
                 let window = *window;
-                return self.execute_ax_mutation(
-                    window,
-                    "toggle_native_fullscreen",
-                    move || unsafe { rovr_bridge_toggle_fullscreen(window.0) },
-                );
+                self.execute_ax_mutation(window, "toggle_native_fullscreen", move || unsafe {
+                    rovr_bridge_toggle_fullscreen(window.0)
+                })?;
+                let did = if target_space != 0 {
+                    unsafe { rovr_bridge_display_for_space(target_space) }
+                } else {
+                    0
+                };
+                if did != 0 {
+                    let deadline = Instant::now() + Duration::from_millis(1500);
+                    while unsafe { rovr_bridge_is_display_animating(did) } != 0 {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                return Ok(());
             }
             Action::MoveWindowToSpace { window, space } => {
                 if unsafe { rovr_bridge_space_is_fullscreen(space.0) } != 0 {
