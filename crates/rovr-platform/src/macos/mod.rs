@@ -144,6 +144,7 @@ struct BridgeSpace {
     type_: i32,
     focused: u8,
     position: u32,
+    is_system: u8,
 }
 
 extern "C" {
@@ -175,6 +176,9 @@ extern "C" {
     fn rovr_bridge_window_pid(window_id: u32) -> i32;
     fn rovr_bridge_current_space_for_space(space_id: u64) -> u64;
     fn rovr_bridge_display_for_space(space_id: u64) -> u32;
+    fn rovr_bridge_space_is_fullscreen(space_id: u64) -> i32;
+    fn rovr_bridge_space_is_system(space_id: u64) -> i32;
+    fn rovr_bridge_sls_managed_for_window(window_id: u32) -> i32;
     fn rovr_bridge_dock_pid() -> i32;
 }
 
@@ -707,6 +711,8 @@ impl MacPlatform {
                 focused: space.focused != 0,
                 generation: 0,
                 position: space.position,
+                is_fullscreen: space.type_ == 4,
+                is_system: space.is_system != 0,
             });
         }
         let mut windows: Vec<WindowSnapshot> = Vec::new();
@@ -748,6 +754,17 @@ impl MacPlatform {
             window.minimized = observed_bool(refinement.minimized);
             window.fullscreen = observed_bool(refinement.fullscreen);
             window.managed = observed_bool(refinement.managed);
+        }
+        // SLS fallback for background apps where AX returns Unknown — uses level/parent (yabai). Keeps tiling on multi-display without frontmost.
+        for window in &mut windows {
+            if window.managed == rovr_types::ObservedBool::Unknown {
+                let sls = unsafe { rovr_bridge_sls_managed_for_window(window.id.0) };
+                match sls {
+                    0 => window.managed = rovr_types::ObservedBool::No,
+                    1 => window.managed = rovr_types::ObservedBool::Yes,
+                    _ => {}
+                }
+            }
         }
         let mut displays: Vec<DisplaySnapshot> = Vec::new();
         let display_status = unsafe {
@@ -923,6 +940,21 @@ impl Platform for MacPlatform {
                 });
             }
             Action::ToggleNativeFullscreen { window } => {
+                let target_space = unsafe { rovr_bridge_window_space_id(window.0) };
+                if target_space != 0
+                    && target_space != unsafe { rovr_bridge_current_space_for_space(target_space) }
+                {
+                    self.execute_focus_space(&SpaceId(target_space))?;
+                    let deadline = Instant::now() + GESTURE_LAND_CAP;
+                    while unsafe { rovr_bridge_current_space_for_space(target_space) }
+                        != target_space
+                    {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(GESTURE_LAND_POLL);
+                    }
+                }
                 let window = *window;
                 return self.execute_ax_mutation(
                     window,
@@ -930,9 +962,19 @@ impl Platform for MacPlatform {
                     move || unsafe { rovr_bridge_toggle_fullscreen(window.0) },
                 );
             }
-            Action::MoveWindowToSpace { window, space } => unsafe {
-                rovr_bridge_move_window_to_space(window.0, space.0)
-            },
+            Action::MoveWindowToSpace { window, space } => {
+                if unsafe { rovr_bridge_space_is_fullscreen(space.0) } != 0 {
+                    return Err(PlatformError::Operation(
+                        "cannot move window to a macOS fullscreen space".to_string(),
+                    ));
+                }
+                if unsafe { rovr_bridge_space_is_system(space.0) } != 0 {
+                    return Err(PlatformError::Operation(
+                        "cannot move window to a macOS system space".to_string(),
+                    ));
+                }
+                unsafe { rovr_bridge_move_window_to_space(window.0, space.0) }
+            }
             Action::FocusDirection { .. } => {
                 return Err(PlatformError::Unsupported("focus_direction"))
             }
@@ -1134,6 +1176,8 @@ mod tests {
                 focused: true,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
             SpaceSnapshot {
                 id: SpaceId(22),
@@ -1142,6 +1186,8 @@ mod tests {
                 focused: true,
                 generation: 0,
                 position: 1,
+                is_fullscreen: false,
+                is_system: false,
             },
         ];
         assert_eq!(

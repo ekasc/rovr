@@ -1766,6 +1766,8 @@ mod tests {
                     focused: true,
                     generation: 1,
                     position: 0,
+                    is_fullscreen: false,
+                    is_system: false,
                 },
                 SpaceSnapshot {
                     id: SpaceId(12),
@@ -1774,6 +1776,8 @@ mod tests {
                     focused: false,
                     generation: 1,
                     position: 1,
+                    is_fullscreen: false,
+                    is_system: false,
                 },
                 SpaceSnapshot {
                     id: SpaceId(13),
@@ -1782,6 +1786,8 @@ mod tests {
                     focused: false,
                     generation: 1,
                     position: 2,
+                    is_fullscreen: false,
+                    is_system: false,
                 },
             ],
             displays: vec![DisplaySnapshot {
@@ -1864,6 +1870,8 @@ mod tests {
                                 focused: false,
                                 generation: 1,
                                 position: new_pos,
+                                is_fullscreen: false,
+                                is_system: false,
                             });
                         }
                     }
@@ -1886,6 +1894,8 @@ mod tests {
                 focused: true,
                 generation: 1,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             }],
             displays: vec![DisplaySnapshot {
                 id: DisplayId(1),
@@ -2010,6 +2020,8 @@ mod tests {
                     focused: true,
                     generation: 0,
                     position: 0,
+                    is_fullscreen: false,
+                    is_system: false,
                 }],
                 displays: vec![DisplaySnapshot {
                     id: DisplayId(1),
@@ -2086,6 +2098,8 @@ mod tests {
                 focused: true,
                 generation: 1,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             }],
             displays: vec![DisplaySnapshot {
                 id: DisplayId(1),
@@ -2217,6 +2231,8 @@ mod tests {
                         focused: true,
                         generation: 1,
                         position: 0,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                     rovr_types::SpaceSnapshot {
                         id: SpaceId(7),
@@ -2225,6 +2241,8 @@ mod tests {
                         focused: false,
                         generation: 1,
                         position: 1,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                 ],
                 displays: vec![],
@@ -2313,6 +2331,8 @@ mod tests {
                         focused: true,
                         generation: 1,
                         position: 0,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                     SpaceSnapshot {
                         id: SpaceId(12),
@@ -2321,6 +2341,8 @@ mod tests {
                         focused: false,
                         generation: 1,
                         position: 1,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                     SpaceSnapshot {
                         id: SpaceId(21),
@@ -2329,6 +2351,8 @@ mod tests {
                         focused: true,
                         generation: 1,
                         position: 0,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                     SpaceSnapshot {
                         id: SpaceId(22),
@@ -2337,6 +2361,8 @@ mod tests {
                         focused: false,
                         generation: 1,
                         position: 1,
+                        is_fullscreen: false,
+                        is_system: false,
                     },
                 ],
                 displays: vec![

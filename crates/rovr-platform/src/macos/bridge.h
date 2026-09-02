@@ -57,6 +57,7 @@ typedef struct rovr_bridge_space {
     int32_t type;
     uint8_t focused;
     uint32_t position;
+    uint8_t is_system; // type==2 system space (yabai space_is_system)
 } rovr_bridge_space;
 
 typedef void (*rovr_space_callback)(const rovr_bridge_space *space, void *context);
@@ -75,9 +76,14 @@ int rovr_bridge_focus_space(uint64_t space_id);
 int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta);
 uint64_t rovr_bridge_current_space_for_space(uint64_t space_id);
 uint32_t rovr_bridge_display_for_space(uint64_t space_id);
+int rovr_bridge_toggle_fullscreen(uint32_t window_id); // AXFullScreen attribute toggle with focus+wait; fallback to button; waits for animation (yabai-adapted, MIT)
+int rovr_bridge_close_window(uint32_t window_id);
 int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);
 int32_t rovr_bridge_window_pid(uint32_t window_id);
 uint64_t rovr_bridge_window_space_id(uint32_t window_id);
+int rovr_bridge_space_is_fullscreen(uint64_t space_id);
+int rovr_bridge_space_is_system(uint64_t space_id); // type==2 system space (yabai space_is_system, MIT)
+int rovr_bridge_sls_managed_for_window(uint32_t window_id); // SLS fallback for background apps where AX returns Unknown (yabai level/parent check, MIT)
 int32_t rovr_bridge_dock_pid(void);
 
 // AX event trampoline registration (rovr-platform calls this once at init;

@@ -422,7 +422,12 @@ impl Engine {
                 .observed
                 .spaces
                 .values()
-                .filter(|s| !claimed.contains(&s.id) && !before.contains(&s.id))
+                .filter(|s| {
+                    !s.is_fullscreen
+                        && !s.is_system
+                        && !claimed.contains(&s.id)
+                        && !before.contains(&s.id)
+                })
                 .find(|s| match desired_display {
                     Some(d) => s.display_id == *d,
                     None => true,
@@ -529,7 +534,7 @@ impl Engine {
                 }
                 continue;
             };
-            if space.focused {
+            if space.is_fullscreen || space.is_system || space.focused {
                 continue;
             }
             let occupied = self
@@ -545,7 +550,7 @@ impl Engine {
                 .observed
                 .spaces
                 .values()
-                .filter(|s| s.display_id == space.display_id)
+                .filter(|s| s.display_id == space.display_id && !s.is_fullscreen && !s.is_system)
                 .count();
             if display_spaces <= 1 {
                 continue;
@@ -751,6 +756,9 @@ impl Engine {
             .collect();
         let mut counts: HashMap<DisplayId, usize> = HashMap::new();
         for space in self.observed.spaces.values() {
+            if space.is_fullscreen || space.is_system {
+                continue;
+            }
             *counts.entry(space.display_id).or_default() += 1;
         }
 
@@ -758,7 +766,9 @@ impl Engine {
             .spaces
             .values()
             .filter(|space| {
-                !space.focused
+                !space.is_fullscreen
+                    && !space.is_system
+                    && !space.focused
                     && !claimed.contains(&space.id)
                     && !occupied.contains(&space.id)
                     && counts.get(&space.display_id).copied().unwrap_or(0) > 1
@@ -1527,6 +1537,8 @@ mod tests {
                     focused: false,
                     generation: 0,
                     position: 0,
+                    is_fullscreen: false,
+                    is_system: false,
                 },
                 SpaceSnapshot {
                     id: SpaceId(22),
@@ -1535,6 +1547,8 @@ mod tests {
                     focused: false,
                     generation: 0,
                     position: 1,
+                    is_fullscreen: false,
+                    is_system: false,
                 },
             ],
             displays: vec![
@@ -1612,6 +1626,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         let mk = |id: u32| WindowSnapshot {
@@ -1792,6 +1808,8 @@ mod tests {
             focused,
             generation: 0,
             position: pos,
+            is_fullscreen: false,
+            is_system: false,
         }
     }
 
@@ -2672,6 +2690,8 @@ mod tests {
             focused: true,
             generation: 0,
             position: 0,
+            is_fullscreen: false,
+            is_system: false,
         }];
         snap.displays = vec![DisplaySnapshot {
             id: DisplayId(1),
@@ -2803,6 +2823,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
             SpaceSnapshot {
                 id: SpaceId(2),
@@ -2811,6 +2833,8 @@ mod tests {
                 focused: true,
                 generation: 0,
                 position: 1,
+                is_fullscreen: false,
+                is_system: false,
             },
             SpaceSnapshot {
                 id: SpaceId(3),
@@ -2819,6 +2843,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 2,
+                is_fullscreen: false,
+                is_system: false,
             },
             // decoy on the other display, globally "focused"
             SpaceSnapshot {
@@ -2828,6 +2854,8 @@ mod tests {
                 focused: true,
                 generation: 0,
                 position: 3,
+                is_fullscreen: false,
+                is_system: false,
             },
         ];
         snap.displays = vec![
@@ -2912,6 +2940,8 @@ mod tests {
                 focused: id == 1,
                 generation: 0,
                 position: id as u32 - 1,
+                is_fullscreen: false,
+                is_system: false,
             })
             .collect();
         snap.displays = vec![DisplaySnapshot {

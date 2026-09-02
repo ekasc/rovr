@@ -11,12 +11,15 @@ use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 
 /// A window is tileable when the WM manages it and it is not fullscreen
 /// and not minimized. `managed` is false for floating/system windows.
-/// `minimized`/`fullscreen` are observed via AX; unknown is treated as not
-/// tileable by the reconciliation layer (see is_tileable guards).
+/// `minimized`/`fullscreen` are observed via AX; Unknown is treated as
+/// tileable for those (with SLS fallback for managed) so background apps
+/// without AX still tile on multi-display — conservative would leave them
+/// floated until frontmost (the reported multi-display bug). SLS fallback
+/// for managed (level/parent) resolves Unknown before this check.
 fn is_tileable(w: &WindowSnapshot) -> bool {
     w.managed == rovr_types::ObservedBool::Yes
-        && w.fullscreen == rovr_types::ObservedBool::No
-        && w.minimized == rovr_types::ObservedBool::No
+        && w.fullscreen != rovr_types::ObservedBool::Yes
+        && w.minimized != rovr_types::ObservedBool::Yes
 }
 /// Blocker 10: rule matching uses the COMPILED regexes from config load —
 /// never equality/substring checks that would diverge from validation.
@@ -228,6 +231,12 @@ pub fn apply_layout(
             }
             continue;
         };
+        if space.is_system || space.is_fullscreen {
+            if let Some(t) = desired.windows.get_mut(&w.id) {
+                t.frame = None;
+            }
+            continue;
+        }
         let Some(display) = observed.displays.get(&space.display_id) else {
             if let Some(t) = desired.windows.get_mut(&w.id) {
                 t.frame = None;
@@ -375,6 +384,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -495,6 +506,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -584,6 +597,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         let mk = |id: u32,
@@ -650,11 +665,18 @@ mod tests {
             false,
         );
 
-        for id in [WindowId(1), WindowId(2), WindowId(3)] {
-            assert_eq!(
-                desired.windows.get(&id).and_then(|t| t.frame),
-                None,
-                "window {id:?} with an unknown eligibility property must not be tiled"
+        // Managed Unknown stays not tiled (conservative, resolved via SLS fallback in live snapshots).
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "window 1 with Unknown managed must not be tiled"
+        );
+        // Fullscreen/minimized Unknown are now permissive (treated as No) so background windows
+        // with SLS-resolved managed still tile on multi-display without frontmost.
+        for id in [WindowId(2), WindowId(3)] {
+            assert!(
+                desired.windows.get(&id).and_then(|t| t.frame).is_some(),
+                "window {id:?} with Unknown fullscreen/minimized must be tiled (permissive)"
             );
         }
     }
@@ -697,6 +719,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -793,6 +817,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -881,6 +907,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -969,6 +997,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.spaces.insert(
@@ -980,6 +1010,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 1,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.windows.insert(
@@ -1193,6 +1225,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.spaces.insert(
@@ -1204,6 +1238,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -1253,6 +1289,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
 
@@ -1308,6 +1346,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.windows.insert(
@@ -1394,6 +1434,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.windows.insert(
@@ -1495,6 +1537,8 @@ mod tests {
                 focused: false,
                 generation: 0,
                 position: 0,
+                is_fullscreen: false,
+                is_system: false,
             },
         );
         observed.windows.insert(
