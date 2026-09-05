@@ -163,6 +163,10 @@ enum {
     ROVR_EVENT_WINDOW_CREATED = 1,
     ROVR_EVENT_WINDOW_FOCUSED = 2,
     ROVR_EVENT_WINDOW_DESTROYED = 4,
+    // A press-drag-release gesture finished. Fires the refresh wake so a
+    // manually dragged window is observed (and retiled) promptly after
+    // mouse-up instead of waiting for the next periodic tick.
+    ROVR_EVENT_DRAG_ENDED = 8,
 };
 
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
@@ -341,16 +345,34 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
     if (!window_info) return NULL;
 
     pid_t target_pid = 0;
+    CGRect target_bounds = CGRectZero;
+    bool have_target_bounds = false;
+    int pid_window_count = 0;
     CFIndex count = CFArrayGetCount(window_info);
+    // No early break: besides the target's pid/bounds we also count how many
+    // CG windows the pid owns (single-candidate fallback below).
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
         CFNumberRef window_number = CFDictionaryGetValue(entry, kCGWindowNumber);
         int window_id = 0;
-        if (window_number && CFNumberGetValue(window_number, kCFNumberIntType, &window_id) &&
-            (uint32_t)window_id == target_id) {
+        if (!window_number || !CFNumberGetValue(window_number, kCFNumberIntType, &window_id)) continue;
+        if ((uint32_t)window_id == target_id) {
             CFNumberRef owner_pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
             if (owner_pid) CFNumberGetValue(owner_pid, kCFNumberIntType, &target_pid);
-            break;
+            CFDictionaryRef bounds_dict = CFDictionaryGetValue(entry, kCGWindowBounds);
+            if (bounds_dict && CGRectMakeWithDictionaryRepresentation(bounds_dict, &target_bounds)) {
+                have_target_bounds = true;
+            }
+        }
+    }
+    if (target_pid != 0) {
+        for (CFIndex i = 0; i < count; i++) {
+            CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
+            CFNumberRef owner_pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
+            int pid = 0;
+            if (owner_pid && CFNumberGetValue(owner_pid, kCFNumberIntType, &pid) && pid == target_pid) {
+                pid_window_count++;
+            }
         }
     }
     CFRelease(window_info);
@@ -374,23 +396,43 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
         usleep(100000); // give the app a moment to build its AX tree
         error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
     }
-    if (error != kAXErrorSuccess || !value || CFGetTypeID(value) != CFArrayGetTypeID()) {
-        if (value) CFRelease(value);
-        return NULL;
-    }
-
-    CFArrayRef windows = (CFArrayRef)value;
     AXUIElementRef result = NULL;
-    for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
-        AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-        CGWindowID candidate_id = 0;
-        if (g_ax_get_window(window, &candidate_id) == kAXErrorSuccess && candidate_id == target_id) {
-            result = (AXUIElementRef)CFRetain(window);
-            rovr_ax_apply_timeout(result);
-            break;
+    CFIndex ax_count = 0;
+    if (error == kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)value;
+        ax_count = CFArrayGetCount(windows);
+        for (CFIndex i = 0; i < ax_count; i++) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            CGWindowID candidate_id = 0;
+            if (g_ax_get_window(window, &candidate_id) == kAXErrorSuccess && candidate_id == target_id) {
+                result = (AXUIElementRef)CFRetain(window);
+                rovr_ax_apply_timeout(result);
+                break;
+            }
+        }
+        // The private matcher rejects some apps' elements outright (notably
+        // Finder: -25201) while their tree is otherwise healthy. Retry with
+        // the public AXWindowNumber attribute before giving up on numbers.
+        // Capped: every candidate costs an AX round-trip against the app's
+        // 0.5s messaging timeout, and this path is already a fallback.
+        if (!result) {
+            CFIndex cap = ax_count < 32 ? ax_count : 32;
+            for (CFIndex i = 0; i < cap; i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                CFNumberRef number = NULL;
+                SInt32 public_id = -1;
+                if (AXUIElementCopyAttributeValue(window, CFSTR("AXWindowNumber"),
+                                                 (CFTypeRef *)&number) == kAXErrorSuccess &&
+                    number && CFNumberGetValue(number, kCFNumberSInt32Type, &public_id) &&
+                    public_id == (SInt32)target_id) {
+                    result = (AXUIElementRef)CFRetain(window);
+                    rovr_ax_apply_timeout(result);
+                }
+                if (number) CFRelease(number);
+                if (result) break;
+            }
         }
     }
-    CFRelease(windows);
 
     // Some apps (e.g. WezTerm nightly) expose no kAXWindowsAttribute array at
     // all and ignore AXManualAccessibility, but still report their main/focused
@@ -416,6 +458,70 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
             CFRelease(single);
         }
     }
+
+    // Last resort for apps with no window-number correlation at all (Finder
+    // exposes neither the private id nor AXWindowNumber): correlate by live
+    // geometry. Only fires on a UNIQUE match — ambiguity refuses rather than
+    // risk mutating the wrong window. (b) is subsumed by (c) geometrically
+    // but needs no extra AX reads, so try it first.
+    if (!result && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)value;
+        if (ax_count == 1 && pid_window_count == 1) {
+            AXUIElementRef only = (AXUIElementRef)CFArrayGetValueAtIndex(windows, 0);
+            CFTypeRef role = NULL;
+            if (AXUIElementCopyAttributeValue(only, kAXRoleAttribute, &role) == kAXErrorSuccess &&
+                role && CFGetTypeID(role) == CFStringGetTypeID() &&
+                CFStringCompare((CFStringRef)role, CFSTR("AXWindow"), 0) == kCFCompareEqualTo) {
+                result = (AXUIElementRef)CFRetain(only);
+                rovr_ax_apply_timeout(result);
+            }
+            if (role) CFRelease(role);
+        } else if (have_target_bounds && ax_count > 1) {
+            const double epsilon = 2.0;
+            AXUIElementRef unique = NULL;
+            bool ambiguous = false;
+            CFIndex cap = ax_count < 32 ? ax_count : 32;
+            for (CFIndex i = 0; i < cap && !ambiguous; i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                CFTypeRef role = NULL;
+                if (AXUIElementCopyAttributeValue(window, kAXRoleAttribute, &role) != kAXErrorSuccess ||
+                    !role || CFGetTypeID(role) != CFStringGetTypeID() ||
+                    CFStringCompare((CFStringRef)role, CFSTR("AXWindow"), 0) != kCFCompareEqualTo) {
+                    if (role) CFRelease(role);
+                    continue;
+                }
+                CFRelease(role);
+                AXValueRef ax_pos = NULL, ax_size = NULL;
+                CGPoint pos = CGPointZero;
+                CGSize size = CGSizeZero;
+                bool ok = AXUIElementCopyAttributeValue(window, kAXPositionAttribute,
+                                                        (CFTypeRef *)&ax_pos) == kAXErrorSuccess &&
+                    ax_pos && AXValueGetValue(ax_pos, kAXValueCGPointType, &pos) &&
+                    AXUIElementCopyAttributeValue(window, kAXSizeAttribute,
+                                                  (CFTypeRef *)&ax_size) == kAXErrorSuccess &&
+                    ax_size && AXValueGetValue(ax_size, kAXValueCGSizeType, &size);
+                if (ax_pos) CFRelease(ax_pos);
+                if (ax_size) CFRelease(ax_size);
+                if (!ok) continue;
+                if (fabs(pos.x - target_bounds.origin.x) <= epsilon &&
+                    fabs(pos.y - target_bounds.origin.y) <= epsilon &&
+                    fabs(size.width - target_bounds.size.width) <= epsilon &&
+                    fabs(size.height - target_bounds.size.height) <= epsilon) {
+                    if (unique) {
+                        ambiguous = true;
+                        unique = NULL;
+                    } else {
+                        unique = window;
+                    }
+                }
+            }
+            if (unique && !ambiguous) {
+                result = (AXUIElementRef)CFRetain(unique);
+                rovr_ax_apply_timeout(result);
+            }
+        }
+    }
+    if (value) CFRelease(value);
 
     CFRelease(app);
     return result;
@@ -665,13 +771,35 @@ static int rovr_ax_managed_for_window(AXUIElementRef window) {
             CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemDialog"), 0) == kCFCompareEqualTo ||
             CFStringCompare((CFStringRef)subrole, CFSTR("AXFloatingWindow"), 0) == kCFCompareEqualTo ||
             CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemFloatingWindow"), 0) == kCFCompareEqualTo ||
-            CFStringCompare((CFStringRef)subrole, CFSTR("AXPopover"), 0) == kCFCompareEqualTo) {
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXPopover"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXUnknown"), 0) == kCFCompareEqualTo) {
             floating = YES;
         }
         CFRelease(subrole);
         if (floating) return 0;
     } else {
         if (subrole) CFRelease(subrole);
+    }
+    // Helium browser chrome: 1470×30 top bars at y:0 present as AXStandardWindow
+    // with title == "" and not main/focused. They are real AXWindows with
+    // buttons, so the toast filter doesn't catch them, but they should never
+    // be tiled — when hover makes them space-bound for a tick, BSP would see
+    // 2 windows on the Space and snap the main window to half. Filter by
+    // AXMain/AXFocused: chrome is never main.
+    CFTypeRef is_main = NULL;
+    if (AXUIElementCopyAttributeValue(window, CFSTR("AXMain"), &is_main) == kAXErrorSuccess && is_main) {
+        BOOL main = CFBooleanGetValue((CFBooleanRef)is_main);
+        CFRelease(is_main);
+        if (!main) {
+            CFTypeRef title = NULL;
+            if (AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &title) == kAXErrorSuccess) {
+                BOOL empty_title = !title || CFStringGetLength((CFStringRef)title) == 0;
+                if (title) CFRelease(title);
+                if (empty_title) return 0;
+            }
+        }
+    } else if (is_main) {
+        CFRelease(is_main);
     }
     // Toast/HUD filter: notification banners and overlays (e.g. browser web
     // notification toasts, Chromium popup overlays) can present as plain
@@ -764,6 +892,8 @@ static void *rovr_macho_find_symbol(const char *target_image, const char *target
 static const char *ROVR_SKYLIGHT_PATH =
     "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 
+static void rovr_install_mouse_tap(void);
+
 int rovr_bridge_init(void) {
     g_ax_get_window = (rovr_ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
     g_sls_main_connection = (rovr_sls_main_connection_fn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
@@ -819,7 +949,83 @@ int rovr_bridge_init(void) {
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
     CGDisplayRegisterReconfigurationCallback(rovr_display_reconfiguration_callback, NULL);
+    rovr_install_mouse_tap();
     return 0;
+}
+
+// ---- Drag-end detection (listen-only mouse event tap) ---------------------
+// Periodic snapshots (seconds) are the retile backstop, but a manually
+// dragged window should be observed promptly after mouse-up. AX
+// moved/resized notifications require per-window registration (churn as
+// windows come and go); a listen-only tap detects press-drag-release in O(1)
+// state and fires one wake per real drag. Plain clicks never wake: only a
+// release that follows actual dragging fires. Rovr's own SetWindowFrame goes
+// through AX, never synthetic mouse events, so there is no feedback loop —
+// the wake only observes, and a converged layout emits no further actions.
+static CFMachPortRef g_mouse_tap = NULL;
+static bool g_mouse_down = false;
+static bool g_mouse_dragged = false;
+
+static CGEventRef rovr_mouse_tap_callback(
+    CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
+    (void)proxy;
+    (void)context;
+    if (type == kCGEventTapDisabledByTimeout) {
+        if (g_mouse_tap) CGEventTapEnable(g_mouse_tap, true);
+        return event;
+    }
+    if (type == kCGEventTapDisabledByUserInput) return event;
+    switch (type) {
+        case kCGEventLeftMouseDown:
+        case kCGEventRightMouseDown:
+        case kCGEventOtherMouseDown:
+            g_mouse_down = true;
+            g_mouse_dragged = false;
+            break;
+        case kCGEventLeftMouseDragged:
+        case kCGEventRightMouseDragged:
+        case kCGEventOtherMouseDragged:
+            if (g_mouse_down) g_mouse_dragged = true;
+            break;
+        case kCGEventLeftMouseUp:
+        case kCGEventRightMouseUp:
+        case kCGEventOtherMouseUp:
+            if (g_mouse_down && g_mouse_dragged) {
+                atomic_store(&g_needs_refresh, 1);
+                if (g_event_trampoline) g_event_trampoline(ROVR_EVENT_DRAG_ENDED, 0);
+            }
+            g_mouse_down = false;
+            g_mouse_dragged = false;
+            break;
+        default:
+            break;
+    }
+    return event;
+}
+
+static void rovr_install_mouse_tap(void) {
+    if (g_mouse_tap) return;
+    CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown)
+        | CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventLeftMouseDragged)
+        | CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp)
+        | CGEventMaskBit(kCGEventRightMouseDragged) | CGEventMaskBit(kCGEventOtherMouseDown)
+        | CGEventMaskBit(kCGEventOtherMouseUp) | CGEventMaskBit(kCGEventOtherMouseDragged);
+    // Listen-only: never alters or swallows events. NULL without AX trust —
+    // tolerated (drag-wake appears after the grant + daemon restart, which a
+    // trust change requires anyway).
+    CFMachPortRef tap = CGEventTapCreate(
+        kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+        mask, rovr_mouse_tap_callback, NULL);
+    if (!tap) return;
+    CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    if (!src) {
+        CFRelease(tap);
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
+    CFRelease(src);
+    // Retained by creation for daemon lifetime.
+    g_mouse_tap = tap;
 }
 
 uint64_t rovr_bridge_capabilities(void) {
@@ -890,6 +1096,12 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
             if (!CFNumberGetValue(pid, kCFNumberIntType, &owner_pid)) continue;
             if (!CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds)) continue;
             if (bounds.size.width <= 1.0 || bounds.size.height <= 1.0) continue;
+            // Helium/Chrome browser chrome: 1470×30 top bars etc. present as
+            // separate CGWindows with no AX element. They briefly become
+            // space-bound on hover and would make BSP see 2 windows on the
+            // Space. Filter by size here; the AX-managed check in refinement
+            // handles the rest (e.g. AXDialog) but can't catch these.
+            if (bounds.size.height < 60.0 || bounds.size.width < 80.0) continue;
 
             rovr_bridge_window window = {0};
             window.id = (uint32_t)window_id;

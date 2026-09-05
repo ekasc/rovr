@@ -26,7 +26,7 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
-use rovr_types::{DisplayId, SpaceId, WindowId};
+use rovr_types::{Capabilities, DisplayId, SpaceId, WindowId};
 
 mod hotkey;
 use serde_json::json;
@@ -38,9 +38,12 @@ const SUBSCRIBER_BACKLOG: usize = 64;
 const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const WINDOW_CREATED_EVENT_KIND: u32 = 1;
 const WINDOW_DESTROYED_EVENT_KIND: u32 = 4;
+const DRAG_ENDED_EVENT_KIND: u32 = 8;
 
 fn event_requests_immediate_refresh(event_kind: u32) -> bool {
-    event_kind == WINDOW_CREATED_EVENT_KIND || event_kind == WINDOW_DESTROYED_EVENT_KIND
+    event_kind == WINDOW_CREATED_EVENT_KIND
+        || event_kind == WINDOW_DESTROYED_EVENT_KIND
+        || event_kind == DRAG_ENDED_EVENT_KIND
 }
 
 #[derive(Default)]
@@ -97,7 +100,40 @@ struct Daemon {
     /// Per-display current/previous Spaces for `space focus-recent`.
     space_history: std::cell::RefCell<HashMap<DisplayId, SpaceHistory>>,
     refresh_wake: Arc<RefreshWake>,
+    /// Last observed Accessibility-control state. Compared every observation
+    /// tick so the degraded/restored transitions notify exactly once —
+    /// ticks while the state is stable stay silent.
+    ax_control_available: bool,
 }
+
+/// Accessibility-backed window control (tiling corrections, window focus,
+/// focused-window resolution) is unavailable: the daemon is not trusted for
+/// Accessibility, or the OS withdrew trust. Space/topology control via the
+/// scripting addition is unaffected.
+fn ax_control_degraded(caps: &Capabilities) -> bool {
+    !caps.focus_window || !caps.set_window_frame
+}
+
+const AX_UNAVAILABLE_MESSAGE: &str = "accessibility permission unavailable: tiling corrections, window focus, and focused-window commands are off. Grant access in System Settings → Privacy & Security → Accessibility, then press Alt+Shift+R (no restart needed)";
+
+/// One-shot macOS user notification for the degraded transition. Unit tests
+/// stub this out (no osascript spawns under `cargo test`).
+#[cfg(not(test))]
+fn notify_ax_control_lost() {
+    let script = format!(
+        "display notification {:?} with title \"Rovr\"",
+        "Accessibility permission unavailable — tiling, window focus, and focused-window commands are off. Grant access in System Settings → Privacy & Security → Accessibility, then press Alt+Shift+R."
+    );
+    if let Err(e) = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+    {
+        warn!(%e, "failed to post accessibility notification");
+    }
+}
+
+#[cfg(test)]
+fn notify_ax_control_lost() {}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -152,11 +188,14 @@ fn main() -> Result<()> {
         state_path,
         space_history: std::cell::RefCell::new(HashMap::new()),
         refresh_wake,
+        // Optimistic until the first observation tick reports otherwise; a
+        // degraded first tick notifies once via the transition below.
+        ax_control_available: true,
     };
     match daemon.platform.snapshot() {
         Ok(snapshot) => {
             let actions = daemon.engine.apply_event(Event::Snapshot(snapshot));
-            if let Err(err) = execute_actions_result(&mut *daemon.platform, actions) {
+            if let Err(err) = daemon.execute_tracked(actions) {
                 warn!(%err, "initial platform reconciliation failed");
             }
         }
@@ -199,6 +238,7 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
 
     let listener = UnixListener::bind(&path)
@@ -362,9 +402,20 @@ fn handle_client(
 }
 
 fn state_loop(
+    daemon: Daemon,
+    rx: Receiver<Envelope>,
+    subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
+) {
+    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100))
+        .max(MIN_RECOVERY_INTERVAL);
+    state_loop_with_interval(daemon, rx, subscribers, interval);
+}
+
+fn state_loop_with_interval(
     mut daemon: Daemon,
     rx: Receiver<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
+    interval: Duration,
 ) {
     // Startup warm-up: run the first observation immediately instead of
     // waiting for the first tick. This establishes the AX/SkyLight per-app
@@ -378,51 +429,16 @@ fn state_loop(
         warmup_ms = t_warm.elapsed().as_millis() as u64,
         "startup observation warm-up complete"
     );
-    // Full snapshots are an idle recovery watchdog. Window creation events
-    // enqueue an immediate Refresh for spawn tiling; focus events are resolved
-    // on demand by focus-defaulting window commands and recovered here when
-    // idle. Interactive Space/Workspace commands remain observation-free.
-    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100))
-        .max(MIN_RECOVERY_INTERVAL);
-    let mut last_observed_at = std::time::Instant::now();
+    let mut next_observation = std::time::Instant::now() + interval;
+    let mut next_heartbeat = std::time::Instant::now() + interval;
     loop {
-        let envelope = match rx.recv_timeout(interval) {
-            Ok(envelope) => envelope,
-            Err(RecvTimeoutError::Timeout) => {
-                let t_obs = std::time::Instant::now();
-                daemon.engine.abandon_pending_space_cursors();
-                if daemon.refresh_observation() {
-                    deliver_notification(&subscribers, &Notification::StateChanged);
-                }
-                let obs_ms = t_obs.elapsed().as_millis() as u64;
-                if obs_ms > 100 {
-                    tracing::info!(obs_ms, "slow periodic observation");
-                }
-                last_observed_at = std::time::Instant::now();
-                deliver_notification(&subscribers, &heartbeat_notification());
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        if envelope.event_wake {
-            daemon.refresh_wake.acknowledge();
+        // Service deadlines even when the request queue never becomes idle.
+        let now = std::time::Instant::now();
+        if now >= next_heartbeat {
+            deliver_notification(&subscribers, &heartbeat_notification());
+            next_heartbeat = now + interval;
         }
-
-        // Some commands must NOT pay the pre-handle observation:
-        // - Refresh observes inside handle() — two enumerations per
-        //   AX window-create event visibly delayed spawn→tile.
-        // - Workspace/Space focus are direct id switches; a full
-        //   snapshot (~100-500ms) before posting the swipe was THE
-        //   external-display switch lag.
-        // - Focus-defaulting window commands re-observe themselves
-        //   inside handle() at resolution time anyway.
-        let skip_pre_observe = match &envelope.request.command {
-            Command::Refresh => true,
-            Command::Workspace(_) | Command::Space(_) => true,
-            Command::Window(wc) if window_command_defaults_to_focus(wc) => true,
-            _ => false,
-        };
-        if !skip_pre_observe && last_observed_at.elapsed() >= interval {
+        if now >= next_observation {
             let t_obs = std::time::Instant::now();
             daemon.engine.abandon_pending_space_cursors();
             if daemon.refresh_observation() {
@@ -432,8 +448,21 @@ fn state_loop(
             if obs_ms > 100 {
                 tracing::info!(obs_ms, "slow periodic observation");
             }
-            last_observed_at = std::time::Instant::now();
+            next_observation = std::time::Instant::now() + interval;
+            continue;
         }
+        let wait = next_observation
+            .min(next_heartbeat)
+            .saturating_duration_since(std::time::Instant::now());
+        let envelope = match rx.recv_timeout(wait) {
+            Ok(envelope) => envelope,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if envelope.event_wake {
+            daemon.refresh_wake.acknowledge();
+        }
+
         let queue_wait_ms = envelope.queued_at.elapsed().as_millis() as u64;
         if queue_wait_ms > 50 {
             tracing::info!(
@@ -450,7 +479,7 @@ fn state_loop(
         let t_handle = std::time::Instant::now();
         let result = daemon.handle(envelope.request);
         if observes_internally {
-            last_observed_at = std::time::Instant::now();
+            next_observation = std::time::Instant::now() + interval;
         }
         tracing::debug!(
             handle_ms = t_handle.elapsed().as_millis() as u64,
@@ -544,6 +573,21 @@ fn window_command_defaults_to_focus(command: &WindowCommand) -> bool {
     }
 }
 
+/// Window commands that cannot do anything useful without Accessibility
+/// control, so they deserve AX_UNAVAILABLE instead of a secondary symptom.
+/// Raising/focusing and frame sets are AX mutations; focus-defaulting Space
+/// moves need focus resolution. Explicit-id Space moves are SA-backed and
+/// keep working while degraded.
+fn window_command_needs_ax(command: &WindowCommand) -> bool {
+    match command {
+        WindowCommand::Focus { .. }
+        | WindowCommand::FocusDirection { .. }
+        | WindowCommand::SetFrame { .. } => true,
+        WindowCommand::MoveToWorkspace { window, .. } => window.is_none(),
+        _ => false,
+    }
+}
+
 /// The result of handling one request: the one-shot Response plus any
 /// notifications describing state transitions that actually committed.
 struct HandleResult {
@@ -611,11 +655,16 @@ impl Daemon {
                 #[cfg(not(target_os = "macos"))]
                 let sa_reinject = None;
                 let snapshot_wedged_ms = self.platform.snapshot_wedged_ms();
+                let ax_degraded_now = ax_control_degraded(&self.platform.capabilities());
                 HandleResult::ok(
                 id,
                 json!({
                     "protocol": PROTOCOL_VERSION,
                     "capabilities": self.platform.capabilities(),
+                    "accessibility": {
+                        "control_available": !ax_degraded_now,
+                        "degraded_message": ax_degraded_now.then_some(AX_UNAVAILABLE_MESSAGE),
+                    },
                     "sa": sa_diagnostics,
                     "sa_reinject": sa_reinject.map(|d| json!({
                         "phase": d.phase,
@@ -670,11 +719,8 @@ impl Daemon {
                 QueryCommand::Focused => {
                     let focused = self
                         .engine
-                        .observed
-                        .windows
-                        .values()
-                        .find(|w| w.focused)
-                        .cloned();
+                        .focused_window()
+                        .and_then(|wid| self.engine.observed.windows.get(&wid).cloned());
                     HandleResult::ok(id, focused)
                 }
                 QueryCommand::Current => {
@@ -698,6 +744,19 @@ impl Daemon {
                 // Explicit-id commands need no observation.
                 if window_command_defaults_to_focus(&command) {
                     self.refresh_observation();
+                }
+                // Commands that fundamentally need Accessibility control fail
+                // fast with a permission error when it is known unavailable,
+                // instead of misleading engine errors caused by hollow
+                // observation (e.g. "no focused window" when nothing can
+                // report focus). Explicit Space moves (SA-backed) keep working.
+                // Live platform capabilities (cheap: cached SA attribs plus
+                // symbol/trust checks), never the engine copy, which is only
+                // synced on observation ticks and reloads.
+                if ax_control_degraded(&self.platform.capabilities())
+                    && window_command_needs_ax(&command)
+                {
+                    return HandleResult::err(id, "AX_UNAVAILABLE", AX_UNAVAILABLE_MESSAGE);
                 }
                 // Layout-mutating ops (swap/warp) change BSP structure without
                 // producing actions; they need snapshot → reconcile → verify.
@@ -880,7 +939,7 @@ impl Daemon {
                             // the window server settles. Drive the loop
                             // synchronously on the spawn path.
                             let exec = if spawned {
-                                match execute_actions_result(&mut *self.platform, actions) {
+                                match self.execute_tracked(actions) {
                                     Ok(()) => match self.platform.snapshot() {
                                         Ok(snap) => {
                                             let observed_spaces: Vec<SpaceId> =
@@ -899,17 +958,14 @@ impl Daemon {
                                                 followup = ?followup,
                                                 "workspace focus spawn followup"
                                             );
-                                            execute_actions_result(
-                                                &mut *self.platform,
-                                                followup,
-                                            )
+                                            self.execute_tracked(followup)
                                         }
                                         Err(err) => Err(err.into()),
                                     },
                                     Err(err) => Err(err),
                                 }
                             } else {
-                                execute_actions_result(&mut *self.platform, actions)
+                                self.execute_tracked(actions)
                             };
                             let target_space = self.engine.workspaces.backing_for(name);
                             if exec.is_ok() {
@@ -1212,6 +1268,21 @@ impl Daemon {
             self.engine.capabilities = fresh_caps;
             changed = true;
         }
+        // Accessibility-control transitions notify exactly once: degraded
+        // (available → unavailable, or unavailable at startup) posts one
+        // macOS notification pointing at the fix; restoration only logs.
+        // Ticks while the state is stable stay silent. The daemon keeps
+        // running — SLS space/topology control is unaffected.
+        let ax_available = !ax_control_degraded(&self.engine.capabilities);
+        if ax_available != self.ax_control_available {
+            self.ax_control_available = ax_available;
+            if ax_available {
+                info!("accessibility control restored; tiling and window focus available");
+            } else {
+                warn!("accessibility control unavailable; tiling, window focus, and focused-window commands are off");
+                notify_ax_control_lost();
+            }
+        }
         // Event-driven: display topology callback sets the flag on reconfiguration.
         if self.platform.needs_refresh() {
             self.engine.observed.bump_generation();
@@ -1231,7 +1302,10 @@ impl Daemon {
             Ok(snapshot) => {
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                 if !actions.is_empty() {
-                    execute_actions_result(&mut *self.platform, actions).unwrap_or_else(|err| {
+                    // Tracked: a failed CreateSpace here must release its
+                    // reservation (retry next cycle) rather than wedge the
+                    // single-flight slot; failed destroys recompute.
+                    self.execute_tracked(actions).unwrap_or_else(|err| {
                         self.engine
                             .flight_recorder
                             .record("platform.error", err.to_string());
@@ -1390,37 +1464,38 @@ impl Daemon {
         }
     }
 
-    fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
-        let destroy_spaces: Vec<SpaceId> = actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::DestroySpace { space } => Some(*space),
-                _ => None,
-            })
-            .collect();
-        if let Err(e) = execute_actions_result(&mut *self.platform, actions) {
-            for space in destroy_spaces {
-                self.engine.clear_pending_destroy(space);
+    /// Execute platform actions serially with lifecycle failure tracking.
+    /// The engine's reservations (single-flight CreateSpace, pending
+    /// destroys) are provable claims about mutations the OS accepted; when
+    /// serial execution reports otherwise, the reservations must be released
+    /// or lifecycle wedges waiting on confirmations that will never arrive:
+    /// - a failed (or never-reached, since CreateSpace is always last in an
+    ///   engine batch) CreateSpace releases the creation reservation so the
+    ///   next Alt+N / persistent pass can retry without duplicating;
+    /// - a failed DestroySpace releases its pending/topology reservations so
+    ///   the next snapshot recomputes them from fresh observation.
+    ///   Successful destroys are NOT released here — their reservation stands
+    ///   until observation proves the Space is gone (prevents double destroy).
+    fn execute_tracked(&mut self, actions: Vec<Action>) -> Result<()> {
+        for (i, action) in actions.iter().enumerate() {
+            if let Err(e) = self.platform.execute(action) {
+                // The failed action and everything after it never landed.
+                // Release exactly those reservations; earlier actions did run
+                // and keep theirs until observation confirms them.
+                self.engine.note_batch_failed(&actions[i..]);
+                return Err(e.into());
             }
-            return Err(e);
         }
+        Ok(())
+    }
+
+    fn execute_and_refresh(&mut self, actions: Vec<Action>) -> Result<()> {
+        self.execute_tracked(actions)?;
         // Re-snapshot to verify mutations landed, then reconcile any residual drift.
         let snapshot = self.platform.snapshot()?;
         let followup = self.engine.apply_event(Event::Snapshot(snapshot));
         if !followup.is_empty() {
-            let followup_destroy: Vec<SpaceId> = followup
-                .iter()
-                .filter_map(|a| match a {
-                    Action::DestroySpace { space } => Some(*space),
-                    _ => None,
-                })
-                .collect();
-            if let Err(e) = execute_actions_result(&mut *self.platform, followup) {
-                for space in followup_destroy {
-                    self.engine.clear_pending_destroy(space);
-                }
-                return Err(e);
-            }
+            self.execute_tracked(followup)?;
             self.engine
                 .flight_recorder
                 .record("reconcile.verification", "followup actions executed");
@@ -1430,7 +1505,7 @@ impl Daemon {
 
     fn execute_close_and_refresh(&mut self, window: WindowId, actions: Vec<Action>) -> Result<()> {
         self.engine.mark_pending_close(window);
-        let res = execute_actions_result(&mut *self.platform, actions);
+        let res = self.execute_tracked(actions);
         if res.is_err() {
             self.engine.clear_pending_close(window);
             return res;
@@ -1438,19 +1513,9 @@ impl Daemon {
         let snapshot = self.platform.snapshot()?;
         let followup = self.engine.apply_event(Event::Snapshot(snapshot));
         if !followup.is_empty() {
-            let followup_destroy: Vec<SpaceId> = followup
-                .iter()
-                .filter_map(|a| match a {
-                    Action::DestroySpace { space } => Some(*space),
-                    _ => None,
-                })
-                .collect();
-            let res2 = execute_actions_result(&mut *self.platform, followup);
+            let res2 = self.execute_tracked(followup);
             if res2.is_err() {
                 self.engine.clear_pending_close(window);
-                for space in followup_destroy {
-                    self.engine.clear_pending_destroy(space);
-                }
             }
             res2?;
             self.engine
@@ -1460,11 +1525,27 @@ impl Daemon {
         Ok(())
     }
 
-    /// Reset config-scoped runtime state, re-observe the real topology, and
-    /// remove empty unclaimed Spaces one at a time. Space IDs remain
-    /// authoritative; every deletion is observed as absent before another
-    /// decision, so Mission Control position compaction cannot corrupt logical
-    /// workspace identity.
+    /// Reload-time execution: attempt every corrective action so one failing
+    /// window (transient AX hiccup, unresolvable element) cannot abort the
+    /// whole heal. Each failure releases exactly that action's reservation
+    /// (single-element suffix) and is recorded; everything else still lands.
+    /// Safe because every action is re-derived from fresh observation each
+    /// cycle — a skipped dependent simply retries on the next tick.
+    fn execute_best_effort(&mut self, actions: Vec<Action>) {
+        for (i, action) in actions.iter().enumerate() {
+            if let Err(e) = self.platform.execute(action) {
+                self.engine.note_batch_failed(&actions[i..i + 1]);
+                self.engine
+                    .flight_recorder
+                    .record("platform.error", e.to_string());
+                warn!(action = ?action, %e, "reload: corrective action failed, continuing");
+            }
+        }
+    }
+
+    /// Apply configuration while preserving in-flight workspace lifecycles,
+    /// then reconcile observed native slots. External Spaces retain their
+    /// adoption grace; eligible deletions are verified before continuing.
     fn reload_config_and_self_heal(&mut self, config: Config) -> Result<usize> {
         const MAX_HEALED_SPACES: usize = 64;
         const VERIFY_POLLS: usize = 20;
@@ -1487,7 +1568,10 @@ impl Daemon {
                 )
             });
             if !actions.is_empty() {
-                execute_actions_result(&mut *self.platform, actions)?;
+                // Best-effort: one stubborn window must not abort frame healing
+                // for all others or skip the topology pass below. Topology
+                // mutations still hand back to the normal loop afterwards.
+                self.execute_best_effort(actions);
             }
             if topology_mutated {
                 // Persistent-workspace creation and ordinary dynamic cleanup
@@ -1590,6 +1674,45 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_continues_under_sustained_request_traffic() {
+        let (tx, rx) = mpsc::channel();
+        let (notification_tx, notification_rx) = sync_channel(32);
+        let subscribers = Arc::new(Mutex::new(vec![notification_tx]));
+        let worker = thread::spawn(move || {
+            state_loop_with_interval(test_daemon(), rx, subscribers, Duration::from_millis(10));
+        });
+        let until = std::time::Instant::now() + Duration::from_millis(80);
+        let mut id = 0;
+        while std::time::Instant::now() < until {
+            let (response, received) = mpsc::channel();
+            tx.send(Envelope {
+                request: Request {
+                    version: PROTOCOL_VERSION,
+                    id,
+                    command: Command::Query(QueryCommand::State),
+                },
+                response,
+                queued_at: std::time::Instant::now(),
+                event_wake: false,
+            })
+            .unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            id += 1;
+        }
+        drop(tx);
+        worker.join().unwrap();
+        let heartbeats = notification_rx
+            .try_iter()
+            .filter(|n| matches!(n, Notification::Heartbeat { .. }))
+            .count();
+        assert!(
+            heartbeats >= 2,
+            "busy state loop emitted {heartbeats} heartbeats"
+        );
+        assert!(id > 2);
+    }
+
+    #[test]
     fn subscription_heartbeat_is_typed_and_timestamped() {
         assert!(matches!(
             heartbeat_notification(),
@@ -1603,6 +1726,7 @@ mod tests {
         assert!(event_requests_immediate_refresh(
             WINDOW_DESTROYED_EVENT_KIND
         ));
+        assert!(event_requests_immediate_refresh(DRAG_ENDED_EVENT_KIND));
         assert!(!event_requests_immediate_refresh(2));
     }
 
@@ -1717,6 +1841,7 @@ mod tests {
         Daemon {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -1794,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_self_heals_empty_orphan_spaces_one_by_one() {
+    fn config_reload_preserves_external_space_adoption_grace() {
         let snapshot = Arc::new(std::sync::Mutex::new(PlatformSnapshot {
             windows: vec![],
             spaces: vec![
@@ -1863,9 +1988,9 @@ mod tests {
 
         let healed = daemon.reload_config_and_self_heal(config).unwrap();
 
-        assert_eq!(healed, 2);
-        assert_eq!(*destroyed.lock().unwrap(), vec![SpaceId(13), SpaceId(12)]);
-        assert_eq!(snapshot.lock().unwrap().spaces.len(), 1);
+        assert_eq!(healed, 0);
+        assert!(destroyed.lock().unwrap().is_empty());
+        assert_eq!(snapshot.lock().unwrap().spaces.len(), 3);
         assert_eq!(daemon.engine.workspaces.backing_for("1"), Some(SpaceId(11)));
     }
 
@@ -2293,6 +2418,7 @@ mod tests {
         let mut daemon = Daemon {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
             engine: Engine::new(Config::default()),
             platform: Box::new(platform),
             config: Config::default(),
@@ -2485,6 +2611,437 @@ mod tests {
             result.notifications,
             vec![Notification::StateChanged],
             "successful space mutation must emit StateChanged"
+        );
+    }
+}
+
+#[cfg(test)]
+mod creation_failure_tests {
+    use super::*;
+    use rovr_platform::{MockPlatform, Platform, PlatformError};
+    use rovr_protocol::ResponseOutcome;
+    use rovr_types::{
+        Capabilities, DisplayId, DisplaySnapshot, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot,
+    };
+
+    fn test_daemon() -> Daemon {
+        Daemon {
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
+            engine: Engine::new(Config::default()),
+            platform: Box::new(MockPlatform::default()),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        }
+    }
+
+    /// Platform whose FIRST CreateSpace fails (SA error) while later ones
+    /// succeed and materialize the new Space — models genuine creation
+    /// failure followed by deterministic recovery.
+    struct FailOnceSpawnPlatform {
+        snapshot: Arc<std::sync::Mutex<PlatformSnapshot>>,
+        executed: Arc<std::sync::Mutex<Vec<Action>>>,
+        fail_next_create: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Platform for FailOnceSpawnPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                create_space: true,
+                destroy_space: true,
+                focus_space: true,
+                ..Capabilities::default()
+            }
+        }
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            Ok(self.snapshot.lock().unwrap().clone())
+        }
+        fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+            self.executed.lock().unwrap().push(action.clone());
+            match action {
+                Action::CreateSpace { .. }
+                    if self
+                        .fail_next_create
+                        .swap(false, std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    Err(PlatformError::Operation(
+                        "simulated SA create failure".to_string(),
+                    ))
+                }
+                Action::CreateSpace { .. } => {
+                    let mut snap = self.snapshot.lock().unwrap();
+                    let next_id = snap.spaces.iter().map(|s| s.id.0).max().unwrap_or(0) + 1;
+                    let display_id = snap.spaces.first().map(|s| s.display_id);
+                    if let Some(display) = display_id {
+                        let new_pos = snap.spaces.len() as u32;
+                        snap.spaces.push(SpaceSnapshot {
+                            id: SpaceId(next_id),
+                            display_id: display,
+                            label: None,
+                            focused: false,
+                            generation: 1,
+                            position: new_pos,
+                            is_fullscreen: false,
+                            is_system: false,
+                        });
+                    }
+                    Ok(())
+                }
+                Action::FocusSpace { space } => {
+                    for s in self.snapshot.lock().unwrap().spaces.iter_mut() {
+                        s.focused = s.id == *space;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn single_space_snapshot() -> PlatformSnapshot {
+        PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![SpaceSnapshot {
+                id: SpaceId(1),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 1,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            }],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 1,
+            }],
+            complete: true,
+        }
+    }
+
+    /// The daemon must translate a platform CreateSpace failure into the
+    /// engine's explicit-failure evidence (releasing single-flight), so the
+    /// user's next Alt+N retries exactly once and then binds — no wedge, no
+    /// duplicate.
+    #[test]
+    fn failed_workspace_spawn_releases_reservation_and_retry_succeeds() {
+        let snapshot = Arc::new(std::sync::Mutex::new(single_space_snapshot()));
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "1".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: None,
+                persistent: true,
+                plugin: None,
+            }],
+            ..Config::default()
+        });
+        daemon.config = daemon.engine.config.clone();
+        daemon.platform = Box::new(FailOnceSpawnPlatform {
+            snapshot: snapshot.clone(),
+            executed: executed.clone(),
+            fail_next_create: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        let _ = daemon
+            .engine
+            .apply_event(Event::Snapshot(snapshot.lock().unwrap().clone()));
+
+        // First Alt+2: the platform CreateSpace fails.
+        let result = daemon.handle(Request::new(
+            1,
+            Command::Workspace(WorkspaceCommand::Focus { name: "2".into() }),
+        ));
+        assert!(
+            matches!(result.response.outcome, ResponseOutcome::Error { .. }),
+            "failed spawn must surface PLATFORM_ERROR"
+        );
+        assert!(
+            daemon
+                .engine
+                .flight_recorder
+                .snapshot()
+                .iter()
+                .any(|r| r.kind == "workspace.creation_failed"),
+            "failure must release the reservation with explicit evidence"
+        );
+
+        // Retry Alt+2: exactly one fresh CreateSpace issues, binds, focuses.
+        let result = daemon.handle(Request::new(
+            2,
+            Command::Workspace(WorkspaceCommand::Focus { name: "2".into() }),
+        ));
+        assert!(
+            matches!(result.response.outcome, ResponseOutcome::Ok { .. }),
+            "retry after explicit failure must succeed"
+        );
+        let executed = executed.lock().unwrap().clone();
+        assert_eq!(
+            executed
+                .iter()
+                .filter(|a| matches!(a, Action::CreateSpace { .. }))
+                .count(),
+            2,
+            "exactly one attempt per Alt+N, no duplicates: {executed:?}"
+        );
+        assert_eq!(
+            executed
+                .iter()
+                .filter(|a| matches!(a, Action::FocusSpace { .. }))
+                .count(),
+            1,
+            "the retry must bind and fire the queued focus: {executed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_recovery_tests {
+    use super::*;
+    use rovr_platform::{MockPlatform, Platform, PlatformError};
+    use rovr_protocol::ResponseOutcome;
+    use rovr_types::{
+        Capabilities, DisplayId, DisplaySnapshot, ObservedBool, PlatformSnapshot, ProcessId, Rect,
+        SpaceId, SpaceSnapshot, WindowId, WindowSnapshot,
+    };
+
+    fn test_daemon() -> Daemon {
+        Daemon {
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
+            engine: Engine::new(Config::default()),
+            platform: Box::new(MockPlatform::default()),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        }
+    }
+
+    /// Platform that models an Accessibility grant coming and going: while
+    /// degraded it reports no AX capabilities and fails AX mutations, like
+    /// the real bridge without trust. Flipping the flag is the test's only
+    /// lever — engine state is never touched directly, exactly as a live
+    /// permission grant only changes what the platform reports.
+    struct GrantFlappingPlatform {
+        ax_available: Arc<std::sync::atomic::AtomicBool>,
+        snapshot: Arc<std::sync::Mutex<PlatformSnapshot>>,
+        executed: Arc<std::sync::Mutex<Vec<Action>>>,
+    }
+
+    impl Platform for GrantFlappingPlatform {
+        fn capabilities(&self) -> Capabilities {
+            let ax = self.ax_available.load(std::sync::atomic::Ordering::Relaxed);
+            Capabilities {
+                focus_window: ax,
+                set_window_frame: ax,
+                ..Capabilities::default()
+            }
+        }
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            Ok(self.snapshot.lock().unwrap().clone())
+        }
+        fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+            self.executed.lock().unwrap().push(action.clone());
+            let ax = self.ax_available.load(std::sync::atomic::Ordering::Relaxed);
+            match action {
+                Action::SetWindowFrame { .. } | Action::FocusWindow { .. } if !ax => Err(
+                    PlatformError::Operation("AX unavailable (permission not granted)".to_string()),
+                ),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn drifted_snapshot() -> PlatformSnapshot {
+        PlatformSnapshot {
+            windows: vec![WindowSnapshot {
+                id: WindowId(1),
+                pid: ProcessId(1),
+                app: "Finder".into(),
+                bundle_id: None,
+                title: "".into(),
+                frame: Rect {
+                    x: 400.0,
+                    y: 300.0,
+                    width: 500.0,
+                    height: 400.0,
+                },
+                space_id: Some(SpaceId(11)),
+                display_id: Some(DisplayId(1)),
+                focused: false,
+                minimized: ObservedBool::No,
+                fullscreen: ObservedBool::No,
+                managed: ObservedBool::Yes,
+                generation: 0,
+            }],
+            spaces: vec![SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            }],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 0,
+            }],
+            complete: true,
+        }
+    }
+
+    fn single_workspace_config() -> Config {
+        Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "1".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: None,
+                persistent: true,
+                plugin: None,
+            }],
+            ..Config::default()
+        }
+    }
+
+    fn set_frame_count(executed: &std::sync::Mutex<Vec<Action>>) -> usize {
+        executed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| matches!(a, Action::SetWindowFrame { .. }))
+            .count()
+    }
+
+    fn ax_error_code(result: &HandleResult) -> Option<String> {
+        match &result.response.outcome {
+            ResponseOutcome::Error { error } => Some(error.code.clone()),
+            _ => None,
+        }
+    }
+
+    /// While Accessibility control is unavailable, AX-fundamental commands
+    /// must fail with the structured permission error — never with secondary
+    /// symptoms like "no focused window".
+    #[test]
+    fn degraded_commands_report_permission_not_symptoms() {
+        let ax_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = single_workspace_config();
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(config.clone());
+        daemon.config = config;
+        daemon.platform = Box::new(GrantFlappingPlatform {
+            ax_available,
+            snapshot: Arc::new(std::sync::Mutex::new(drifted_snapshot())),
+            executed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        assert_eq!(
+            ax_error_code(&daemon.handle(Request::new(
+                1,
+                Command::Window(WindowCommand::SetFrame {
+                    window: WindowId(1),
+                    frame: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                }),
+            ))),
+            Some("AX_UNAVAILABLE".to_string())
+        );
+        assert_eq!(
+            ax_error_code(&daemon.handle(Request::new(
+                2,
+                Command::Window(WindowCommand::Focus {
+                    window: WindowId(1),
+                }),
+            ))),
+            Some("AX_UNAVAILABLE".to_string())
+        );
+        assert_eq!(
+            ax_error_code(&daemon.handle(Request::new(
+                3,
+                Command::Window(WindowCommand::MoveToWorkspace {
+                    window: None,
+                    workspace: "1".into(),
+                }),
+            ))),
+            Some("AX_UNAVAILABLE".to_string())
+        );
+    }
+
+    /// Alt+Shift+R must refresh capabilities from the platform and heal with
+    /// them — no daemon restart, no Space switch. While degraded, one failing
+    /// frame must not abort the reload; after the grant, frames flow again.
+    #[test]
+    fn reload_recovers_capabilities_and_heals_frames_without_restart() {
+        let ax_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let snapshot = Arc::new(std::sync::Mutex::new(drifted_snapshot()));
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = single_workspace_config();
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(config.clone());
+        daemon.config = config.clone();
+        daemon.platform = Box::new(GrantFlappingPlatform {
+            ax_available: ax_available.clone(),
+            snapshot: snapshot.clone(),
+            executed: executed.clone(),
+        });
+
+        // Phase 1 (degraded): reload still converges — the failing frame is
+        // attempted, recorded, and does not abort the pass.
+        daemon
+            .reload_config_and_self_heal(config.clone())
+            .expect("degraded reload must not fail the whole heal");
+        assert!(!daemon.engine.capabilities.set_window_frame);
+        assert_eq!(
+            set_frame_count(executed.as_ref()),
+            1,
+            "drift correction must be attempted even while degraded"
+        );
+
+        // Phase 2 (grant arrives, no restart): reload refreshes capabilities,
+        // consumes a fresh snapshot, and frame actions flow again.
+        ax_available.store(true, std::sync::atomic::Ordering::Relaxed);
+        executed.lock().unwrap().clear();
+        daemon
+            .reload_config_and_self_heal(config)
+            .expect("post-grant reload must succeed");
+        assert!(daemon.engine.capabilities.set_window_frame);
+        assert!(daemon.engine.capabilities.focus_window);
+        assert_eq!(
+            daemon.engine.observed.windows[&WindowId(1)].frame,
+            drifted_snapshot().windows[0].frame,
+            "a fresh snapshot must be consumed on reload"
+        );
+        assert_eq!(
+            set_frame_count(executed.as_ref()),
+            1,
+            "post-grant reload must emit the correction with no Space switch"
         );
     }
 }

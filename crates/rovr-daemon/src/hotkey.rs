@@ -106,6 +106,7 @@ pub fn create_hotkey_manager(config: Config, socket_path: PathBuf) -> Option<Hot
                 .ok()
                 .and_then(|commands| commands.get(&event.id).cloned());
             let Some(cmd_str) = command else { continue };
+            info!(id=%event.id, cmd=%cmd_str, "hotkey: pressed");
             match parse_command(&cmd_str) {
                 Ok(command) => {
                     if dispatch_tx.try_send((cmd_str.clone(), command)).is_err() {
