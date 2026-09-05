@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rovr: how it works, down to the atoms</title>
+<meta name="description" content="A guided tour of the Rovr window manager codebase as it stands now: loop, crates, types, engine, layout, config, protocol, platform, daemon, CLI, scripting addition, and current status.">
+<style>
+:root{
+  --bg:#0b0f17; --panel:#101724; --panel2:#0f172a; --border:#1f2b3d;
+  --text:#e6ebf3; --muted:#9aa7bd; --faint:#6b7a93;
+  --blue:#3b82f6; --blue2:#2563eb; --orange:#f97316; --green:#22c55e;
+  --amber:#f59e0b; --red:#f87171; --code:#0a1220;
+  --radius:14px; --max:1120px;
+  --font:Inter,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f8fafc; --panel:#ffffff; --panel2:#f1f5f9; --border:#e2e8f0;
+    --text:#0f172a; --muted:#475569; --faint:#64748b; --code:#0f172a; }
+  body{ background:var(--bg); }
+  pre, code{ color:#e6ebf3; }
+  .card p, .card li, .lede, td, th{ color:var(--text); }
+  .topbar{ background:rgba(255,255,255,.9); }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} *{animation:none!important;transition:none!important} }
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.65;font-size:16px}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible,button:focus-visible{outline:3px solid var(--blue);outline-offset:2px;border-radius:6px}
+.skip{position:absolute;left:-9999px;top:0;background:var(--blue2);color:#fff;padding:10px 16px;border-radius:0 0 10px 0;z-index:99}
+.skip:focus{left:0}
+.topbar{position:sticky;top:0;z-index:50;background:rgba(11,15,23,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topbar-inner{max-width:var(--max);margin:0 auto;padding:12px 20px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px}
+.brand-mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--blue2),var(--blue));display:grid;place-items:center;color:#fff;font-weight:800}
+.topbar nav{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+.topbar nav a{color:var(--muted);padding:8px 10px;border-radius:8px;font-size:14px;min-height:44px;display:inline-flex;align-items:center}
+.topbar nav a:hover{color:var(--text);background:var(--panel2)}
+.wrap{max-width:var(--max);margin:0 auto;padding:0 20px}
+.hero{padding:44px 0 18px}
+.kicker{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.kicker .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
+h1{font-size:clamp(30px,4.6vw,52px);line-height:1.08;margin:14px 0 12px;letter-spacing:-.02em}
+.lede{font-size:clamp(16px,2vw,19px);color:var(--muted);max-width:70ch}
+.status-row{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 6px}
+.pill{border:1px solid var(--border);background:var(--panel);border-radius:999px;padding:7px 13px;font-size:13.5px;color:var(--muted)}
+.pill strong{color:var(--text);font-weight:650}
+.pill.ok{border-color:rgba(34,197,94,.4)} .pill.warn{border-color:rgba(245,158,11,.45)}
+.grid{display:grid;gap:16px}
+@media(min-width:960px){ .layout{grid-template-columns:248px 1fr;align-items:start} }
+.toc{position:sticky;top:70px;border:1px solid var(--border);background:var(--panel);border-radius:var(--radius);padding:14px}
+.toc h2{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);margin:4px 6px 10px}
+.toc ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+.toc a{display:block;padding:8px 10px;border-radius:8px;color:var(--muted);font-size:14px;min-height:40px}
+.toc a:hover{background:var(--panel2);color:var(--text)}
+section.card{border:1px solid var(--border);background:var(--panel);border-radius:var(--radius);padding:26px;margin:18px 0}
+section.card h2{font-size:24px;margin:0 0 6px;letter-spacing:-.01em}
+section.card h3{font-size:17px;margin:26px 0 8px}
+section.card h4{font-size:15px;margin:18px 0 6px;color:var(--muted);text-transform:none}
+.sub{color:var(--muted);margin:0 0 14px;max-width:72ch}
+p,li{max-width:75ch}
+ul.tight li,ol.tight li{margin:4px 0}
+pre{background:var(--code);border:1px solid var(--border);border-radius:12px;padding:16px;overflow:auto;font-family:var(--mono);font-size:13.5px;line-height:1.6;color:#e6ebf3}
+code{font-family:var(--mono);font-size:.88em;background:rgba(59,130,246,.12);padding:2px 6px;border-radius:6px}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14.5px;display:block;overflow-x:auto}
+thead th{text-align:left;color:var(--faint);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.08em;padding:10px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+tbody td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+.diagram{border:1px solid var(--border);background:var(--panel2);border-radius:12px;padding:16px;margin:14px 0;overflow-x:auto}
+.diagram svg{min-width:560px;width:100%;height:auto;display:block}
+.diagram figcaption,.cap{color:var(--faint);font-size:13.5px;margin-top:10px}
+.callout{border-left:3px solid var(--blue);background:rgba(59,130,246,.08);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;color:var(--text)}
+.callout.warn{border-color:var(--amber);background:rgba(245,158,11,.08)}
+.callout.good{border-color:var(--green);background:rgba(34,197,94,.08)}
+.kv{display:grid;gap:10px;margin:12px 0}
+@media(min-width:720px){.kv{grid-template-columns:1fr 1fr}}
+.kv .cell{border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel)}
+.cell b{display:block;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);margin-bottom:4px}
+.tag{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);margin-right:6px}
+.tag.verified{color:#86efac;border-color:rgba(34,197,94,.4)}
+.tag.partial{color:#fcd34d;border-color:rgba(245,158,11,.45)}
+.tag.open{color:#fca5a5;border-color:rgba(248,113,113,.4)}
+footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
+.rule{height:1px;background:var(--border);margin:18px 0}
+.two{display:grid;gap:14px}@media(min-width:820px){.two{grid-template-columns:1fr 1fr}}
+.mono-list{font-family:var(--mono);font-size:13.5px}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header class="topbar">
+<div class="topbar-inner">
+<div class="brand"><span class="brand-mark" aria-hidden="true">R</span> Rovr internals</div>
+<nav aria-label="Sections">
+<a href="#status">Status</a><a href="#stack">Stack</a><a href="#loop">Loop</a><a href="#crates">Crates</a><a href="#engine">Engine</a><a href="#platform">Platform</a><a href="#daemon">Daemon</a><a href="#sa">Scripting addition</a>
+</nav>
+</div>
+</header>
+<div class="wrap">
+<div class="hero">
+<span class="kicker"><span class="dot" aria-hidden="true"></span> macOS window manager in Rust</span>
+<h1>Rovr: how it works, down to the atoms</h1>
+<p class="lede">Rovr keeps the macOS knowledge from yabai and replaces the architecture around it. It treats macOS state as untrusted, holds two models of the world, and reconciles them in a loop. This page traces that idea from the top level to the exact structs, files, and threads that carry it out, as the tree stands now.</p>
+<div class="status-row" role="list">
+<span class="pill" role="listitem"><strong>Prime rule:</strong> never assume an OS mutation worked. Re-observe and verify.</span>
+<span class="pill" role="listitem"><strong>Core loop:</strong> observe, decide, execute, verify, reconcile</span>
+<span class="pill" role="listitem"><strong>Tests:</strong> 141 passed at last full check</span>
+</div>
+</div>
+<div class="grid layout">
+<nav class="toc" aria-label="Table of contents">
+<h2>Contents</h2>
+<ol>
+<li><a href="#status">0. Where it is right now</a></li>
+<li><a href="#stack">1. The stack in one picture</a></li>
+<li><a href="#loop">2. The one loop that runs everything</a></li>
+<li><a href="#crates">3. Crate map</a></li>
+<li><a href="#atoms">4. Atom layer: ids, rects, snapshots</a></li>
+<li><a href="#states">5. Observed state and desired state</a></li>
+<li><a href="#engine">6. Engine: events in, actions out</a></li>
+<li><a href="#layout">7. Layout is pure math</a></li>
+<li><a href="#config">8. Config: parse, validate, compile, commit</a></li>
+<li><a href="#protocol">9. Protocol: typed IPC over a socket</a></li>
+<li><a href="#platform">10. Platform boundary</a></li>
+<li><a href="#daemon">11. Daemon threads and latency fixes</a></li>
+<li><a href="#cli">12. CLI: a thin client</a></li>
+<li><a href="#sa">13. Scripting addition stack</a></li>
+<li><a href="#reliability">14. Recovery and observability</a></li>
+<li><a href="#next">15. Gaps and what comes next</a></li>
+</ol>
+</nav>
+<main id="main">
+<section class="card" id="status">
+<h2>0. Where it is right now</h2>
+<p class="sub">Read this first. It tells you which parts you can trust and which parts still need a live macOS session to prove.</p>
+<div class="kv">
+<div class="cell"><b>Live verified on macOS 26.5 arm64e</b>Scripting addition injected into the live Dock, all space ops and cosmetics verified with re-observation, <code>killall Dock</code> reinjection in about 6 seconds with full <code>0x7ff</code> attributes. Rapid workspace switches at 250 ms spacing finish in 240 ms or less with zero queue waits.</div>
+<div class="cell"><b>Checks at last full pass</b><code>cargo fmt --check</code>, <code>clippy --workspace --all-targets -- -D warnings</code>, and <code>cargo test --workspace</code> all clean. Workspace suite reports 141 passed. Swift menu bar app untouched.</div>
+</div>
+<p><span class="tag verified">verified end to end</span> <span class="tag partial">logic tested, live run pending</span> <span class="tag open">open</span></p>
+<table>
+<thead><tr><th>Blocker</th><th>State</th><th>What changed</th></tr></thead>
+<tbody>
+<tr><td>1. Owned scripting addition</td><td><span class="tag verified">verified</span></td><td>Real ObjC payload, root loader, <code>sa install</code> and <code>status</code> with five honest states. Open remainder: protocol v2 interop rerun and reboot recovery.</td></tr>
+<tr><td>2. Snapshot timeout leaks threads</td><td><span class="tag partial">logic tested</span></td><td>One <code>BoundedWorker</code> thread owns observation. Fail fast while wedged, recover only after the timed out closure returns. Real AX hang not yet reproduced live.</td></tr>
+<tr><td>3. Workspace remap shuffles identity</td><td><span class="tag partial">logic tested</span></td><td>Stable config <code>ordinal</code>, resume by <code>last_position</code>, ordinal order assignment. 200 repetition test for code to 101 and chat to 102 never swaps. Dock restart on hardware not yet exercised.</td></tr>
+<tr><td>4. Persistent workspaces not recreated</td><td><span class="tag partial">logic tested</span></td><td>Engine emits one deterministic <code>CreateSpace</code> per cycle for the lowest ordinal missing persistent workspace. New id learned only from the next snapshot.</td></tr>
+<tr><td>5. BSP keyed by volatile SpaceId</td><td><span class="tag partial">logic tested</span></td><td>Workspaces own layout state. Remap returns <code>RemapMove</code> records and the engine carries trees across. Tree survives 11 to 101 byte identically, across save and load.</td></tr>
+<tr><td>6. Hotkeys invalid on macOS threads</td><td><span class="tag partial">logic tested</span></td><td>Daemon main thread owns the hotkey manager and runs the AppKit loop. Socket accept moved to a worker. Firing needs a manual UI session run.</td></tr>
+<tr><td>7 and 8. Hotkey syntax drift, silent Ping</td><td><span class="tag verified">verified</span></td><td>One shared parser <code>rovr_protocol::command_parser::parse_command</code>. Invalid binds fail load and reload. No fallback to Ping.</td></tr>
+<tr><td>9. Sticky rule desired state</td><td><span class="tag verified">verified</span></td><td><code>desired.space</code> is rebuilt from scratch every <code>apply_layout</code> cycle. Rules own it. Manual moves stay one shot actions.</td></tr>
+<tr><td>10. Regex validated but unused</td><td><span class="tag verified">verified</span></td><td><code>Config::compile_rules</code> builds <code>CompiledRule</code> once per load. Runtime matches compiled regexes in config order.</td></tr>
+<tr><td>11. WASM memory cap claimed only</td><td><span class="tag partial">logic tested</span></td><td>wasmi <code>StoreLimits</code> per call: 16 MiB linear memory, table cap, fuel budget, no host imports. Malicious plugin survival on live macOS not yet run.</td></tr>
+<tr><td>12. Plugin output unvalidated</td><td><span class="tag verified">verified</span></td><td><code>validate_placements</code> checks count, duplicates, foreign ids, finite coords, positive sizes. Bad output is dropped wholesale and the built in layout runs.</td></tr>
+<tr><td>13. Unknown state shown as false</td><td><span class="tag partial">logic tested</span></td><td><code>ObservedBool::Yes/No/Unknown</code> flows through the bridge as 0/1/2. Tiling stays conservative when Unknown. Query output serializes unknown honestly.</td></tr>
+<tr><td>14. SA reinjection after Dock restart</td><td><span class="tag partial">logic tested</span></td><td>Root LaunchDaemon helper with a two call API, plus a pure reinject state machine with backoff. Live install, Dock kill, reboot, and crash loops still need an interactive session.</td></tr>
+<tr><td>14b and 14c. Latency, parity commands</td><td><span class="tag verified">verified</span></td><td>O(apps plus windows) enumeration, async periodic snapshots, adaptive cadence, gesture gate by timestamp, cross display focus. New window close, float toggle, swap and warp by direction, resize by edge. 112 tests in that wave.</td></tr>
+</tbody>
+</table>
+<div class="callout warn"><strong>Known platform gap on macOS 26.5.</strong> Background apps return an empty <code>kAXWindowsAttribute</code> list. Only the frontmost app refines minimized, fullscreen, and managed state. This limits tiling refinement and focus by id for background windows. The team tracks it as a platform gap, not a scripting addition bug.</div>
+</section>
+<section class="card" id="stack">
+<h2>1. The stack in one picture</h2>
+<p class="sub">Rust owns product logic. macOS specifics live behind one trait. The CLI holds no policy.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 430" role="img" aria-labelledby="stackT stackD">
+<title id="stackT">Rovr stack from CLI to macOS</title>
+<desc id="stackD">CLI and clients talk typed versioned IPC to the Rust daemon. The daemon holds events, observed state, desired state, reconciler, rules, layouts, config, persistence, and recovery. It calls a safe platform interface, which calls the macOS layer with Accessibility, SkyLight, Spaces, Dock, and Mach code, which drives macOS.</desc>
+<rect x="150" y="10" width="420" height="44" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="360" y="37" text-anchor="middle" fill="#e6ebf3" font-size="14" font-weight="700">CLI and clients (rovr-cli, hotkeys, subscribers)</text>
+<rect x="310" y="62" width="100" height="30" rx="8" fill="#0f172a" stroke="#334155"/><text x="360" y="82" text-anchor="middle" fill="#9aa7bd" font-size="12">typed IPC v1</text>
+<rect x="110" y="100" width="500" height="150" rx="12" fill="#101724" stroke="#3b82f6"/>
+<text x="360" y="122" text-anchor="middle" fill="#e6ebf3" font-size="14" font-weight="700">Rust daemon (single owner of mutable state)</text>
+<text x="360" y="144" text-anchor="middle" fill="#9aa7bd" font-size="12">events  observed  desired  reconciler  rules  layouts  config  persistence  recovery</text>
+<text x="360" y="164" text-anchor="middle" fill="#9aa7bd" font-size="12">workspace registry  BSP state  flight recorder  notifications</text>
+<text x="360" y="196" text-anchor="middle" fill="#9aa7bd" font-size="12">observe, decide, execute, verify, reconcile</text>
+<rect x="200" y="200" width="320" height="34" rx="8" fill="#13233a" stroke="#334155"/><text x="360" y="222" text-anchor="middle" fill="#e6ebf3" font-size="12">observed vs desired, generation tagged</text>
+<rect x="180" y="260" width="360" height="40" rx="10" fill="#0f172a" stroke="#22c55e"/><text x="360" y="285" text-anchor="middle" fill="#e6ebf3" font-size="13" font-weight="600">safe Platform trait (thin and boring)</text>
+<rect x="110" y="310" width="500" height="100" rx="12" fill="#101724" stroke="#f59e0b"/>
+<text x="360" y="332" text-anchor="middle" fill="#e6ebf3" font-size="13" font-weight="700">macOS platform layer (unsafe stays here)</text>
+<text x="360" y="353" text-anchor="middle" fill="#9aa7bd" font-size="12">Accessibility  SkyLight  Spaces  Dock and scripting addition  Mach</text>
+<text x="360" y="372" text-anchor="middle" fill="#9aa7bd" font-size="12">capabilities, not OS version checks</text>
+</svg>
+<figcaption>PRODUCT.md draws this boundary on purpose. Core never asks which macOS it runs on. It asks what the platform can do.</figcaption>
+</figure>
+<div class="kv">
+<div class="cell"><b>Platform may</b>Enumerate windows, displays, and Spaces. Move, resize, focus. Move windows between Spaces. Create, destroy, reorder, and focus Spaces. Set layer, opacity, sticky, shadow, scale. Subscribe to native events.</div>
+<div class="cell"><b>Platform must not</b>Choose layouts. Evaluate rules. Decide workspace policy. Parse config. Own desired state. Hold product behavior. If a macOS hack is needed, it stays inside this layer.</div>
+</div>
+</section>
+<section class="card" id="loop">
+<h2>2. The one loop that runs everything</h2>
+<p class="sub">macOS can miss events, return stale data, move windows on its own, rebuild Spaces after sleep, restart the Dock, or reject an operation. The loop below is how Rovr stays correct anyway.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 210" role="img" aria-labelledby="loopT loopD">
+<title id="loopT">Observe, decide, execute, verify, reconcile</title>
+<desc id="loopD">Five stages in a row with a verify edge that re-observes and feeds back into reconcile.</desc>
+<rect x="10" y="60" width="118" height="70" rx="12" fill="#13233a" stroke="#3b82f6"/><text x="69" y="88" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">observe</text><text x="69" y="108" text-anchor="middle" fill="#9aa7bd" font-size="11">snapshot</text>
+<rect x="156" y="60" width="118" height="70" rx="12" fill="#13233a" stroke="#3b82f6"/><text x="215" y="88" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">decide</text><text x="215" y="108" text-anchor="middle" fill="#9aa7bd" font-size="11">layout + rules</text>
+<rect x="302" y="60" width="118" height="70" rx="12" fill="#13233a" stroke="#3b82f6"/><text x="361" y="88" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">execute</text><text x="361" y="108" text-anchor="middle" fill="#9aa7bd" font-size="11">typed Action</text>
+<rect x="448" y="60" width="118" height="70" rx="12" fill="#13233a" stroke="#22c55e"/><text x="507" y="88" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">verify</text><text x="507" y="108" text-anchor="middle" fill="#9aa7bd" font-size="11">re-observe</text>
+<rect x="594" y="60" width="118" height="70" rx="12" fill="#13233a" stroke="#f59e0b"/><text x="653" y="88" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">reconcile</text><text x="653" y="108" text-anchor="middle" fill="#9aa7bd" font-size="11">diff + retry</text>
+<text x="128" y="100" text-anchor="middle" fill="#3b82f6" font-size="18">→</text><text x="274" y="100" text-anchor="middle" fill="#3b82f6" font-size="18">→</text><text x="420" y="100" text-anchor="middle" fill="#3b82f6" font-size="18">→</text><text x="566" y="100" text-anchor="middle" fill="#3b82f6" font-size="18">→</text>
+<path d="M 507 130 C 507 175 215 175 150 135" fill="none" stroke="#22c55e" stroke-width="2" stroke-dasharray="6 5"/><text x="330" y="192" text-anchor="middle" fill="#86efac" font-size="12">mismatch feeds back into the next reconcile</text>
+</svg>
+<figcaption>Native callbacks only translate macOS events into typed events. They never apply layout directly.</figcaption>
+</figure>
+<pre><code>macOS callback -&gt; typed Event -&gt; update ObservedState
+  -&gt; reconcile -&gt; Action -&gt; Platform -&gt; macOS
+  -&gt; re-observe -&gt; verify -&gt; reconcile again</code></pre>
+<div class="callout"><strong>What verify means in code.</strong> After a mutation the daemon snapshots again through <code>execute_and_refresh</code>. If observed and desired still differ, the next <code>reconcile</code> emits fresh actions. No step trusts its own write.</div>
+</section>
+<section class="card" id="crates">
+<h2>3. Crate map</h2>
+<p class="sub">Twelve workspace members plus one Swift app. Read them bottom up: types first, then core, then the edges.</p>
+<table>
+<thead><tr><th>Crate</th><th>Path</th><th>Owns</th></tr></thead>
+<tbody>
+<tr><td><code>rovr-types</code></td><td><code>crates/rovr-types/src/lib.rs</code></td><td>Ids, <code>Rect</code>, <code>Direction</code>, <code>LayoutKind</code>, <code>ObservedBool</code>, snapshots, <code>Capabilities</code>. No logic.</td></tr>
+<tr><td><code>rovr-core</code></td><td><code>crates/rovr-core/src/{engine,state,event,action,reconcile,workspace,bsp,layout,layout_state,persistence,flight_recorder}.rs</code></td><td>State machine, reducer, reconciler, workspaces, BSP trees, persistence, flight recorder. Almost no unsafe code.</td></tr>
+<tr><td><code>rovr-layout</code></td><td><code>crates/rovr-layout/src/lib.rs</code></td><td>Pure geometry for BSP, stack, monocle, master, columns, float. Input rect plus window order, output placements. No FFI.</td></tr>
+<tr><td><code>rovr-layout-plugin</code></td><td><code>crates/rovr-layout-plugin/src/lib.rs</code></td><td>WASM plugin registry on wasmi. Fuel budget, 16 MiB memory cap, output validation with built in fallback.</td></tr>
+<tr><td><code>rovr-config</code></td><td><code>crates/rovr-config/src/lib.rs</code></td><td>TOML model, validation, <code>compile_rules</code>, keybind checks against the shared command parser.</td></tr>
+<tr><td><code>rovr-protocol</code></td><td><code>crates/rovr-protocol/src/{lib,command_parser,hotkey}.rs</code></td><td>Versioned <code>Request</code>, <code>Command</code>, <code>Response</code>, <code>Notification</code>. One CLI style grammar used by CLI, hotkeys, and config validation.</td></tr>
+<tr><td><code>rovr-platform</code></td><td><code>crates/rovr-platform/src/{lib,mock,bounded_worker,macos/mod,macos/sa,macos/reinject}.rs</code></td><td><code>Platform</code> trait, mock backend, bounded observation worker, macOS bridge, SA client, reinject state machine.</td></tr>
+<tr><td><code>rovr-daemon</code></td><td><code>crates/rovr-daemon/src/{main,hotkey}.rs</code></td><td>Single owner state loop, Unix socket server, subscribers, doctor data, hotkey manager on the main thread.</td></tr>
+<tr><td><code>rovr-cli</code></td><td><code>crates/rovr-cli/src/main.rs</code></td><td>Thin IPC client. Maps clap subcommands to protocol commands. Also owns <code>sa install</code>, <code>status</code>, <code>uninstall</code> flows.</td></tr>
+<tr><td><code>rovr-sa-payload</code></td><td><code>crates/rovr-sa-payload</code></td><td>ObjC dylib injected into Dock. Socket <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code>, handshake <code>rovr-sa-2.0</code>, opcodes for space lifecycle and cosmetics.</td></tr>
+<tr><td><code>rovr-sa-loader</code></td><td><code>crates/rovr-sa-loader</code></td><td>Root injector adapted from yabai loader.m with attribution. arm64e build with PAC ABI patch.</td></tr>
+<tr><td><code>rovr-sa-helper</code></td><td><code>crates/rovr-sa-helper</code></td><td>Minimal root LaunchDaemon at <code>/var/run/rovr-sa-helper.sock</code>. Exactly <code>inject</code> plus <code>status</code>. No pid, path, or command fields.</td></tr>
+<tr><td>menu bar app</td><td><code>apps/rovr-menu-bar</code></td><td>Optional native Swift status and debug UI. No changes in the current pass.</td></tr>
+</tbody>
+</table>
+<p>Shared roots: <code>Cargo.toml</code> sets workspace version <code>0.1.0</code>, edition 2021, Rust 1.78. Default config lives at <code>~/.config/rovr/rovr.toml</code> with <code>config/rovr.example.toml</code> as the reference. Runtime sockets live under <code>/tmp/rovr-&lt;uid&gt;/</code> keyed by real <code>getuid</code>, never the <code>$UID</code> env var.</p>
+</section>
+<section class="card" id="atoms">
+<h2>4. Atom layer: ids, rects, snapshots</h2>
+<p class="sub">File: <code>crates/rovr-types/src/lib.rs</code>. These are the smallest units the rest of the system passes around.</p>
+<h3>Typed ids instead of native pointers</h3>
+<p>Core never stores long lived Objective-C objects, Accessibility references, SkyLight pointers, or BSP node pointers. It passes small typed ids and looks up fresh data each cycle.</p>
+<pre><code>id_type!(WindowId, u32);
+id_type!(SpaceId, u64);
+id_type!(DisplayId, u32);
+id_type!(ProcessId, i32);</code></pre>
+<h3>Geometry</h3>
+<pre><code>Rect { x, y, width, height }   // f64 points
+Point { x, y }
+Size { width, height }
+Rect::center()                 // layout + focus-direction math
+Rect::approx_eq(other, 0.75)   // reconciler epsilon, avoids jitter</code></pre>
+<h3>Honest unknowns</h3>
+<p>macOS often cannot answer. Blocker 13 replaced misleading booleans with a three state enum that flows from the C bridge as 0, 1, 2 and stays unknown until proven.</p>
+<pre><code>enum ObservedBool { Yes, No, Unknown }
+WindowSnapshot {
+  id, pid, app, bundle_id, title, frame,
+  space_id: Option&lt;SpaceId&gt;, display_id: Option&lt;DisplayId&gt;,
+  focused: bool,
+  minimized: ObservedBool, fullscreen: ObservedBool, managed: ObservedBool,
+  generation: u64,
+}
+SpaceSnapshot {
+  id, display_id, label, focused, generation, position,
+  is_fullscreen, is_system,   // fullscreen and system spaces never tile
+}
+DisplaySnapshot {
+  id, frame, label, focused,
+  is_main: bool,              // CGMainDisplayID, not menu bar display
+  generation: u64,
+}
+PlatformSnapshot { windows, spaces, displays, complete: bool }</code></pre>
+<h3>Capabilities, not OS names</h3>
+<p>Core never branches on Sonoma or Sequoia or Tahoe. The platform reports what it can do and the engine gates on that.</p>
+<pre><code>Capabilities {
+  observe_windows, set_window_frame, focus_window,
+  move_window_to_space, create_space, destroy_space,
+  focus_space, reorder_space, set_window_layer,
+  set_window_sticky, set_window_shadow,
+  set_window_opacity, set_window_scale,
+  scripting_addition,
+}</code></pre>
+</section>
+<section class="card" id="states">
+<h2>5. Observed state and desired state</h2>
+<p class="sub">Files: <code>rovr-core/src/state.rs</code> and <code>rovr-core/src/reconcile.rs</code>. Two maps, one diff.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 230" role="img" aria-labelledby="odT odD">
+<title id="odT">Observed and desired feed the reconciler</title>
+<desc id="odD">Observed state and desired state boxes point into a reconciler box that emits a vector of actions.</desc>
+<rect x="20" y="30" width="300" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="170" y="56" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ObservedState</text><text x="170" y="78" text-anchor="middle" fill="#9aa7bd" font-size="12">HashMap Window Space Display</text><text x="170" y="98" text-anchor="middle" fill="#9aa7bd" font-size="12">generation: u64</text><text x="170" y="118" text-anchor="middle" fill="#9aa7bd" font-size="12">refresh_required: bool</text><text x="170" y="138" text-anchor="middle" fill="#9aa7bd" font-size="12">window_is_fresh checks generation</text><text x="170" y="158" text-anchor="middle" fill="#9aa7bd" font-size="12">what macOS reports now</text>
+<rect x="400" y="30" width="300" height="150" rx="12" fill="#101724" stroke="#22c55e"/><text x="550" y="56" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">DesiredState</text><text x="550" y="78" text-anchor="middle" fill="#9aa7bd" font-size="12">HashMap WindowId to WindowTarget</text><text x="550" y="98" text-anchor="middle" fill="#9aa7bd" font-size="12">frame, space, focused, floating</text><text x="550" y="118" text-anchor="middle" fill="#9aa7bd" font-size="12">space rebuilt each layout pass</text><text x="550" y="138" text-anchor="middle" fill="#9aa7bd" font-size="12">focus stays transient, never stored</text><text x="550" y="158" text-anchor="middle" fill="#9aa7bd" font-size="12">what Rovr wants</text>
+<rect x="250" y="192" width="220" height="34" rx="8" fill="#13233a" stroke="#f59e0b"/><text x="360" y="214" text-anchor="middle" fill="#fff" font-size="12">reconcile(observed, desired) to actions</text>
+</svg>
+<figcaption>Focus is transient by design. If the reconciler stored focus, it would steal focus back on every tick.</figcaption>
+</figure>
+<pre><code>// reconcile.rs: refresh always wins over mutation
+if observed.refresh_required { return vec![Action::RefreshAll]; }
+// stale window -&gt; RefreshWindow, never a blind move
+// space mismatch -&gt; MoveWindowToSpace
+// frame differs by more than 0.75pt -&gt; SetWindowFrame
+// wants focus and not focused -&gt; FocusWindow</code></pre>
+<h3>Generations</h3>
+<p>Sleep, wake, Dock restart, and display changes call <code>bump_generation</code>, which sets <code>refresh_required</code>. The next reconcile emits <code>RefreshAll</code> instead of guessing. Per window checks compare <code>window.generation</code> against the global generation so a geometry sensitive op cannot complete on stale data.</p>
+<h3>Action vocabulary</h3>
+<p>File: <code>rovr-core/src/action.rs</code>. Actions are the only language the core uses to ask for change.</p>
+<pre><code>RefreshAll | RefreshWindow | SetWindowFrame | MoveWindowToSpace
+FocusWindow | FocusDirection | FocusSpace | FocusSpaceStep { target, delta }
+CreateSpace { anchor } | DestroySpace | MoveSpace
+SetWindowLayer | SetWindowSticky | SetWindowShadow
+SetWindowOpacity | SetWindowScale | SetWindowMinimized
+CloseWindow | ToggleNativeFullscreen</code></pre>
+</section>
+<section class="card" id="engine">
+<h2>6. Engine: events in, actions out</h2>
+<p class="sub">File: <code>rovr-core/src/engine.rs</code> at about 1,200 lines plus <code>workspace.rs</code>, <code>layout.rs</code>, <code>bsp.rs</code>, <code>layout_state.rs</code>, <code>persistence.rs</code>. The engine owns config, rules, observed, desired, layouts, scratchpads, workspaces, plugins, cursors, and pending queues.</p>
+<h3>Event enum</h3>
+<pre><code>enum Event {
+  Snapshot(PlatformSnapshot),
+  WindowDestroyed { window }, SpaceDestroyed { space },
+  DisplayRemoved { display },
+  SystemWillSleep, SystemWoke, DockRestarted, DisplayTopologyChanged,
+}</code></pre>
+<h3>What apply_event does on a snapshot</h3>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="engT engD">
+<title id="engT">Snapshot handling inside apply_event</title>
+<desc id="engD">Snapshot flows through apply snapshot, confirm destroys, reconcile cursors, bind dynamic spaces, remap workspaces and carry layouts, destroy empty dynamic workspaces, fulfill pending focus and moves, start next creation, recreate persistent workspaces, then layout and reconcile.</desc>
+<rect x="200" y="8" width="320" height="34" rx="8" fill="#13233a" stroke="#3b82f6"/><text x="360" y="30" text-anchor="middle" fill="#fff" font-size="12">1. apply_snapshot, confirm destroys</text>
+<rect x="200" y="50" width="320" height="34" rx="8" fill="#13233a" stroke="#3b82f6"/><text x="360" y="72" text-anchor="middle" fill="#fff" font-size="12">2. reconcile space cursors per display</text>
+<rect x="200" y="92" width="320" height="34" rx="8" fill="#13233a" stroke="#3b82f6"/><text x="360" y="114" text-anchor="middle" fill="#fff" font-size="12">3. bind awaited dynamic spaces</text>
+<rect x="160" y="134" width="400" height="40" rx="8" fill="#13233a" stroke="#22c55e"/><text x="360" y="150" text-anchor="middle" fill="#fff" font-size="12">4. remap_after_snapshot, carry BSP trees</text>
+<text x="360" y="166" text-anchor="middle" fill="#86efac" font-size="11">RemapMove { name, from, to } moves layout state</text>
+<rect x="200" y="182" width="320" height="34" rx="8" fill="#0f172a" stroke="#334155"/><text x="360" y="204" text-anchor="middle" fill="#e6ebf3" font-size="12">5. destroy empties, fulfill pending, next create</text>
+<rect x="200" y="224" width="320" height="34" rx="8" fill="#0f172a" stroke="#334155"/><text x="360" y="246" text-anchor="middle" fill="#e6ebf3" font-size="12">6. one CreateSpace for lowest missing persistent</text>
+<rect x="180" y="264" width="360" height="30" rx="8" fill="#1a1206" stroke="#f59e0b"/><text x="360" y="284" text-anchor="middle" fill="#fcd34d" font-size="12">7. apply_layout, then reconcile to Vec Action</text>
+</svg>
+<figcaption>One snapshot cycle emits at most one persistent <code>CreateSpace</code>. The new id is learned only from the next snapshot, then bound by deterministic remap. This stops duplicate desktops.</figcaption>
+</figure>
+<h3>Workspace identity survives SpaceId churn</h3>
+<p>macOS SpaceIds are volatile. Rovr names are stable. <code>WorkspaceState</code> holds <code>name</code>, <code>desired_display</code>, <code>persistent</code>, <code>backing_space</code>, <code>ordinal</code>, <code>last_position</code>, and <code>dynamic</code>. Remap runs in sorted order every time: unclaimed spaces by position then id, workspaces by ordinal.</p>
+<div class="two">
+<div>
+<h4>Resume pass</h4>
+<p>A workspace whose <code>last_position</code> matches an unclaimed space at the same position reclaims that slot. After a Dock restart, code returns to its old slot instead of shuffling.</p>
+</div>
+<div>
+<h4>Ordinal pass</h4>
+<p>Workspaces still missing claim the first unclaimed space on their desired display, else the first remaining space in position order. Lowest ordinal takes lowest position. No HashMap order leaks in.</p>
+</div>
+</div>
+<figure class="diagram">
+<svg viewBox="0 0 720 200" role="img" aria-labelledby="remapT remapD">
+<title id="remapT">Deterministic remap example</title>
+<desc id="remapD">Before Dock restart code maps to 11 and chat maps to 12. After restart with new ids 101 and 102, code maps to 101 and chat maps to 102 by position.</desc>
+<text x="170" y="22" text-anchor="middle" fill="#9aa7bd" font-size="12">before Dock restart</text>
+<rect x="60" y="34" width="220" height="56" rx="10" fill="#101724" stroke="#334155"/><text x="170" y="58" text-anchor="middle" fill="#fff" font-size="12">code (ordinal 0) -&gt; 11 at pos 0</text><text x="170" y="76" text-anchor="middle" fill="#9aa7bd" font-size="11">chat (ordinal 1) -&gt; 12 at pos 1</text>
+<text x="550" y="22" text-anchor="middle" fill="#9aa7bd" font-size="12">after restart, ids 101 and 102</text>
+<rect x="440" y="34" width="220" height="56" rx="10" fill="#101724" stroke="#22c55e"/><text x="550" y="58" text-anchor="middle" fill="#fff" font-size="12">code (ordinal 0) -&gt; 101 at pos 0</text><text x="550" y="76" text-anchor="middle" fill="#9aa7bd" font-size="11">chat (ordinal 1) -&gt; 102 at pos 1</text>
+<text x="360" y="68" text-anchor="middle" fill="#3b82f6" font-size="20">→</text>
+<rect x="90" y="112" width="540" height="66" rx="10" fill="#0f172a" stroke="#334155"/><text x="360" y="136" text-anchor="middle" fill="#e6ebf3" font-size="12">surviving ids are authoritative: deleting middle space 12 never renumbers 11 or 13</text><text x="360" y="156" text-anchor="middle" fill="#9aa7bd" font-size="12">manual Mission Control drags reassign ordinal to position so alt-N follows the visual order</text>
+</svg>
+</figure>
+<h3>Layout state follows the logical name</h3>
+<p><code>apply_remap_moves</code> moves each BSP tree from <code>from</code> to <code>to</code>. A stale dynamic binding with <code>from == to</code> drops its tree so a dead SpaceId never keeps state. Save writes workspace trees under the stable workspace name in <code>workspace_layouts</code> and keeps leftover raw SpaceId keys only for unmanaged spaces. Load restores trees onto current backings. Writes are atomic: temp file, fsync file, rename, fsync directory.</p>
+<h3>Pending queues that stop races</h3>
+<ul class="tight">
+<li><code>pending_workspace_focus</code> and <code>pending_workspace_move</code>: FIFO queues so fast alt-2 then alt-3 cannot overwrite. Focus fires once when the backing materializes, then the entry is dropped so later alt-tabs are not hijacked.</li>
+<li><code>awaited_creations</code> plus <code>pending_creations</code>: one in flight creation at a time. Binding picks a new unclaimed space on the anchor display that was absent in the <code>before</code> set. Pre existing spaces are never adopted.</li>
+<li><code>pending_close</code>: a closing window leaves placements at once but stays in the BSP until observation confirms destruction. Cancel keeps the tree stable.</li>
+<li><code>pending_destroy</code>: workspace and layout stay until a complete snapshot proves the space is gone.</li>
+<li><code>dynamic_grace</code>: two second immunity after a dynamic spawn so async focus and window arrival are not judged empty.</li>
+<li><code>space_cursors: HashMap DisplayId to (SpaceId, pending)</code>: optimistic per display cursor. Next, previous, explicit, and workspace focus update it. Snapshots confirm or reconcile it.</li>
+</ul>
+</section>
+<section class="card" id="layout">
+<h2>7. Layout is pure math</h2>
+<p class="sub">Crates <code>rovr-layout</code> and <code>rovr-core/src/layout.rs</code>, <code>bsp.rs</code>, <code>layout_state.rs</code>. Same rule as PRODUCT.md: layout code never touches Accessibility, SkyLight, FFI, or Platform.</p>
+<pre><code>input:  usable area + ordered WindowIds + config (gap, padding, ratio)
+output: WindowId -&gt; Rect
+compute(kind, LayoutRequest { area, windows, gap, padding, split_ratio })</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 720 220" role="img" aria-labelledby="layT layD">
+<title id="layT">Five layout kinds</title>
+<desc id="layD">Mini maps for BSP splits, master plus stack, equal columns, full overlay stack, and float with no placements.</desc>
+<text x="80" y="20" text-anchor="middle" fill="#9aa7bd" font-size="12">bsp</text>
+<rect x="20" y="30" width="120" height="120" rx="8" fill="none" stroke="#3b82f6"/><line x1="80" y1="30" x2="80" y2="150" stroke="#3b82f6"/><line x1="80" y1="90" x2="140" y2="90" stroke="#3b82f6"/><line x1="20" y1="90" x2="80" y2="90" stroke="#3b82f6"/>
+<text x="230" y="20" text-anchor="middle" fill="#9aa7bd" font-size="12">master + stack</text>
+<rect x="160" y="30" width="140" height="120" rx="8" fill="none" stroke="#3b82f6"/><rect x="160" y="30" width="80" height="120" fill="rgba(59,130,246,.25)"/><line x1="240" y1="70" x2="300" y2="70" stroke="#3b82f6"/><line x1="240" y1="110" x2="300" y2="110" stroke="#3b82f6"/>
+<text x="380" y="20" text-anchor="middle" fill="#9aa7bd" font-size="12">columns</text>
+<rect x="320" y="30" width="120" height="120" rx="8" fill="none" stroke="#3b82f6"/><line x1="360" y1="30" x2="360" y2="150" stroke="#3b82f6"/><line x1="400" y1="30" x2="400" y2="150" stroke="#3b82f6"/>
+<text x="520" y="20" text-anchor="middle" fill="#9aa7bd" font-size="12">stack / monocle</text>
+<rect x="460" y="30" width="120" height="120" rx="8" fill="rgba(59,130,246,.18)" stroke="#3b82f6"/><rect x="470" y="40" width="120" height="120" rx="8" fill="none" stroke="#3b82f6" opacity=".6"/>
+<text x="660" y="20" text-anchor="middle" fill="#9aa7bd" font-size="12">float</text>
+<rect x="610" y="30" width="100" height="120" rx="8" fill="none" stroke="#334155" stroke-dasharray="6 5"/><text x="660" y="95" text-anchor="middle" fill="#6b7a93" font-size="11">no move</text>
+<text x="360" y="185" text-anchor="middle" fill="#9aa7bd" font-size="12">gap splits siblings, padding insets the area, split ratio must sit in 0.1 to 0.9</text>
+</svg>
+<figcaption>Float returns no placements. Unknown minimized windows never tile. Scratchpad members leave tiling while open.</figcaption>
+</figure>
+<ul class="tight">
+<li><code>apply_layout</code> clears <code>desired.space</code> and rebuilds it from rules each cycle, then writes frames per workspace layout, plugin override, scratchpad filter, and <code>insets_off</code> session toggle.</li>
+<li>BSP ops: <code>rotate</code>, <code>mirror</code>, <code>balance</code>, <code>swap</code>, <code>warp</code>, <code>set_ratio</code>, directional swap and warp from observed geometry.</li>
+<li>WASM plugins load from <code>~/.config/rovr/plugins/*.wasm</code>. Each call carries fuel plus memory caps. <code>validate_placements</code> rejects empty, duplicate, missing, foreign, NaN, infinite, zero, negative, or huge frames and falls back to the built in layout.</li>
+<li>Fresh BSP inserts target exact 50 percent ratios. Balance resets drifted persisted ratios.</li>
+</ul>
+</section>
+<section class="card" id="config">
+<h2>8. Config: parse, validate, compile, commit</h2>
+<p class="sub">File: <code>rovr-config/src/lib.rs</code>. Native format is TOML at <code>config-version = 1</code>. Missing key means 1. Anything else fails before partial reconfig.</p>
+<pre><code>[general] layout gap padding reconcile_on_wake reconcile_interval_ms plugin
+[focus] follows_mouse
+[animations] enabled duration_ms curve
+[[workspace]] name layout display persistent plugin
+[[rule]] app title workspace float target_workspace opacity layer
+[[scratchpad]] name app title
+[[bind]] key command   # skhd syntax key, CLI style command</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 720 150" role="img" aria-labelledby="cfgT cfgD">
+<title id="cfgT">Config pipeline</title>
+<desc id="cfgD">Parse to candidate, validate, build candidate, diff, commit. Invalid config never partially applies.</desc>
+<rect x="10" y="45" width="110" height="50" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="65" y="74" text-anchor="middle" fill="#fff" font-size="12">parse</text>
+<rect x="156" y="45" width="110" height="50" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="211" y="74" text-anchor="middle" fill="#fff" font-size="12">validate</text>
+<rect x="302" y="45" width="110" height="50" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="357" y="74" text-anchor="middle" fill="#fff" font-size="12">compile</text>
+<rect x="448" y="45" width="110" height="50" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="503" y="74" text-anchor="middle" fill="#fff" font-size="12">diff</text>
+<rect x="594" y="45" width="110" height="50" rx="10" fill="#101724" stroke="#22c55e"/><text x="649" y="74" text-anchor="middle" fill="#fff" font-size="12">commit</text>
+<text x="120" y="74" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="266" y="74" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="412" y="74" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="558" y="74" text-anchor="middle" fill="#3b82f6" font-size="16">→</text>
+<text x="360" y="125" text-anchor="middle" fill="#9aa7bd" font-size="12">reload clears pending queues, rebinds workspaces, reloads WASM plugins</text>
+</svg>
+</figure>
+<ul class="tight">
+<li>Validation rejects negative gap and padding, empty or duplicate workspace names, unknown workspaces in rules, bad opacity, bad regex, empty or duplicate binds, bad hotkey keys, and bad bind commands.</li>
+<li><code>compile_rules</code> compiles each <code>app</code> and <code>title</code> regex once per load and keeps config order. Predicate is <code>all_of</code>: every selector must match. Empty predicate matches every window.</li>
+<li>Binds are the single source of truth for the built in listener and <code>config gen-skhd</code> output. Key syntax uses skhd chords such as <code>alt - h</code>. Command syntax must parse with the same <code>parse_command</code> the CLI uses, so <code>window --focus 1</code> fails at load instead of drifting at runtime.</li>
+<li>Reload is transactional. Only affected state is disturbed. Ordinal identity is preserved across reorder and manual drags.</li>
+</ul>
+</section>
+<section class="card" id="protocol">
+<h2>9. Protocol: typed IPC over a socket</h2>
+<p class="sub">Crate <code>rovr-protocol</code>. Newline delimited JSON over <code>/tmp/rovr-&lt;uid&gt;/daemon.sock</code> with mode 0600 and dir 0700. Requests carry version plus id. This boring framing is deliberate: inspectable now, replaceable with binary framing as v2 later.</p>
+<pre><code>Request  { version: 1, id: u64, command: Command }
+Response { version: 1, id: u64, status: ok | error, result | error{code,message} }
+Notification { type: hello | heartbeat | state_changed | layout_changed
+  | scratchpad_toggled | config_reloaded | unknown }</code></pre>
+<table>
+<thead><tr><th>Domain</th><th>Commands</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>ping, refresh, doctor</code></td><td>Health and one observation pass</td><td><code>refresh</code> is the internal AX wake. Harmless for clients.</td></tr>
+<tr><td><code>query</code></td><td>windows, spaces, displays, state, focused, current</td><td>State returns both observed and desired for debugging.</td></tr>
+<tr><td><code>window</code></td><td>focus, focus-direction, set-frame, move-to-space, move-to-workspace, set-layer, sticky, shadow, opacity, pip, swap, warp, close, toggle-fullscreen, toggle-float, swap-dir, warp-dir, resize</td><td>Many accept empty id meaning the focused window. Layout commands default to the focused space.</td></tr>
+<tr><td><code>space</code></td><td>focus, focus-recent, create, destroy, move, next, prev, toggle-insets</td><td>Next and previous carry display scope: focused, main, or numeric id. Step emits <code>FocusSpaceStep</code> with displacement including wrap.</td></tr>
+<tr><td><code>layout</code></td><td>rotate, mirror, balance, set-ratio</td><td>Each emits <code>LayoutChanged</code> even if the later platform apply fails.</td></tr>
+<tr><td><code>workspace</code></td><td>focus name, move-window to name</td><td>Unknown names spawn i3 style dynamic workspaces. Empty ones die when left.</td></tr>
+<tr><td><code>scratchpad</code></td><td>toggle name</td><td>Emits <code>ScratchpadToggled</code>. Show centers 800 by 600 on the focused space.</td></tr>
+<tr><td><code>config</code></td><td>reload, check, dump, gen-skhd</td><td>Dump and gen-skhd run locally in the CLI without IPC.</td></tr>
+<tr><td><code>debug</code></td><td>events</td><td>Reads the flight recorder.</td></tr>
+<tr><td><code>subscribe</code></td><td>Stream with Hello first, then heartbeats and hints</td><td>Per subscriber backlog of 64. Slow readers are evicted so the state loop never blocks.</td></tr>
+</tbody>
+</table>
+<div class="callout"><strong>Stability rules.</strong> Errors use stable codes plus structured details. Notifications add variants only. Old clients decode unknown variants as <code>Unknown</code> instead of failing, and unknown notify lines are skipped by the CLI stream reader.</div>
+</section>
+<section class="card" id="platform">
+<h2>10. Platform boundary</h2>
+<p class="sub">Crate <code>rovr-platform</code>. The trait is small. The macOS implementation is where the private API knowledge lives.</p>
+<pre><code>trait Platform: Send {
+  fn capabilities() -&gt; Capabilities;
+  fn snapshot(&amp;mut self) -&gt; Result&lt;PlatformSnapshot, PlatformError&gt;;
+  fn execute(&amp;mut self, action: &amp;Action) -&gt; Result&lt;(), PlatformError&gt;;
+  fn needs_refresh() -&gt; bool;                       // default false
+  fn snapshot_wedged_ms() -&gt; Option&lt;u64&gt;;             // doctor visibility
+  fn drain_diagnostics() -&gt; Vec&lt;PlatformDiagnostic&gt;;
+  fn sa_reinject_diagnostics() -&gt; Option&lt;SaReinjectDiag&gt;;
+  fn set_event_watcher(watcher: Arc&lt;dyn Fn(u32)&gt;);   // AX wake kinds
+}</code></pre>
+<h3>Mock for tests</h3>
+<p><code>mock.rs</code> returns a canned snapshot, records executed actions, and reports full capabilities except the scripting addition. This lets reconciler, layout, config, IPC, and recovery tests run without WindowServer, on any OS.</p>
+<h3>BoundedWorker: one thread, no pile up</h3>
+<p>File: <code>bounded_worker.rs</code>. AX and SkyLight calls can hang when an app dies mid call or the Dock restarts. The old spawn and abandon pattern leaked one thread per hang. Now one worker thread serves one job at a time with a bounded wait.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 190" role="img" aria-labelledby="bwT bwD">
+<title id="bwT">Bounded worker states</title>
+<desc id="bwD">Idle accepts one job. In flight waits to a deadline. Timeout marks wedged and fails fast. Late completion clears the wedge.</desc>
+<rect x="20" y="55" width="190" height="70" rx="12" fill="#101724" stroke="#22c55e"/><text x="115" y="82" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">idle</text><text x="115" y="102" text-anchor="middle" fill="#9aa7bd" font-size="11">submit one job, one epoch</text>
+<rect x="265" y="55" width="190" height="70" rx="12" fill="#101724" stroke="#3b82f6"/><text x="360" y="82" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">in flight</text><text x="360" y="102" text-anchor="middle" fill="#9aa7bd" font-size="11">wait to absolute deadline</text>
+<rect x="510" y="55" width="190" height="70" rx="12" fill="#101724" stroke="#f59e0b"/><text x="605" y="82" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">wedged</text><text x="605" y="102" text-anchor="middle" fill="#9aa7bd" font-size="11">fail fast, expose wedged_since</text>
+<text x="237" y="95" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="482" y="95" text-anchor="middle" fill="#3b82f6" font-size="16">→</text>
+<text x="360" y="155" text-anchor="middle" fill="#9aa7bd" font-size="12">recovery only after the timed out closure returns. No queued retries. Max concurrency stays 1 across 30 timeouts.</text>
+</svg>
+<figcaption>Timeouts used in tree: global snapshot 2 s, per app AX refine and mutation 500 ms. <code>doctor.snapshot_wedged_ms</code> surfaces the wedge.</figcaption>
+</figure>
+<h3>macOS snapshot path</h3>
+<p>File: <code>macos/mod.rs</code>. Roughly this order per snapshot:</p>
+<ol class="tight">
+<li>Enumerate window candidates through the C bridge into <code>BridgeWindow</code> structs.</li>
+<li>Collect pids that need AX refinement. Refine per pid on persistent pid keyed workers with a shared 500 ms deadline. Map 0, 1, other to <code>No</code>, <code>Yes</code>, <code>Unknown</code>.</li>
+<li>Fall back to SkyLight managed state for background apps where AX stays Unknown, using window level and parent checks from yabai practice.</li>
+<li>Enumerate displays and spaces. Keep one focused space per display. Never collapse to a global focused space.</li>
+<li>Derive <code>display_id</code> from the space to display map built once per snapshot, not rect hit testing.</li>
+<li>Resolve window to space in bulk per space instead of one private API call per window, which cut about 100 round trips and dropped observe time from hundreds of ms to about 100 ms.</li>
+<li>Fill minimized unknowns from last known values so tiling does not flap.</li>
+</ol>
+<h3>macOS execute path</h3>
+<ul class="tight">
+<li>Refresh actions never touch macOS. All other actions first ensure the bridge is idle so a mutation cannot overlap a timed out observation closure.</li>
+<li>Frame, focus, minimize, close, and fullscreen go through per pid AX workers. Focus on another space first focuses that space through the normal path, then waits bounded for WindowServer to land before raising.</li>
+<li>Space create, destroy, and reorder plus layer, sticky, shadow, opacity, and scale go through the scripting addition client with capability gating. Absent capability returns <code>Unsupported</code> instead of failing each cycle.</li>
+<li>Space focus prefers the scripting addition with a 30 by 100 ms retry for Dock catch up, then falls back to a bridge swipe gesture with a bounded 450 ms settle gate. Cross display posts skip the gate. Step posts one high velocity swipe pair per displacement without querying current space.</li>
+</ul>
+</section>
+<section class="card" id="daemon">
+<h2>11. Daemon threads and latency fixes</h2>
+<p class="sub">File: <code>rovr-daemon/src/main.rs</code>. The state loop owns the engine and the platform. Every other thread sends it envelopes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 230" role="img" aria-labelledby="thrT thrD">
+<title id="thrT">Three daemon lanes</title>
+<desc id="thrD">Main thread runs AppKit hotkeys. Accept thread reads sockets and queues bounded envelopes. State thread owns engine and platform and emits responses plus notifications.</desc>
+<rect x="20" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="120" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">main thread</text><text x="120" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">hotkey manager</text><text x="120" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">AppKit run loop</text><text x="120" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">persistent IPC</text><text x="120" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">dispatcher, FIFO</text>
+<rect x="260" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="360" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">accept thread</text><text x="360" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">UnixListener</text><text x="360" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">per client threads</text><text x="360" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">256 envelope cap</text><text x="360" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">version check first</text>
+<rect x="500" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#22c55e"/><text x="600" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">state thread</text><text x="600" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">Engine + Platform</text><text x="600" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">handle one envelope</text><text x="600" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">execute + refresh</text><text x="600" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">notify subscribers</text>
+<text x="240" y="110" text-anchor="middle" fill="#3b82f6" font-size="18">→</text><text x="480" y="110" text-anchor="middle" fill="#3b82f6" font-size="18">→</text>
+</svg>
+<figcaption>Carbon hotkey targets require the main thread, which is why accept and state moved off it in blocker 6.</figcaption>
+</figure>
+<h3>Envelope</h3>
+<pre><code>Envelope { request: Request, response: Sender&lt;Response&gt;,
+  queued_at: Instant, event_wake: bool }</code></pre>
+<p>AX callbacks share one atomic <code>RefreshWake</code>. Created and destroyed kinds enqueue one <code>Refresh</code> for instant spawn tiling. The wake is acknowledged before its snapshot so callbacks during observation queue the next wake instead of merging silently.</p>
+<h3>Why switches got fast</h3>
+<table>
+<thead><tr><th>Fix</th><th>What it removed</th></tr></thead>
+<tbody>
+<tr><td>Skip pre observe for Refresh, workspace and space commands, and focus defaulting window commands</td><td>A full 100 to 500 ms snapshot before every alt-N press. No op focus now measures 17 to 35 ms end to end.</td></tr>
+<tr><td>O(apps plus windows) AX resolution plus bulk space mapping</td><td>O(N squared) enumeration and one private call per window.</td></tr>
+<tr><td>Async periodic snapshots with adaptive cadence</td><td>Head of line blocking. Burst 100 ms for about 2 s after activity, configured interval when idle, 5 s minimum recovery watchdog.</td></tr>
+<tr><td>Timestamp paced gesture gate plus throttled SA probes</td><td>SLS busy poll and wedged payload stalls in the loop.</td></tr>
+<tr><td>Cross display focus with cursor warp and menu bar display set</td><td>External display switches that waited on the wrong display animation.</td></tr>
+<tr><td>Socket keyed on real <code>getuid</code>, dispatcher reads every response</td><td>GUI agent socket mismatch and EPIPE noise.</td></tr>
+</tbody>
+</table>
+<p>History detail: <code>space_history</code> tracks current and previous per display for <code>focus-recent</code>. Active display fallback is focused, then main, then lowest id.</p>
+</section>
+<section class="card" id="cli">
+<h2>12. CLI: a thin client</h2>
+<p class="sub">File: <code>rovr-cli/src/main.rs</code>. The CLI parses flags, builds one <code>Request</code>, sends one line of JSON, prints the pretty response. Policy stays in the daemon.</p>
+<pre><code>rovrd --foreground
+rovr ping | doctor | query windows | query spaces | debug events
+rovr window focus 1 | window focus-direction west 1
+rovr space focus 3 | workspace focus code | layout rotate
+rovr config dump | config dump --full | config check PATH | config reload
+rovr subscribe            # Hello, then Heartbeat + StateChanged stream
+rovr sa status | sa install | sa uninstall</code></pre>
+<ul class="tight">
+<li>Request ids come from an atomic counter. Responses have a 5 s deadline and a 1 MiB cap with bounded line reads.</li>
+<li><code>completions</code>, <code>config dump</code>, and <code>gen-skhd</code> run locally without IPC.</li>
+<li>39 binds expressible in Rovr now live as in process <code>[[bind]]</code> entries. skhd keeps app launches, reload, chained resizes, and space destroy.</li>
+<li>Artifact discovery canonicalizes <code>current_exe</code> first so symlinked installs such as <code>~/.local/bin/rovr</code> still find payload, loader, and helper next to the real binary or under prefix lib paths.</li>
+</ul>
+</section>
+<section class="card" id="sa">
+<h2>13. Scripting addition stack</h2>
+<p class="sub">Private Space lifecycle and cosmetics live here. The design keeps privilege small and observable.</p>
+<div class="kv">
+<div class="cell"><b>rovr-sa-payload: the code in Dock</b>ObjC dylib on <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code> with <code>rovr-sa-2.0</code> handshake and honest capability bits. SkyLight cosmetics direct. Space lifecycle via vendored yabai MIT pattern tables with attribution. Scan bounds guarded. arm64e build with loader caps patched <code>0x81 to 0x80</code> per yabai issue 2686.</div>
+<div class="cell"><b>rovr-sa-loader: the injector</b>Root only. Adapted from yabai loader.m with attribution. Stable signing with a cert anchored designated requirement keeps the Accessibility grant across rebuilds. Embedded Info.plist in <code>__TEXT,__info_plist</code> lets TCC attribute launchd spawned rovrd.</div>
+</div>
+<h3>Helper: the smallest possible root service</h3>
+<p>Crate <code>rovr-sa-helper</code> plus <code>platform/macos/reinject.rs</code>. LaunchDaemon <code>com.rovr.sa-helper</code> owns <code>/var/run/rovr-sa-helper.sock</code> and starts on demand. The wire frame is fixed <code>{magic, proto, opcode, uid}</code>. There are no pid, path, command, or env fields by construction. Each use validates fixed root owned artifacts with <code>lstat</code> plus <code>O_NOFOLLOW</code>, root owner, and safe modes. Auth checks <code>getpeereid</code> equals request uid equals <code>/dev/console</code> owner. The daemon calls exactly <code>inject</code> and <code>status</code> with fixed argv and minimal env. SMAppService cannot serve here because it needs an app bundle path. The launchd fallback is documented in <code>docs/SA.md</code>. No sudoers file anywhere.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 210" role="img" aria-labelledby="rejT rejD">
+<title id="rejT">Reinject state machine</title>
+<desc id="rejD">Healthy stays healthy. Dock change or handshake loss moves to injecting, then verifying, then healthy or backoff with bounded retries.</desc>
+<rect x="20" y="60" width="140" height="60" rx="12" fill="#101724" stroke="#22c55e"/><text x="90" y="85" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">healthy</text><text x="90" y="103" text-anchor="middle" fill="#9aa7bd" font-size="11">Dock pid stable</text>
+<rect x="200" y="60" width="140" height="60" rx="12" fill="#101724" stroke="#3b82f6"/><text x="270" y="85" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">injecting</text><text x="270" y="103" text-anchor="middle" fill="#9aa7bd" font-size="11">single flight</text>
+<rect x="380" y="60" width="140" height="60" rx="12" fill="#101724" stroke="#3b82f6"/><text x="450" y="85" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">verifying</text><text x="450" y="103" text-anchor="middle" fill="#9aa7bd" font-size="11">bounded window</text>
+<rect x="560" y="60" width="140" height="60" rx="12" fill="#101724" stroke="#f59e0b"/><text x="630" y="85" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">backoff</text><text x="630" y="103" text-anchor="middle" fill="#9aa7bd" font-size="11">5s 15s 45s</text>
+<text x="180" y="95" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="360" y="95" text-anchor="middle" fill="#3b82f6" font-size="16">→</text><text x="540" y="95" text-anchor="middle" fill="#3b82f6" font-size="16">→</text>
+<text x="360" y="155" text-anchor="middle" fill="#9aa7bd" font-size="12">max 4 attempts per Dock generation, then quiet until Dock changes. Late results are discarded.</text>
+</svg>
+<figcaption><code>reinject.rs</code> is pure and unit tested for single flight, generation invalidation, late result discard, bounded retries, backoff, verify window, and refusal paths. <code>needs_refresh</code> drives it. SA cache refreshes on version and attrib change so capabilities follow reinjection.</figcaption>
+</figure>
+<h3>Five honest SA states</h3>
+<pre><code>not_installed | installed_not_injected | injected_compatible
+| incompatible_protocol | capability_missing</code></pre>
+<p><code>sa install</code> writes files, registers the service, injects directly, polls the handshake, writes <code>payload.installed.json</code> with sha256 plus handshake version, then reports per capability bits for create, destroy, reorder, focus, opacity, layer, sticky, shadow, and scale. <code>sa uninstall</code> removes bootout first, then plist, helper, loader, payload, marker, and socket, then restarts Dock because mapped code cannot be evicted any other way. Client framing uses <code>len = 3 + payload_len</code> with the socket keyed on <code>getuid</code> to match the payload.</p>
+</section>
+<section class="card" id="reliability">
+<h2>14. Recovery and observability</h2>
+<p class="sub">Rovr assumes it will be surprised and keeps the evidence.</p>
+<ul class="tight">
+<li><code>FlightRecorder</code> in <code>core/src/flight_recorder.rs</code>: bounded ring, default 2048 records, each with sequence, unix ms, kind, and detail. Records events, actions, remap moves, creations, destroys, and platform errors. <code>rovr debug events</code> reads it.</li>
+<li><code>rovr doctor</code>: protocol version, capabilities, SA socket plus version plus attribs, reinject phase plus generation plus attempts plus retry, wedge ms, generation, counts, config path, layout, gap, interval.</li>
+<li>Recovery triggers that force scoped or full re-observation: wake, Dock restart, display change, space change, suspicious mutation failure. Every OS wait has a deadline. No infinite polling.</li>
+<li>Persistence in <code>core/src/persistence.rs</code>: layouts, workspace owned trees, scratchpads, workspaces. Atomic replace with fsync on file and directory survives crash and power loss mid save.</li>
+<li>Hotkeys: main thread manager, one persistent bounded FIFO dispatcher, every IPC response read. Invalid bind command at runtime logs and runs nothing.</li>
+<li>Signing detail that matters: stable cert anchored requirement plus embedded plist keep TCC and Accessibility grants stable across rebuilds.</li>
+</ul>
+<div class="callout good"><strong>Mental model for debugging.</strong> Query state to see both models. Read <code>debug events</code> for the seconds before a failure. Check <code>doctor</code> for wedge, SA, and reinject state. If observed and desired differ after an action, the next reconcile already carries the retry.</div>
+</section>
+<section class="card" id="next">
+<h2>15. Gaps and what comes next</h2>
+<p class="sub">What PRODUCT.md still wants beyond today: full BSP plus stack, monocle, columns, master stack, centered master, named and dynamic spaces, full restoration, scratchpads and groups beyond the current toggle, reactive rules beyond current triggers, event subscriptions beyond the current stream, stable IPC growth, hot reload polish, crash recovery, diagnostics growth, and optional native UI.</p>
+<table>
+<thead><tr><th>Open item</th><th>Why it waits</th></tr></thead>
+<tbody>
+<tr><td>Reboot recovery and protocol v2 interop rerun</td><td>Needs a SIP relaxed reboot and an isolated host run. Pure logic is done.</td></tr>
+<tr><td>Live Dock restart and crash loops</td><td>Needs interactive killall Dock runs, repeated crashes, and update simulation.</td></tr>
+<tr><td>Real AX hang reproduction</td><td>Timeout and wedge logic is tested. A dying app mid call on hardware is the proof.</td></tr>
+<tr><td>Background app refinement</td><td>macOS 26.5 returns empty window lists for background apps. Only frontmost refines. Affects tiling breadth.</td></tr>
+<tr><td>Malicious WASM survival on hardware</td><td>Limits and validation are tested. Daemon survival under hostile plugin on macOS is not yet run.</td></tr>
+<tr><td>Hotkey firing proof</td><td>Threading is correct by construction. Firing needs a UI session run, not headless CI.</td></tr>
+</tbody>
+</table>
+<h3>How to run the checks behind this page</h3>
+<pre><code>git diff --check
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p rovr-daemon --bin rovrd -- --foreground
+cargo run -p rovr-cli -- ping
+cargo run -p rovr-cli -- doctor
+cargo run -p rovr-cli -- query windows
+cargo run -p rovr-cli -- debug events
+scripts/sa-interop/run.sh   # SA interop harness</code></pre>
+<div class="rule"></div>
+<p>Sources: <code>PRODUCT.md</code>, <code>README.md</code>, <code>docs/ARCHITECTURE.md</code>, <code>TODO.md</code> through 2026-08-25, plus the files named in each section. Yabai under <code>../yabai/</code> stays read only and is used for macOS behavior, never copied as architecture. When code derives from it, MIT attribution stays with the port.</p>
+</section>
+</main>
+</div>
+<footer class="wrap">
+<div class="rule"></div>
+<p>Built from the current Rovr tree. If a struct name here disagrees with the code, the code wins. File generated as a static single file with inline SVG, no external assets, keyboard focus visible, reduced motion respected.</p>
+</footer>
+</div>
+</body>
+</html>

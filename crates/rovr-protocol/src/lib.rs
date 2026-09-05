@@ -231,6 +231,9 @@ pub enum Notification {
     /// Sent immediately when a subscription stream is established; the client
     /// should treat this as the first event on the stream.
     Hello { protocol_version: u16 },
+    /// Periodic liveness signal. Clients may reconnect when heartbeats stop
+    /// arriving for longer than their chosen deadline.
+    Heartbeat { unix_ms: u64 },
     /// Observable state may have changed (reconcile tick or a verified
     /// mutation); re-query `state` to refresh. Carries no counter: it is a
     /// re-poll hint, not a revision number.
@@ -310,6 +313,7 @@ mod tests {
             Notification::Hello {
                 protocol_version: PROTOCOL_VERSION,
             },
+            Notification::Heartbeat { unix_ms: 42 },
             Notification::StateChanged,
             Notification::LayoutChanged {
                 space: SpaceId(3),

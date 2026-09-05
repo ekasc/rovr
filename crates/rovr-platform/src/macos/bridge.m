@@ -21,6 +21,14 @@
 typedef AXError (*rovr_ax_get_window_fn)(AXUIElementRef element, CGWindowID *window_id);
 static rovr_ax_get_window_fn g_ax_get_window = NULL;
 
+// Accessibility messaging is IPC to another process and may otherwise wait
+// indefinitely when that process stops servicing its AX port.
+static const float ROVR_AX_MESSAGING_TIMEOUT_SECONDS = 0.5f;
+
+static void rovr_ax_apply_timeout(AXUIElementRef element) {
+    if (element) AXUIElementSetMessagingTimeout(element, ROVR_AX_MESSAGING_TIMEOUT_SECONDS);
+}
+
 // Private SkyLight symbols. SkyLight.framework is not a linked public
 // framework, so every entry point is resolved at runtime with dlsym against
 // the default search order. A NULL pointer means the capability is absent on
@@ -37,6 +45,8 @@ typedef CFArrayRef (*rovr_sls_copy_spaces_for_windows_fn)(int cid, int selector,
 typedef int64_t (*rovr_sls_perform_async_bridged_op_fn)(void *operation);
 typedef CGError (*rovr_sls_set_active_menu_bar_display_identifier_fn)(int cid, CFStringRef uuid, CFStringRef uuid2);
 typedef CFStringRef (*rovr_sls_copy_active_menu_bar_display_identifier_fn)(int cid);
+typedef bool (*rovr_sls_managed_display_is_animating_fn)(int cid, CFStringRef uuid);
+typedef CGError (*rovr_sls_register_notify_fn)(int cid, void *handler, uint32_t event, void *context);
 
 static rovr_sls_main_connection_fn g_sls_main_connection = NULL;
 static rovr_sls_copy_managed_display_spaces_fn g_sls_copy_managed_display_spaces = NULL;
@@ -52,6 +62,34 @@ static rovr_sls_perform_async_bridged_op_fn g_sls_perform_async_bridged_op = NUL
 // so cross-display Space switches actually bring the other display forward.
 static rovr_sls_set_active_menu_bar_display_identifier_fn g_sls_set_active_menu_bar_display_identifier = NULL;
 static rovr_sls_copy_active_menu_bar_display_identifier_fn g_sls_copy_active_menu_bar_display_identifier = NULL;
+static rovr_sls_managed_display_is_animating_fn g_sls_managed_display_is_animating = NULL;
+static rovr_sls_register_notify_fn g_sls_register_notify = NULL;
+typedef CFTypeRef (*rovr_sls_window_query_fn)(int cid, CFArrayRef windows, int count);
+typedef CFTypeRef (*rovr_sls_window_query_copy_fn)(CFTypeRef query);
+typedef int (*rovr_sls_window_iter_count_fn)(CFTypeRef iter);
+typedef bool (*rovr_sls_window_iter_advance_fn)(CFTypeRef iter);
+typedef uint32_t (*rovr_sls_window_iter_parent_fn)(CFTypeRef iter);
+typedef int (*rovr_sls_window_iter_level_fn)(CFTypeRef iter);
+typedef CGError (*rovr_sls_get_menu_autohide_fn)(int cid, int *enabled);
+typedef CGError (*rovr_sls_get_revealed_menu_bounds_fn)(CGRect *rect, int cid, uint64_t sid);
+typedef CGError (*rovr_sls_get_display_menubar_height_fn)(uint32_t did, uint32_t *height);
+typedef CGError (*rovr_sls_get_dock_rect_fn)(int cid, CGRect *rect, int *reason);
+typedef Boolean (*rovr_core_dock_autohide_fn)(void);
+typedef void (*rovr_core_dock_orient_fn)(int *orientation, int *pinning);
+typedef CGError (*rovr_sls_request_notifications_fn)(int cid, uint32_t *window_list, int window_count);
+static rovr_sls_window_query_fn g_sls_window_query = NULL;
+static rovr_sls_window_query_copy_fn g_sls_window_query_copy = NULL;
+static rovr_sls_window_iter_count_fn g_sls_window_iter_count = NULL;
+static rovr_sls_window_iter_advance_fn g_sls_window_iter_advance = NULL;
+static rovr_sls_window_iter_parent_fn g_sls_window_iter_parent = NULL;
+static rovr_sls_window_iter_level_fn g_sls_window_iter_level = NULL;
+static rovr_sls_get_menu_autohide_fn g_sls_get_menu_autohide = NULL;
+static rovr_sls_get_revealed_menu_bounds_fn g_sls_get_revealed_menu = NULL;
+static rovr_sls_get_display_menubar_height_fn g_sls_get_menubar_height = NULL;
+static rovr_sls_get_dock_rect_fn g_sls_get_dock_rect = NULL;
+static rovr_core_dock_autohide_fn g_core_dock_autohide = NULL;
+static rovr_core_dock_orient_fn g_core_dock_orient = NULL;
+static rovr_sls_request_notifications_fn g_sls_request_notifications = NULL;
 
 static _Atomic int g_needs_refresh = 0;
 
@@ -93,25 +131,6 @@ static uint32_t rovr_display_for_rect(CGRect rect) {
     return displays[0];
 }
 
-static uint32_t rovr_focused_window_id(void) {
-    if (!g_ax_get_window) return 0;
-    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
-    if (!frontmost) return 0;
-
-    AXUIElementRef app = AXUIElementCreateApplication(frontmost.processIdentifier);
-    if (!app) return 0;
-
-    CFTypeRef focused = NULL;
-    AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &focused);
-    CFRelease(app);
-    if (error != kAXErrorSuccess || !focused) return 0;
-
-    CGWindowID window_id = 0;
-    g_ax_get_window((AXUIElementRef)focused, &window_id);
-    CFRelease(focused);
-    return window_id;
-}
-
 // yabai's AX_ENHANCED_UI_WORKAROUND: Electron/Chromium set
 // AXEnhancedUserInterface=true on themselves and then misapply position and
 // size writes while it is active. For apps in that state, flip it off around
@@ -143,6 +162,11 @@ static void rovr_ax_set_enhanced_ui(AXUIElementRef app, bool on) {
 enum {
     ROVR_EVENT_WINDOW_CREATED = 1,
     ROVR_EVENT_WINDOW_FOCUSED = 2,
+    ROVR_EVENT_WINDOW_DESTROYED = 4,
+    // A press-drag-release gesture finished. Fires the refresh wake so a
+    // manually dragged window is observed (and retiled) promptly after
+    // mouse-up instead of waiting for the next periodic tick.
+    ROVR_EVENT_DRAG_ENDED = 8,
 };
 
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
@@ -170,6 +194,8 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
         kind = ROVR_EVENT_WINDOW_CREATED;
     } else if (CFStringCompare(notification, kAXFocusedWindowChangedNotification, 0) == kCFCompareEqualTo) {
         kind = ROVR_EVENT_WINDOW_FOCUSED;
+    } else if (CFStringCompare(notification, kAXUIElementDestroyedNotification, 0) == kCFCompareEqualTo) {
+        kind = ROVR_EVENT_WINDOW_DESTROYED;
     } else {
         return;
     }
@@ -181,6 +207,19 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
     // _AXUIElementGetWindow, e.g. error -25212), otherwise those focus
     // changes are silently lost and the daemon serves stale state.
     g_event_trampoline(kind, have_gid ? (uint32_t)gid : 0);
+}
+
+// SLS connection notify handler (yabai mission_control.c: connection_handler, MIT, Åsmund Vikane).
+// Space create/destroy (1327/1328), window ordered/destroyed (808/804), mission control enter (1204).
+static void rovr_sls_connection_handler(uint32_t type, void *data, size_t data_length, void *context, int cid) {
+    (void)data;
+    (void)data_length;
+    (void)context;
+    (void)cid;
+    if (type == 1327 || type == 1328 || type == 808 || type == 804 || type == 1204) {
+        atomic_store(&g_needs_refresh, 1);
+        if (g_event_trampoline) g_event_trampoline(1, 0);
+    }
 }
 
 static bool rovr_observer_registered_for_pid(pid_t pid) {
@@ -200,20 +239,15 @@ static bool rovr_observer_registered_for_pid(pid_t pid) {
 // already runs, so callbacks are delivered there.
 static void rovr_observe_app(pid_t pid) {
     if (rovr_observer_registered_for_pid(pid)) return;
-    pthread_mutex_lock(&g_observers_lock);
-    if (g_observed_app_count >= ROVR_OBSERVER_MAX) {
-        pthread_mutex_unlock(&g_observers_lock);
-        return;
-    }
     AXUIElementRef app = AXUIElementCreateApplication(pid);
+    rovr_ax_apply_timeout(app);
     AXObserverRef observer = NULL;
     if (!app || AXObserverCreate(pid, rovr_ax_notification_handler, &observer) != kAXErrorSuccess || !observer) {
         if (app) CFRelease(app);
-        pthread_mutex_unlock(&g_observers_lock);
         return;
     }
     bool any = false;
-    const CFStringRef notifications[] = { kAXCreatedNotification, kAXFocusedWindowChangedNotification };
+    const CFStringRef notifications[] = { kAXCreatedNotification, kAXFocusedWindowChangedNotification, kAXUIElementDestroyedNotification };
     for (unsigned long i = 0; i < sizeof(notifications) / sizeof(notifications[0]); ++i) {
         AXError err = AXObserverAddNotification(observer, app, notifications[i], (void *)(intptr_t)pid);
         if (err == kAXErrorSuccess || err == kAXErrorNotificationAlreadyRegistered) any = true;
@@ -221,7 +255,13 @@ static void rovr_observe_app(pid_t pid) {
     if (!any) {
         CFRelease(observer);
         CFRelease(app);
+        return;
+    }
+    pthread_mutex_lock(&g_observers_lock);
+    if (g_observed_app_count >= ROVR_OBSERVER_MAX) {
         pthread_mutex_unlock(&g_observers_lock);
+        CFRelease(observer);
+        CFRelease(app);
         return;
     }
     CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), kCFRunLoopDefaultMode);
@@ -233,19 +273,26 @@ static void rovr_observe_app(pid_t pid) {
 
 // Drop observer entries whose process has exited (called each snapshot).
 static void rovr_prune_observers(void) {
+    struct observed_app removed[ROVR_OBSERVER_MAX];
+    int removed_count = 0;
     pthread_mutex_lock(&g_observers_lock);
     for (int i = g_observed_app_count - 1; i >= 0; --i) {
         pid_t pid = g_observed_apps[i].pid;
         if (kill(pid, 0) == 0 || errno != ESRCH) continue;
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(g_observed_apps[i].observer), kCFRunLoopDefaultMode);
-        CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(g_observed_apps[i].observer));
-        AXObserverRemoveNotification(g_observed_apps[i].observer, g_observed_apps[i].app, kAXCreatedNotification);
-        CFRelease(g_observed_apps[i].observer);
-        CFRelease(g_observed_apps[i].app);
+        removed[removed_count++] = g_observed_apps[i];
         g_observed_apps[i] = g_observed_apps[g_observed_app_count - 1];
         g_observed_app_count--;
     }
     pthread_mutex_unlock(&g_observers_lock);
+    for (int i = 0; i < removed_count; i++) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(removed[i].observer), kCFRunLoopDefaultMode);
+        CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(removed[i].observer));
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXCreatedNotification);
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXFocusedWindowChangedNotification);
+        AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXUIElementDestroyedNotification);
+        CFRelease(removed[i].observer);
+        CFRelease(removed[i].app);
+    }
 }
 
 // Electron/Chromium accessibility enablement: these apps hide their AX tree
@@ -298,16 +345,34 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
     if (!window_info) return NULL;
 
     pid_t target_pid = 0;
+    CGRect target_bounds = CGRectZero;
+    bool have_target_bounds = false;
+    int pid_window_count = 0;
     CFIndex count = CFArrayGetCount(window_info);
+    // No early break: besides the target's pid/bounds we also count how many
+    // CG windows the pid owns (single-candidate fallback below).
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
         CFNumberRef window_number = CFDictionaryGetValue(entry, kCGWindowNumber);
         int window_id = 0;
-        if (window_number && CFNumberGetValue(window_number, kCFNumberIntType, &window_id) &&
-            (uint32_t)window_id == target_id) {
+        if (!window_number || !CFNumberGetValue(window_number, kCFNumberIntType, &window_id)) continue;
+        if ((uint32_t)window_id == target_id) {
             CFNumberRef owner_pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
             if (owner_pid) CFNumberGetValue(owner_pid, kCFNumberIntType, &target_pid);
-            break;
+            CFDictionaryRef bounds_dict = CFDictionaryGetValue(entry, kCGWindowBounds);
+            if (bounds_dict && CGRectMakeWithDictionaryRepresentation(bounds_dict, &target_bounds)) {
+                have_target_bounds = true;
+            }
+        }
+    }
+    if (target_pid != 0) {
+        for (CFIndex i = 0; i < count; i++) {
+            CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
+            CFNumberRef owner_pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
+            int pid = 0;
+            if (owner_pid && CFNumberGetValue(owner_pid, kCFNumberIntType, &pid) && pid == target_pid) {
+                pid_window_count++;
+            }
         }
     }
     CFRelease(window_info);
@@ -317,6 +382,7 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
 
     AXUIElementRef app = AXUIElementCreateApplication(target_pid);
     if (!app) return NULL;
+    rovr_ax_apply_timeout(app);
 
     CFTypeRef value = NULL;
     AXError error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
@@ -330,23 +396,134 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
         usleep(100000); // give the app a moment to build its AX tree
         error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value);
     }
-    CFRelease(app);
-    if (error != kAXErrorSuccess || !value || CFGetTypeID(value) != CFArrayGetTypeID()) {
-        if (value) CFRelease(value);
-        return NULL;
-    }
-
-    CFArrayRef windows = (CFArrayRef)value;
     AXUIElementRef result = NULL;
-    for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
-        AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-        CGWindowID candidate_id = 0;
-        if (g_ax_get_window(window, &candidate_id) == kAXErrorSuccess && candidate_id == target_id) {
-            result = (AXUIElementRef)CFRetain(window);
-            break;
+    CFIndex ax_count = 0;
+    if (error == kAXErrorSuccess && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)value;
+        ax_count = CFArrayGetCount(windows);
+        for (CFIndex i = 0; i < ax_count; i++) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            CGWindowID candidate_id = 0;
+            if (g_ax_get_window(window, &candidate_id) == kAXErrorSuccess && candidate_id == target_id) {
+                result = (AXUIElementRef)CFRetain(window);
+                rovr_ax_apply_timeout(result);
+                break;
+            }
+        }
+        // The private matcher rejects some apps' elements outright (notably
+        // Finder: -25201) while their tree is otherwise healthy. Retry with
+        // the public AXWindowNumber attribute before giving up on numbers.
+        // Capped: every candidate costs an AX round-trip against the app's
+        // 0.5s messaging timeout, and this path is already a fallback.
+        if (!result) {
+            CFIndex cap = ax_count < 32 ? ax_count : 32;
+            for (CFIndex i = 0; i < cap; i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                CFNumberRef number = NULL;
+                SInt32 public_id = -1;
+                if (AXUIElementCopyAttributeValue(window, CFSTR("AXWindowNumber"),
+                                                 (CFTypeRef *)&number) == kAXErrorSuccess &&
+                    number && CFNumberGetValue(number, kCFNumberSInt32Type, &public_id) &&
+                    public_id == (SInt32)target_id) {
+                    result = (AXUIElementRef)CFRetain(window);
+                    rovr_ax_apply_timeout(result);
+                }
+                if (number) CFRelease(number);
+                if (result) break;
+            }
         }
     }
-    CFRelease(windows);
+
+    // Some apps (e.g. WezTerm nightly) expose no kAXWindowsAttribute array at
+    // all and ignore AXManualAccessibility, but still report their main/focused
+    // window. Match those against the target id so observation and the
+    // fullscreen/close button presses keep working for them. (Uses `app`,
+    // hence this runs before the release below.)
+    if (!result) {
+        const CFStringRef single_attrs[2] = { kAXMainWindowAttribute, kAXFocusedWindowAttribute };
+        for (int a = 0; a < 2 && !result; ++a) {
+            CFTypeRef single = NULL;
+            if (AXUIElementCopyAttributeValue(app, single_attrs[a], &single) != kAXErrorSuccess || !single) {
+                if (single) CFRelease(single);
+                continue;
+            }
+            if (CFGetTypeID(single) == AXUIElementGetTypeID()) {
+                CGWindowID candidate_id = 0;
+                if (g_ax_get_window((AXUIElementRef)single, &candidate_id) == kAXErrorSuccess &&
+                    candidate_id == target_id) {
+                    result = (AXUIElementRef)CFRetain(single);
+                    rovr_ax_apply_timeout(result);
+                }
+            }
+            CFRelease(single);
+        }
+    }
+
+    // Last resort for apps with no window-number correlation at all (Finder
+    // exposes neither the private id nor AXWindowNumber): correlate by live
+    // geometry. Only fires on a UNIQUE match — ambiguity refuses rather than
+    // risk mutating the wrong window. (b) is subsumed by (c) geometrically
+    // but needs no extra AX reads, so try it first.
+    if (!result && value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+        CFArrayRef windows = (CFArrayRef)value;
+        if (ax_count == 1 && pid_window_count == 1) {
+            AXUIElementRef only = (AXUIElementRef)CFArrayGetValueAtIndex(windows, 0);
+            CFTypeRef role = NULL;
+            if (AXUIElementCopyAttributeValue(only, kAXRoleAttribute, &role) == kAXErrorSuccess &&
+                role && CFGetTypeID(role) == CFStringGetTypeID() &&
+                CFStringCompare((CFStringRef)role, CFSTR("AXWindow"), 0) == kCFCompareEqualTo) {
+                result = (AXUIElementRef)CFRetain(only);
+                rovr_ax_apply_timeout(result);
+            }
+            if (role) CFRelease(role);
+        } else if (have_target_bounds && ax_count > 1) {
+            const double epsilon = 2.0;
+            AXUIElementRef unique = NULL;
+            bool ambiguous = false;
+            CFIndex cap = ax_count < 32 ? ax_count : 32;
+            for (CFIndex i = 0; i < cap && !ambiguous; i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                CFTypeRef role = NULL;
+                if (AXUIElementCopyAttributeValue(window, kAXRoleAttribute, &role) != kAXErrorSuccess ||
+                    !role || CFGetTypeID(role) != CFStringGetTypeID() ||
+                    CFStringCompare((CFStringRef)role, CFSTR("AXWindow"), 0) != kCFCompareEqualTo) {
+                    if (role) CFRelease(role);
+                    continue;
+                }
+                CFRelease(role);
+                AXValueRef ax_pos = NULL, ax_size = NULL;
+                CGPoint pos = CGPointZero;
+                CGSize size = CGSizeZero;
+                bool ok = AXUIElementCopyAttributeValue(window, kAXPositionAttribute,
+                                                        (CFTypeRef *)&ax_pos) == kAXErrorSuccess &&
+                    ax_pos && AXValueGetValue(ax_pos, kAXValueCGPointType, &pos) &&
+                    AXUIElementCopyAttributeValue(window, kAXSizeAttribute,
+                                                  (CFTypeRef *)&ax_size) == kAXErrorSuccess &&
+                    ax_size && AXValueGetValue(ax_size, kAXValueCGSizeType, &size);
+                if (ax_pos) CFRelease(ax_pos);
+                if (ax_size) CFRelease(ax_size);
+                if (!ok) continue;
+                if (fabs(pos.x - target_bounds.origin.x) <= epsilon &&
+                    fabs(pos.y - target_bounds.origin.y) <= epsilon &&
+                    fabs(size.width - target_bounds.size.width) <= epsilon &&
+                    fabs(size.height - target_bounds.size.height) <= epsilon) {
+                    if (unique) {
+                        ambiguous = true;
+                        unique = NULL;
+                    } else {
+                        unique = window;
+                    }
+                }
+            }
+            if (unique && !ambiguous) {
+                result = (AXUIElementRef)CFRetain(unique);
+                rovr_ax_apply_timeout(result);
+            }
+        }
+    }
+    if (value) CFRelease(value);
+
+    CFRelease(app);
     return result;
 }
 
@@ -525,6 +702,27 @@ uint64_t rovr_bridge_window_space_id(uint32_t window_id) {
     return rovr_space_id_for_window(window_id);
 }
 
+int32_t rovr_bridge_window_pid(uint32_t target_id) {
+    CFArrayRef window_info = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!window_info) return 0;
+    int32_t result = 0;
+    CFIndex count = CFArrayGetCount(window_info);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef entry = CFArrayGetValueAtIndex(window_info, i);
+        CFNumberRef number = CFDictionaryGetValue(entry, kCGWindowNumber);
+        int window_id = 0;
+        if (!number || !CFNumberGetValue(number, kCFNumberIntType, &window_id) ||
+            (uint32_t)window_id != target_id) continue;
+        CFNumberRef pid = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
+        if (pid) CFNumberGetValue(pid, kCFNumberSInt32Type, &result);
+        break;
+    }
+    CFRelease(window_info);
+    return result;
+}
+
 // 0 = false, 1 = true, 2 = unknown (AX unavailable / race / attribute missing).
 static int rovr_ax_bool_for_window(AXUIElementRef window, CFStringRef attribute) {
     if (!window || !attribute) return 2;
@@ -573,13 +771,35 @@ static int rovr_ax_managed_for_window(AXUIElementRef window) {
             CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemDialog"), 0) == kCFCompareEqualTo ||
             CFStringCompare((CFStringRef)subrole, CFSTR("AXFloatingWindow"), 0) == kCFCompareEqualTo ||
             CFStringCompare((CFStringRef)subrole, CFSTR("AXSystemFloatingWindow"), 0) == kCFCompareEqualTo ||
-            CFStringCompare((CFStringRef)subrole, CFSTR("AXPopover"), 0) == kCFCompareEqualTo) {
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXPopover"), 0) == kCFCompareEqualTo ||
+            CFStringCompare((CFStringRef)subrole, CFSTR("AXUnknown"), 0) == kCFCompareEqualTo) {
             floating = YES;
         }
         CFRelease(subrole);
         if (floating) return 0;
     } else {
         if (subrole) CFRelease(subrole);
+    }
+    // Helium browser chrome: 1470×30 top bars at y:0 present as AXStandardWindow
+    // with title == "" and not main/focused. They are real AXWindows with
+    // buttons, so the toast filter doesn't catch them, but they should never
+    // be tiled — when hover makes them space-bound for a tick, BSP would see
+    // 2 windows on the Space and snap the main window to half. Filter by
+    // AXMain/AXFocused: chrome is never main.
+    CFTypeRef is_main = NULL;
+    if (AXUIElementCopyAttributeValue(window, CFSTR("AXMain"), &is_main) == kAXErrorSuccess && is_main) {
+        BOOL main = CFBooleanGetValue((CFBooleanRef)is_main);
+        CFRelease(is_main);
+        if (!main) {
+            CFTypeRef title = NULL;
+            if (AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &title) == kAXErrorSuccess) {
+                BOOL empty_title = !title || CFStringGetLength((CFStringRef)title) == 0;
+                if (title) CFRelease(title);
+                if (empty_title) return 0;
+            }
+        }
+    } else if (is_main) {
+        CFRelease(is_main);
     }
     // Toast/HUD filter: notification banners and overlays (e.g. browser web
     // notification toasts, Chromium popup overlays) can present as plain
@@ -672,6 +892,8 @@ static void *rovr_macho_find_symbol(const char *target_image, const char *target
 static const char *ROVR_SKYLIGHT_PATH =
     "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 
+static void rovr_install_mouse_tap(void);
+
 int rovr_bridge_init(void) {
     g_ax_get_window = (rovr_ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
     g_sls_main_connection = (rovr_sls_main_connection_fn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
@@ -698,11 +920,112 @@ int rovr_bridge_init(void) {
     g_sls_copy_active_menu_bar_display_identifier =
         (rovr_sls_copy_active_menu_bar_display_identifier_fn)dlsym(
             RTLD_DEFAULT, "SLSCopyActiveMenuBarDisplayIdentifier");
+    g_sls_managed_display_is_animating =
+        (rovr_sls_managed_display_is_animating_fn)dlsym(RTLD_DEFAULT, "SLSManagedDisplayIsAnimating");
+    g_sls_window_query = (rovr_sls_window_query_fn)dlsym(RTLD_DEFAULT, "SLSWindowQueryWindows");
+    g_sls_window_query_copy = (rovr_sls_window_query_copy_fn)dlsym(RTLD_DEFAULT, "SLSWindowQueryResultCopyWindows");
+    g_sls_window_iter_count = (rovr_sls_window_iter_count_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetCount");
+    g_sls_window_iter_advance = (rovr_sls_window_iter_advance_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorAdvance");
+    g_sls_window_iter_parent = (rovr_sls_window_iter_parent_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetParentID");
+    g_sls_window_iter_level = (rovr_sls_window_iter_level_fn)dlsym(RTLD_DEFAULT, "SLSWindowIteratorGetLevel");
+    g_sls_get_menu_autohide = (rovr_sls_get_menu_autohide_fn)dlsym(RTLD_DEFAULT, "SLSGetMenuBarAutohideEnabled");
+    g_sls_get_revealed_menu = (rovr_sls_get_revealed_menu_bounds_fn)dlsym(RTLD_DEFAULT, "SLSGetRevealedMenuBarBounds");
+    g_sls_get_menubar_height = (rovr_sls_get_display_menubar_height_fn)dlsym(RTLD_DEFAULT, "SLSGetDisplayMenubarHeight");
+    g_sls_get_dock_rect = (rovr_sls_get_dock_rect_fn)dlsym(RTLD_DEFAULT, "SLSGetDockRectWithReason");
+    g_core_dock_autohide = (rovr_core_dock_autohide_fn)dlsym(RTLD_DEFAULT, "CoreDockGetAutoHideEnabled");
+    g_core_dock_orient = (rovr_core_dock_orient_fn)dlsym(RTLD_DEFAULT, "CoreDockGetOrientationAndPinning");
+    g_sls_request_notifications = (rovr_sls_request_notifications_fn)dlsym(RTLD_DEFAULT, "SLSRequestNotificationsForWindows");
+    g_sls_register_notify =
+        (rovr_sls_register_notify_fn)dlsym(RTLD_DEFAULT, "SLSRegisterConnectionNotifyProc");
+    if (g_sls_register_notify && g_sls_main_connection) {
+        int cid = g_sls_main_connection();
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1327, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1328, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 808, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 804, NULL);
+        g_sls_register_notify(cid, (void *)rovr_sls_connection_handler, 1204, NULL);
+    }
     g_sls_perform_async_bridged_op = (rovr_sls_perform_async_bridged_op_fn)rovr_macho_find_symbol(
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
     CGDisplayRegisterReconfigurationCallback(rovr_display_reconfiguration_callback, NULL);
+    rovr_install_mouse_tap();
     return 0;
+}
+
+// ---- Drag-end detection (listen-only mouse event tap) ---------------------
+// Periodic snapshots (seconds) are the retile backstop, but a manually
+// dragged window should be observed promptly after mouse-up. AX
+// moved/resized notifications require per-window registration (churn as
+// windows come and go); a listen-only tap detects press-drag-release in O(1)
+// state and fires one wake per real drag. Plain clicks never wake: only a
+// release that follows actual dragging fires. Rovr's own SetWindowFrame goes
+// through AX, never synthetic mouse events, so there is no feedback loop —
+// the wake only observes, and a converged layout emits no further actions.
+static CFMachPortRef g_mouse_tap = NULL;
+static bool g_mouse_down = false;
+static bool g_mouse_dragged = false;
+
+static CGEventRef rovr_mouse_tap_callback(
+    CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
+    (void)proxy;
+    (void)context;
+    if (type == kCGEventTapDisabledByTimeout) {
+        if (g_mouse_tap) CGEventTapEnable(g_mouse_tap, true);
+        return event;
+    }
+    if (type == kCGEventTapDisabledByUserInput) return event;
+    switch (type) {
+        case kCGEventLeftMouseDown:
+        case kCGEventRightMouseDown:
+        case kCGEventOtherMouseDown:
+            g_mouse_down = true;
+            g_mouse_dragged = false;
+            break;
+        case kCGEventLeftMouseDragged:
+        case kCGEventRightMouseDragged:
+        case kCGEventOtherMouseDragged:
+            if (g_mouse_down) g_mouse_dragged = true;
+            break;
+        case kCGEventLeftMouseUp:
+        case kCGEventRightMouseUp:
+        case kCGEventOtherMouseUp:
+            if (g_mouse_down && g_mouse_dragged) {
+                atomic_store(&g_needs_refresh, 1);
+                if (g_event_trampoline) g_event_trampoline(ROVR_EVENT_DRAG_ENDED, 0);
+            }
+            g_mouse_down = false;
+            g_mouse_dragged = false;
+            break;
+        default:
+            break;
+    }
+    return event;
+}
+
+static void rovr_install_mouse_tap(void) {
+    if (g_mouse_tap) return;
+    CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown)
+        | CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventLeftMouseDragged)
+        | CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp)
+        | CGEventMaskBit(kCGEventRightMouseDragged) | CGEventMaskBit(kCGEventOtherMouseDown)
+        | CGEventMaskBit(kCGEventOtherMouseUp) | CGEventMaskBit(kCGEventOtherMouseDragged);
+    // Listen-only: never alters or swallows events. NULL without AX trust —
+    // tolerated (drag-wake appears after the grant + daemon restart, which a
+    // trust change requires anyway).
+    CFMachPortRef tap = CGEventTapCreate(
+        kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+        mask, rovr_mouse_tap_callback, NULL);
+    if (!tap) return;
+    CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    if (!src) {
+        CFRelease(tap);
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
+    CFRelease(src);
+    // Retained by creation for daemon lifetime.
+    g_mouse_tap = tap;
 }
 
 uint64_t rovr_bridge_capabilities(void) {
@@ -735,35 +1058,27 @@ uint64_t rovr_bridge_capabilities(void) {
     return capabilities;
 }
 
-int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) {
+int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void *context) {
     if (!callback) return 1;
 
-    // Bounds for the per-snapshot caches. 512 windows / 64 apps is far beyond
-    // any real session; overflow simply leaves extra windows unrefined (they
-    // stay "unknown" on the Rust side, which is conservative and honest).
     #define ROVR_ENUM_MAX_WINDOWS 512
-    #define ROVR_ENUM_MAX_PIDS 64
-
     @autoreleasepool {
-        const uint32_t focused_window_id = rovr_focused_window_id();
         CFArrayRef list = CGWindowListCopyWindowInfo(
             kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID);
         if (!list) return 2;
 
-        // ---- Pass 1: collect candidates with the same filters as before ----
-        struct {
-            uint32_t window_id;
-            pid_t pid;
-            CGRect bounds;
-            CFDictionaryRef entry; // backed by `list`, alive through pass 3
-        } cand[ROVR_ENUM_MAX_WINDOWS];
-        int cand_count = 0;
-        pid_t pids[ROVR_ENUM_MAX_PIDS];
-        int pid_count = 0;
+        struct space_display_entry space_displays[ROVR_SPACE_DISPLAY_MAX];
+        const int space_display_count =
+            rovr_build_space_display_map(space_displays, ROVR_SPACE_DISPLAY_MAX);
+        struct window_space_entry window_spaces[ROVR_WINDOW_SPACE_MAX];
+        const int window_space_count =
+            rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
 
+        int emitted = 0;
+        uint32_t emitted_ids[ROVR_ENUM_MAX_WINDOWS] = {0};
         CFIndex count = CFArrayGetCount(list);
-        for (CFIndex i = 0; i < count && cand_count < ROVR_ENUM_MAX_WINDOWS; i++) {
+        for (CFIndex i = 0; i < count && emitted < ROVR_ENUM_MAX_WINDOWS; i++) {
             CFDictionaryRef entry = CFArrayGetValueAtIndex(list, i);
             CFNumberRef layer_number = CFDictionaryGetValue(entry, kCGWindowLayer);
             int layer = 0;
@@ -781,133 +1096,32 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
             if (!CFNumberGetValue(pid, kCFNumberIntType, &owner_pid)) continue;
             if (!CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds)) continue;
             if (bounds.size.width <= 1.0 || bounds.size.height <= 1.0) continue;
-
-            cand[cand_count].window_id = (uint32_t)window_id;
-            cand[cand_count].pid = owner_pid;
-            cand[cand_count].bounds = bounds;
-            cand[cand_count].entry = entry;
-            cand_count++;
-
-            BOOL known_pid = NO;
-            for (int p = 0; p < pid_count; ++p) {
-                if (pids[p] == owner_pid) { known_pid = YES; break; }
-            }
-            if (!known_pid && pid_count < ROVR_ENUM_MAX_PIDS) {
-                pids[pid_count++] = owner_pid;
-            }
-        }
-
-        // ---- Pass 2: resolve AX elements ONCE PER APP -----------------------
-        // Previously each candidate window re-copied the full CG window list
-        // plus its app's full AX window array — O(N^2) IPC that made every
-        // snapshot cost ~350 ms and blocked the state loop behind it. One
-        // kAXWindowsAttribute query per app makes a snapshot O(apps + windows).
-        uint32_t ax_ids[ROVR_ENUM_MAX_WINDOWS];
-        AXUIElementRef ax_elems[ROVR_ENUM_MAX_WINDOWS];
-        int ax_count = 0;
-        const BOOL dbg = getenv("ROVR_BRIDGE_DEBUG") != NULL;
-        rovr_prune_observers();
-        for (int p = 0; p < pid_count; ++p) {
-            rovr_observe_app(pids[p]);
-            @autoreleasepool {
-                AXUIElementRef app = AXUIElementCreateApplication(pids[p]);
-                if (!app) continue;
-                CFTypeRef value = NULL;
-                bool got_windows =
-                    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
-                    value && CFGetTypeID(value) == CFArrayGetTypeID();
-                // Electron/Chromium apps gate their ENTIRE accessibility tree
-                // behind this flag until an assistive client asks for it.
-                // Without it their windows are invisible to us (0 windows)
-                // and can never be tiled. Setting it is harmless for apps
-                // that ignore unknown attributes. Enabled once per pid per
-                // process lifetime; the next snapshot picks up the tree.
-                if (got_windows && CFArrayGetCount((CFArrayRef)value) == 0 &&
-                    !rovr_manual_ax_already_requested(pids[p])) {
-                    rovr_ax_enable_manual_accessibility(app);
-                }
-                if (got_windows) {
-                    CFArrayRef windows = (CFArrayRef)value;
-                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: %ld ax windows\n", pids[p], (long)CFArrayGetCount(windows));
-                    for (CFIndex j = 0; j < CFArrayGetCount(windows) && ax_count < ROVR_ENUM_MAX_WINDOWS; j++) {
-                        AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(windows, j);
-                        if (!w || CFGetTypeID(w) != AXUIElementGetTypeID()) continue;
-                        CGWindowID gid = 0;
-                        if (g_ax_get_window(w, &gid) == kAXErrorSuccess && gid != 0) {
-                            ax_ids[ax_count] = (uint32_t)gid;
-                            ax_elems[ax_count] = (AXUIElementRef)CFRetain(w);
-                            ax_count++;
-                        }
-                    }
-                    CFRelease(value);
-                } else {
-                    if (!rovr_manual_ax_already_requested(pids[p])) {
-                        rovr_ax_enable_manual_accessibility(app);
-                    }
-                    if (dbg) fprintf(stderr, "[rovr-enum] pid %d: kAXWindowsAttribute failed\n", pids[p]);
-                }
-                CFRelease(app);
-            }
-        }
-        if (dbg) fprintf(stderr, "[rovr-enum] candidates=%d pids=%d ax_mapped=%d\n", cand_count, pid_count, ax_count);
-
-        // ---- Pass 3: emit windows, refining from the cached AX elements ----
-        struct space_display_entry space_displays[ROVR_SPACE_DISPLAY_MAX];
-        const int space_display_count =
-            rovr_build_space_display_map(space_displays, ROVR_SPACE_DISPLAY_MAX);
-        struct window_space_entry window_spaces[ROVR_WINDOW_SPACE_MAX];
-        const int window_space_count =
-            rovr_build_window_space_map(window_spaces, ROVR_WINDOW_SPACE_MAX);
-        for (int i = 0; i < cand_count; i++) {
-            uint32_t window_id = cand[i].window_id;
-            pid_t owner_pid = cand[i].pid;
-            CGRect bounds = cand[i].bounds;
+            // Helium/Chrome browser chrome: 1470×30 top bars etc. present as
+            // separate CGWindows with no AX element. They briefly become
+            // space-bound on hover and would make BSP see 2 windows on the
+            // Space. Filter by size here; the AX-managed check in refinement
+            // handles the rest (e.g. AXDialog) but can't catch these.
+            if (bounds.size.height < 60.0 || bounds.size.width < 80.0) continue;
 
             rovr_bridge_window window = {0};
-            window.id = window_id;
+            window.id = (uint32_t)window_id;
             window.pid = owner_pid;
-
-            // Best-effort AX refinement from the per-app cache. Transient
-            // windows missing from AX simply stay unknown.
-            AXUIElementRef ax_window = NULL;
-            for (int a = 0; a < ax_count; ++a) {
-                if (ax_ids[a] == window_id) { ax_window = ax_elems[a]; break; }
-            }
-
-            window.space_id = rovr_lookup_space_for_window(window_spaces, window_space_count, window_id);
-            if (window.space_id == 0 && ax_window) {
-                // Real app window missing from the on-screen map: likely
-                // MINIMIZED. Fall back to the direct (expensive) query —
-                // bounded by the number of real app windows, not all
-                // candidates, so overlays never trigger it.
-                window.space_id = rovr_space_id_for_window(window.id);
-            }
-            uint32_t space_display =
-                rovr_lookup_display_for_space(space_displays, space_display_count, window.space_id);
+            window.space_id = rovr_lookup_space_for_window(
+                window_spaces, window_space_count, window.id);
+            uint32_t space_display = rovr_lookup_display_for_space(
+                space_displays, space_display_count, window.space_id);
             window.display_id = space_display != 0 ? space_display : rovr_display_for_rect(bounds);
-            window.focused = focused_window_id == window.id ? 1 : 0;
             window.x = bounds.origin.x;
             window.y = bounds.origin.y;
             window.width = bounds.size.width;
             window.height = bounds.size.height;
-            // Conservative defaults: unknown = 2. Rust side maps unknown
-            // managed => false (don't tile), unknown minimized/fullscreen => false.
             window.minimized = 2;
             window.fullscreen = 2;
             window.managed = 2;
-
-            if (ax_window) {
-                int minimized = rovr_ax_bool_for_window(ax_window, kAXMinimizedAttribute);
-                int fullscreen = rovr_ax_bool_for_window(ax_window, CFSTR("AXFullScreen"));
-                int managed = rovr_ax_managed_for_window(ax_window);
-                window.minimized = (uint8_t)(minimized == 2 ? 2 : (minimized ? 1 : 0));
-                window.fullscreen = (uint8_t)(fullscreen == 2 ? 2 : (fullscreen ? 1 : 0));
-                window.managed = (uint8_t)(managed == 2 ? 2 : (managed ? 1 : 0));
-            }
-
-            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowOwnerName), window.app, sizeof(window.app));
-            rovr_copy_cf_string(CFDictionaryGetValue(cand[i].entry, kCGWindowName), window.title, sizeof(window.title));
-
+            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowOwnerName),
+                                window.app, sizeof(window.app));
+            rovr_copy_cf_string(CFDictionaryGetValue(entry, kCGWindowName),
+                                window.title, sizeof(window.title));
             NSRunningApplication *application =
                 [NSRunningApplication runningApplicationWithProcessIdentifier:owner_pid];
             if (application.bundleIdentifier) {
@@ -915,17 +1129,318 @@ int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context) 
                                                maxLength:sizeof(window.bundle_id)
                                                 encoding:NSUTF8StringEncoding];
             }
-
             callback(&window, context);
+            emitted_ids[emitted] = window.id;
+            emitted++;
         }
-
-        for (int a = 0; a < ax_count; ++a) {
-            CFRelease(ax_elems[a]);
+        // SLS window notifications on Sequoia+ (yabai update_window_notifications, MIT) — enables 804/808 events.
+        if (emitted > 0 && g_sls_request_notifications && g_sls_main_connection) {
+            NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+            if (v.majorVersion >= 15) {
+                int cid = g_sls_main_connection();
+                g_sls_request_notifications(cid, emitted_ids, emitted);
+            }
         }
-
         CFRelease(list);
         return 0;
     }
+}
+
+int rovr_bridge_refine_windows_for_pid(
+    int32_t pid,
+    rovr_ax_window_callback callback,
+    void *context) {
+    if (pid <= 0 || !callback || !g_ax_get_window) return 1;
+
+    #define ROVR_AX_MAX_WINDOWS 512
+    @autoreleasepool {
+        rovr_prune_observers();
+        rovr_observe_app(pid);
+        AXUIElementRef app = AXUIElementCreateApplication(pid);
+        if (!app) return 2;
+        rovr_ax_apply_timeout(app);
+
+        uint32_t ids[ROVR_AX_MAX_WINDOWS];
+        AXUIElementRef elements[ROVR_AX_MAX_WINDOWS];
+        int ax_count = 0;
+        CFTypeRef value = NULL;
+        bool got_windows =
+            AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &value) == kAXErrorSuccess &&
+            value && CFGetTypeID(value) == CFArrayGetTypeID();
+        if (got_windows && CFArrayGetCount((CFArrayRef)value) == 0 &&
+            !rovr_manual_ax_already_requested(pid)) {
+            rovr_ax_enable_manual_accessibility(app);
+        }
+        if (got_windows) {
+            CFArrayRef windows = (CFArrayRef)value;
+            for (CFIndex i = 0;
+                 i < CFArrayGetCount(windows) && ax_count < ROVR_AX_MAX_WINDOWS;
+                 i++) {
+                AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+                if (!window || CFGetTypeID(window) != AXUIElementGetTypeID()) continue;
+                rovr_ax_apply_timeout(window);
+                CGWindowID gid = 0;
+                if (g_ax_get_window(window, &gid) == kAXErrorSuccess && gid != 0) {
+                    ids[ax_count] = (uint32_t)gid;
+                    elements[ax_count++] = (AXUIElementRef)CFRetain(window);
+                }
+            }
+            CFRelease(value);
+        } else {
+            if (value) CFRelease(value);
+            if (!rovr_manual_ax_already_requested(pid)) {
+                rovr_ax_enable_manual_accessibility(app);
+            }
+        }
+
+        uint32_t focused_id = 0;
+        CFTypeRef focused = NULL;
+        if (AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &focused) ==
+                kAXErrorSuccess && focused &&
+            CFGetTypeID(focused) == AXUIElementGetTypeID()) {
+            g_ax_get_window((AXUIElementRef)focused, &focused_id);
+        }
+
+        if (ax_count == 0) {
+            const CFStringRef attrs[2] = { kAXMainWindowAttribute, kAXFocusedWindowAttribute };
+            for (int a = 0; a < 2 && ax_count < ROVR_AX_MAX_WINDOWS; a++) {
+                CFTypeRef single = NULL;
+                if (AXUIElementCopyAttributeValue(app, attrs[a], &single) != kAXErrorSuccess ||
+                    !single) {
+                    if (single) CFRelease(single);
+                    continue;
+                }
+                if (CFGetTypeID(single) == AXUIElementGetTypeID()) {
+                    rovr_ax_apply_timeout((AXUIElementRef)single);
+                    CGWindowID gid = 0;
+                    if (g_ax_get_window((AXUIElementRef)single, &gid) == kAXErrorSuccess &&
+                        gid != 0) {
+                        bool seen = false;
+                        for (int i = 0; i < ax_count; i++) {
+                            if (ids[i] == (uint32_t)gid) { seen = true; break; }
+                        }
+                        if (!seen) {
+                            ids[ax_count] = (uint32_t)gid;
+                            elements[ax_count++] = (AXUIElementRef)CFRetain(single);
+                        }
+                    }
+                }
+                CFRelease(single);
+            }
+        }
+        if (focused) CFRelease(focused);
+
+        for (int i = 0; i < ax_count; i++) {
+            rovr_bridge_ax_window refinement = {
+                .id = ids[i],
+                .focused = ids[i] == focused_id ? 1 : 0,
+                .minimized = (uint8_t)rovr_ax_bool_for_window(
+                    elements[i], kAXMinimizedAttribute),
+                .fullscreen = (uint8_t)rovr_ax_bool_for_window(
+                    elements[i], CFSTR("AXFullScreen")),
+                .managed = (uint8_t)rovr_ax_managed_for_window(elements[i]),
+            };
+            callback(&refinement, context);
+            CFRelease(elements[i]);
+        }
+        CFRelease(app);
+        return 0;
+    }
+}
+
+// Adapted from yabai display_bounds_constrained (MIT, Åsmund Vikane).
+// Usable area excluding dock/menubar/notch. Tries private SLS path for accuracy
+// (hidden menubar + notch, dock orientation) and falls back to NSScreen visibleFrame.
+static int rovr_display_notch_height(uint32_t did) {
+    if (!CGDisplayIsBuiltin(did)) return 0;
+    if (@available(macos 12.0, *)) {
+        for (NSScreen *screen in [NSScreen screens]) {
+            NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+            if (num && [num unsignedIntValue] == did) {
+                return (int)round(screen.safeAreaInsets.top);
+            }
+        }
+    }
+    return 0;
+}
+
+static bool rovr_menu_bar_hidden(void) {
+    if (g_sls_get_menu_autohide && g_sls_main_connection) {
+        int enabled = 0;
+        if (g_sls_get_menu_autohide(g_sls_main_connection(), &enabled) == kCGErrorSuccess) return enabled != 0;
+    }
+    return false;
+}
+
+static bool rovr_dock_hidden(void) {
+    if (g_core_dock_autohide) return g_core_dock_autohide();
+    return false;
+}
+
+static CGRect rovr_display_constrained_bounds(CGDirectDisplayID did) {
+    CGRect frame = CGDisplayBounds(did);
+    bool canUseSLS = g_sls_main_connection && g_sls_get_dock_rect;
+    if (canUseSLS) {
+        int cid = g_sls_main_connection();
+        if (rovr_menu_bar_hidden()) {
+            int notch = rovr_display_notch_height(did);
+            if (notch > 0) {
+                frame.origin.y += notch;
+                frame.size.height -= notch;
+            }
+        } else {
+            uint64_t sid = 0;
+            if (g_sls_copy_managed_display_spaces) {
+                CFArrayRef spaces = g_sls_copy_managed_display_spaces(cid);
+                if (spaces) {
+                    CFIndex dc = CFArrayGetCount(spaces);
+                    for (CFIndex d = 0; d < dc; d++) {
+                        CFDictionaryRef dr = CFArrayGetValueAtIndex(spaces, d);
+                        CFStringRef uuid = CFDictionaryGetValue(dr, CFSTR("Display Identifier"));
+                        CFArrayRef sarr = CFDictionaryGetValue(dr, CFSTR("Spaces"));
+                        if (!uuid || !sarr) continue;
+                        CFUUIDRef pu = CFUUIDCreateFromString(NULL, uuid);
+                        uint32_t curDid = pu ? CGDisplayGetDisplayIDFromUUID(pu) : 0;
+                        if (pu) CFRelease(pu);
+                        if (curDid == did && CFArrayGetCount(sarr) > 0) {
+                            CFDictionaryRef sr = CFArrayGetValueAtIndex(sarr, 0);
+                            CFNumberRef sidRef = CFDictionaryGetValue(sr, CFSTR("id64"));
+                            if (sidRef) CFNumberGetValue(sidRef, kCFNumberSInt64Type, &sid);
+                            break;
+                        }
+                    }
+                    CFRelease(spaces);
+                }
+            }
+            CGRect menu = {0};
+            bool gotMenu = false;
+            if (sid != 0 && g_sls_get_revealed_menu) {
+                if (g_sls_get_revealed_menu(&menu, cid, sid) == kCGErrorSuccess) gotMenu = true;
+            }
+            if (!gotMenu && g_sls_get_menubar_height) {
+                uint32_t h = 0;
+                if (g_sls_get_menubar_height(did, &h) == kCGErrorSuccess && h > 0) {
+                    menu.size.height = h;
+                    gotMenu = true;
+                }
+            }
+            if (gotMenu && menu.size.height > 0) {
+                if (menu.size.height > 1) menu.size.height += 1;
+                frame.origin.y += menu.size.height;
+                frame.size.height -= menu.size.height;
+            } else {
+                // Fallback notch already handled? Use visibleFrame height delta.
+                for (NSScreen *screen in [NSScreen screens]) {
+                    NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+                    if (num && [num unsignedIntValue] == did) {
+                        CGRect vf = [screen visibleFrame];
+                        CGFloat delta = (frame.size.height - vf.size.height);
+                        if (delta > 0 && delta < 100) {
+                            frame.origin.y += delta;
+                            frame.size.height -= delta;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (!rovr_dock_hidden() && g_sls_get_dock_rect) {
+            CGRect dock = {0}; int reason = 0;
+            if (g_sls_get_dock_rect(cid, &dock, &reason) == kCGErrorSuccess) {
+                // Use yabai's logic: only subtract dock if did == dock display.
+                // Heuristic: if dock rect lies within this display's bounds (before subtraction), apply.
+                if (CGRectIntersectsRect(frame, dock) || CGRectContainsRect(CGDisplayBounds(did), dock)) {
+                    int orient = 0, pinning = 0;
+                    if (g_core_dock_orient) g_core_dock_orient(&orient, &pinning);
+                    else orient = 2; // bottom default
+                    switch (orient) {
+                        case 0: // left
+                            if (dock.size.width > 0) { frame.origin.x += dock.size.width; frame.size.width -= dock.size.width; }
+                            break;
+                        case 1: // right
+                            frame.size.width -= dock.size.width; break;
+                        case 2: // bottom
+                        default: frame.size.height -= dock.size.height; break;
+                    }
+                }
+            }
+        }
+        // Clamp to positive
+        if (frame.size.width < 0) frame.size.width = 0;
+        if (frame.size.height < 0) frame.size.height = 0;
+        return frame;
+    }
+    // Fallback: NSScreen visibleFrame (covers dock+menubar+notch on most configs)
+    @autoreleasepool {
+        for (NSScreen *screen in [NSScreen screens]) {
+            NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+            if (num && [num unsignedIntValue] == did) {
+                return [screen visibleFrame];
+            }
+        }
+    }
+    return frame;
+}
+
+// Adapted from yabai display_manager_display_is_animating (MIT, © Åsmund Vikane).
+static bool rovr_display_is_animating(uint32_t did) {
+    if (!g_sls_managed_display_is_animating || !g_sls_main_connection) return false;
+    CFUUIDRef uuidRef = CGDisplayCreateUUIDFromDisplayID(did);
+    if (!uuidRef) return false;
+    CFStringRef uuid = CFUUIDCreateString(NULL, uuidRef);
+    CFRelease(uuidRef);
+    if (!uuid) return false;
+    bool result = g_sls_managed_display_is_animating(g_sls_main_connection(), uuid);
+    CFRelease(uuid);
+    return result;
+}
+
+// SLS fallback for background apps where AX returns Unknown. Uses level/parent to decide
+// if window is a standard user window (level 0/3/8, parent 0) — yabai window_manager.c / window.c logic (MIT).
+static int rovr_sls_managed_for_window(uint32_t wid) {
+    if (!g_sls_window_query || !g_sls_window_query_copy || !g_sls_window_iter_count || !g_sls_window_iter_advance || !g_sls_window_iter_parent || !g_sls_window_iter_level || !g_sls_main_connection) return 2;
+    int cid = g_sls_main_connection();
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
+    if (!n) return 2;
+    const void *vals[1] = { n };
+    CFArrayRef arr = CFArrayCreate(NULL, vals, 1, &kCFTypeArrayCallBacks);
+    CFRelease(n);
+    if (!arr) return 2;
+    CFTypeRef query = g_sls_window_query(cid, arr, 1);
+    CFRelease(arr);
+    if (!query) return 2;
+    CFTypeRef iter = g_sls_window_query_copy(query);
+    CFRelease(query);
+    if (!iter) return 2;
+    int result = 2;
+    if (g_sls_window_iter_count(iter) == 1 && g_sls_window_iter_advance(iter)) {
+        int level = g_sls_window_iter_level(iter);
+        uint32_t parent = g_sls_window_iter_parent(iter);
+        if (parent != 0) result = 0;
+        else if (level == 0 || level == 3 || level == 8) result = 1;
+        else result = 0;
+    }
+    CFRelease(iter);
+    return result;
+}
+
+int rovr_bridge_sls_managed_for_window(uint32_t wid) {
+    return rovr_sls_managed_for_window(wid);
+}
+
+// Sort displays by center coordinate (x then y) — deterministic arrangement order, yabai display_manager_coordinate_comparator (MIT).
+static int rovr_display_cmp(const void *a, const void *b) {
+    CGDirectDisplayID da = *(const CGDirectDisplayID *)a;
+    CGDirectDisplayID db = *(const CGDirectDisplayID *)b;
+    CGRect fa = CGDisplayBounds(da);
+    CGRect fb = CGDisplayBounds(db);
+    CGPoint ca = CGPointMake(fa.origin.x + fa.size.width * 0.5, fa.origin.y + fa.size.height * 0.5);
+    CGPoint cb = CGPointMake(fb.origin.x + fb.size.width * 0.5, fb.origin.y + fb.size.height * 0.5);
+    if (ca.x < cb.x) return -1;
+    if (ca.x > cb.x) return 1;
+    if (ca.y < cb.y) return -1;
+    if (ca.y > cb.y) return 1;
+    return 0;
 }
 
 int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context) {
@@ -934,12 +1449,13 @@ int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context
     CGDirectDisplayID displays[32] = {0};
     uint32_t count = 0;
     if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess) return 2;
+    if (count > 1) qsort(displays, count, sizeof(CGDirectDisplayID), rovr_display_cmp);
 
     CGDirectDisplayID active_display = rovr_active_display_id();
     if (active_display == 0) active_display = CGMainDisplayID();
     CGDirectDisplayID main_display = CGMainDisplayID();
     for (uint32_t i = 0; i < count; i++) {
-        CGRect frame = CGDisplayBounds(displays[i]);
+        CGRect frame = rovr_display_constrained_bounds(displays[i]);
         rovr_bridge_display display = {
             .id = displays[i],
             .focused = displays[i] == active_display ? 1 : 0,
@@ -966,6 +1482,7 @@ int rovr_bridge_set_window_frame(
     pid_t window_pid = 0;
     AXUIElementGetPid(window, &window_pid);
     __block AXUIElementRef app = window_pid > 0 ? AXUIElementCreateApplication(window_pid) : NULL;
+    rovr_ax_apply_timeout(app);
     bool eui_toggled = false;
     if (app && rovr_ax_get_enhanced_ui(app)) {
         rovr_ax_set_enhanced_ui(app, false);
@@ -1025,6 +1542,7 @@ static int rovr_ax_press_window_button(uint32_t window_id, CFStringRef button_at
     int result = 2;
     AXUIElementRef button = NULL;
     if (AXUIElementCopyAttributeValue(window, button_attribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
+        rovr_ax_apply_timeout(button);
         if (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) {
             result = 0;
         }
@@ -1039,9 +1557,39 @@ int rovr_bridge_close_window(uint32_t window_id) {
 }
 
 int rovr_bridge_toggle_fullscreen(uint32_t window_id) {
-    // The fullscreen button only exists while the window supports native
-    // fullscreen; error 2 surfaces as "unsupported" to the caller.
-    return rovr_ax_press_window_button(window_id, kAXFullScreenButtonAttribute);
+    // AX-only mutation. Focus and transition settling are handled outside the 150ms AX worker
+    // (see mod.rs ToggleNativeFullscreen). Keeps the worker deadline tight.
+    pid_t pid = 0;
+    AXUIElementRef window = rovr_ax_window_for_id(window_id, &pid);
+    if (!window) return 1;
+    bool is_fullscreen = false;
+    CFTypeRef fv = NULL;
+    if (AXUIElementCopyAttributeValue(window, CFSTR("AXFullScreen"), &fv) == kAXErrorSuccess && fv) {
+        if (CFGetTypeID(fv) == CFBooleanGetTypeID()) is_fullscreen = CFBooleanGetValue((CFBooleanRef)fv);
+        CFRelease(fv);
+    }
+    AXUIElementRef appElem = pid > 0 ? AXUIElementCreateApplication(pid) : NULL;
+    if (appElem) rovr_ax_apply_timeout(appElem);
+    bool eui = appElem ? rovr_ax_get_enhanced_ui(appElem) : false;
+    if (eui) rovr_ax_set_enhanced_ui(appElem, false);
+    AXError setErr = AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), is_fullscreen ? kCFBooleanFalse : kCFBooleanTrue);
+    if (eui) rovr_ax_set_enhanced_ui(appElem, true);
+    if (appElem) CFRelease(appElem);
+    int result = 0;
+    if (setErr != kAXErrorSuccess) {
+        AXUIElementRef button = NULL;
+        if (AXUIElementCopyAttributeValue(window, kAXFullScreenButtonAttribute, (CFTypeRef *)&button) == kAXErrorSuccess && button) {
+            rovr_ax_apply_timeout(button);
+            result = (AXUIElementPerformAction(button, kAXPressAction) == kAXErrorSuccess) ? 0 : 3;
+            CFRelease(button);
+        } else result = 2;
+    }
+    CFRelease(window);
+    return result;
+}
+
+int rovr_bridge_is_display_animating(uint32_t display_id) {
+    return rovr_display_is_animating(display_id) ? 1 : 0;
 }
 
 int32_t rovr_bridge_dock_pid(void) {
@@ -1094,12 +1642,14 @@ int rovr_bridge_enumerate_spaces(rovr_space_callback callback, void *context) {
             if (!sid_ref) continue;
             uint64_t sid = 0;
             CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &sid);
+            int stype = g_sls_space_get_type ? g_sls_space_get_type(cid, sid) : -1;
             rovr_bridge_space space = {
                 .id = sid,
                 .display_id = display_id,
-                .type = g_sls_space_get_type ? g_sls_space_get_type(cid, sid) : -1,
+                .type = stype,
                 .focused = sid == active_sid ? 1 : 0,
                 .position = position,
+                .is_system = stype == 2 ? 1 : 0,
             };
             callback(&space, context);
             position++;
@@ -1179,6 +1729,12 @@ int rovr_bridge_focus_space(uint64_t space_id) {
     if (!g_sls_copy_managed_display_for_space || !g_sls_managed_display_get_current_space ||
         !g_sls_copy_managed_display_spaces || !g_sls_main_connection) {
         return 1;
+    }
+    // Guard: posting gesture mid-animation leaves WindowServer between Spaces (blank-screen bug).
+    // Adapted from yabai display_manager_display_is_animating check (MIT).
+    {
+        uint32_t did = rovr_display_for_space(space_id);
+        if (did != 0 && rovr_display_is_animating(did)) return 5;
     }
 
     int cid = g_sls_main_connection();
@@ -1264,6 +1820,10 @@ int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta) {
         target_space_id == 0 || delta == 0) {
         return 1;
     }
+    {
+        uint32_t did = rovr_display_for_space(target_space_id);
+        if (did != 0 && rovr_display_is_animating(did)) return 5;
+    }
 
     int cid = g_sls_main_connection();
     CFStringRef target_uuid =
@@ -1335,4 +1895,14 @@ uint64_t rovr_bridge_current_space_for_space(uint64_t space_id) {
 // cross-display switches (their settle gates are independent).
 uint32_t rovr_bridge_display_for_space(uint64_t space_id) {
     return rovr_display_for_space(space_id);
+}
+
+int rovr_bridge_space_is_fullscreen(uint64_t space_id) {
+    if (!g_sls_space_get_type || !g_sls_main_connection || space_id == 0) return 0;
+    return g_sls_space_get_type(g_sls_main_connection(), space_id) == 4 ? 1 : 0;
+}
+
+int rovr_bridge_space_is_system(uint64_t space_id) {
+    if (!g_sls_space_get_type || !g_sls_main_connection || space_id == 0) return 0;
+    return g_sls_space_get_type(g_sls_main_connection(), space_id) == 2 ? 1 : 0;
 }

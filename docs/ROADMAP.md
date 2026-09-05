@@ -27,7 +27,7 @@ See `TODO.md` for the 2026-05-11 audit baseline. Do not promote `[~]` to `[x]` w
 - [x] resolve CGWindowID <-> AXUIElement reliably
 - [x] focus window
 - [x] set window frame (+ minimize/unminimize via AX `kAXMinimizedAttribute`)
-- [~] observe AX window lifecycle — polling + `CGDisplay` callback + AX `minimized/fullscreen/managed` via `kAXMinimized/AXFullScreen/Role/Subrole` (filtered dialogs/popovers); still no `AXObserver` subscriptions, no `AXHidden` handling
+- [~] observe AX window lifecycle — polling + `CGDisplay` callback + AX `minimized/fullscreen/managed` via `kAXMinimized/AXFullScreen/Role/Subrole` (filtered dialogs/popovers); per-PID persistent AX workers with 500 ms messaging timeouts and shared deadlines are live-verified against a deliberately hung Cocoa app (healthy windows stayed known, hung window stayed `unknown`, refresh 540 ms, next ping 19 ms); still no destroyed-window subscription or `AXHidden` handling
 - [x] display topology observation
 - [x] sleep/wake generation bump and complete refresh
 - [~] query output compatibility layer — `rovr query windows/spaces/displays` now truthfully reports `minimized/fullscreen/managed` (via AX) but `label` still synthesized
@@ -55,9 +55,9 @@ See `TODO.md` for the 2026-05-11 audit baseline. Do not promote `[~]` to `[x]` w
 
 ## M4: ecosystem
 
-- [x] stable subscription API — `Notification::{Hello,StateChanged,LayoutChanged,ScratchpadToggled,ConfigReloaded,Unknown}`, bounded eviction, ACK
+- [x] stable subscription API — `Notification::{Hello,Heartbeat,StateChanged,LayoutChanged,ScratchpadToggled,ConfigReloaded,Unknown}`, bounded eviction, ACK; heartbeat verified on an isolated live daemon
 - [x] shell completions
-- [~] skhd compatibility / optional built-in keybinds — `[[bind]]` → `gen-skhd` works; built-in global hotkey backend architecturally fixed for macOS: daemon MAIN thread runs the AppKit event loop (Carbon event target requirement), socket accept on a worker thread; binds validated at config load via the ONE shared command parser (`rovr_protocol::command_parser`); invalid bind commands fail load and execute nothing at runtime (never substituted); hotkey firing on a live UI session not yet verified
+- [~] skhd compatibility / optional built-in keybinds — `[[bind]]` → `gen-skhd` works; built-in global hotkey backend is the native path: daemon MAIN thread runs the AppKit event loop (Carbon event target requirement), socket accept on a worker thread; binds validated at config load via the ONE shared command parser (`rovr_protocol::command_parser`); invalid bind commands fail load and execute nothing at runtime (never substituted); one live binding registered successfully, but synthetic CGEvents did not trigger Carbon, so a physical keypress remains unverified
 - [~] Swift menu-bar diagnostics UI — now at `apps/rovr-menu-bar` as diagnostics/control surface **only via public IPC** (`rovr doctor`/`query state`/`sa status`/`debug events` via `Process`/`/usr/bin/env rovr`), shows daemon/SA/capabilities/workspace/layout, `Reload Config` + `Open Diagnostics`, 5 s refresh, no layout logic in Swift
 - [~] layout plugin protocol, likely WASM — wasmi 0.40 runtime with REAL resource limits: `StoreLimits` attached per call (16 MiB linear memory cap, table cap, trap-on-grow-failure) + fuel 1M timeout + no host imports; plugin output VALIDATED before use (`validate_placements`: count/duplicates/foreign/finite/positive/bounds — invalid output discarded wholesale, built-in fallback); regression tests for memory-hog containment and all validation classes; live-macOS plugin behavior not yet verified
 

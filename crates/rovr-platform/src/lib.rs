@@ -19,6 +19,15 @@ pub enum PlatformError {
     Operation(String),
 }
 
+/// A recoverable platform-layer failure that did not fail the enclosing
+/// operation. The daemon drains these into its bounded flight recorder so
+/// partial snapshots remain diagnosable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformDiagnostic {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
 /// Diagnostics for the automatic SA reinjection lifecycle. Exposed by
 /// `rovr doctor`; never contains secrets or privileged internals.
 #[derive(Debug, Clone)]
@@ -87,6 +96,10 @@ pub trait Platform: Send {
     fn snapshot_wedged_ms(&self) -> Option<u64> {
         None
     }
+    /// Drain recoverable failures accumulated since the previous call.
+    fn drain_diagnostics(&mut self) -> Vec<PlatformDiagnostic> {
+        Vec::new()
+    }
     /// Automatic SA reinjection lifecycle diagnostics; None on platforms
     /// without the macOS scripting addition.
     fn sa_reinject_diagnostics(&self) -> Option<SaReinjectDiag> {
@@ -97,5 +110,33 @@ pub trait Platform: Send {
     /// its state loop immediately; observation remains snapshot-authoritative.
     fn set_event_watcher(&mut self, event_kind_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
         let _ = event_kind_watcher;
+    }
+}
+
+/// An AX timeout cannot establish that a newly observed window is unminimized.
+#[cfg(any(target_os = "macos", test))]
+fn cached_minimized(
+    observed: rovr_types::ObservedBool,
+    cached: Option<rovr_types::ObservedBool>,
+) -> rovr_types::ObservedBool {
+    use rovr_types::ObservedBool;
+    match observed {
+        ObservedBool::Unknown => cached.unwrap_or(ObservedBool::Unknown),
+        known => known,
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::cached_minimized;
+    use rovr_types::ObservedBool::{No, Unknown, Yes};
+
+    #[test]
+    fn first_seen_unknown_minimized_stays_unknown() {
+        assert_eq!(cached_minimized(Unknown, None), Unknown);
+        assert_eq!(cached_minimized(Unknown, Some(Unknown)), Unknown);
+        assert_eq!(cached_minimized(Unknown, Some(Yes)), Yes);
+        assert_eq!(cached_minimized(Unknown, Some(No)), No);
+        assert_eq!(cached_minimized(Yes, Some(No)), Yes);
     }
 }

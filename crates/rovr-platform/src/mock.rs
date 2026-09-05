@@ -1,12 +1,13 @@
 use rovr_core::Action;
 use rovr_types::{Capabilities, PlatformSnapshot};
 
-use crate::{Platform, PlatformError};
+use crate::{Platform, PlatformDiagnostic, PlatformError};
 
 #[derive(Debug, Default)]
 pub struct MockPlatform {
     pub snapshot: PlatformSnapshot,
     pub executed: Vec<Action>,
+    pub diagnostics: Vec<PlatformDiagnostic>,
 }
 
 impl MockPlatform {
@@ -14,6 +15,7 @@ impl MockPlatform {
         Self {
             snapshot,
             executed: vec![],
+            diagnostics: vec![],
         }
     }
 }
@@ -45,5 +47,9 @@ impl Platform for MockPlatform {
     fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
         self.executed.push(action.clone());
         Ok(())
+    }
+
+    fn drain_diagnostics(&mut self) -> Vec<PlatformDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
     }
 }

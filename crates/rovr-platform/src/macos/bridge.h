@@ -42,6 +42,14 @@ typedef struct rovr_bridge_display {
 } rovr_bridge_display;
 
 typedef void (*rovr_window_callback)(const rovr_bridge_window *window, void *context);
+typedef struct rovr_bridge_ax_window {
+    uint32_t id;
+    uint8_t focused;
+    uint8_t minimized;
+    uint8_t fullscreen;
+    uint8_t managed;
+} rovr_bridge_ax_window;
+typedef void (*rovr_ax_window_callback)(const rovr_bridge_ax_window *window, void *context);
 typedef void (*rovr_display_callback)(const rovr_bridge_display *display, void *context);
 typedef struct rovr_bridge_space {
     uint64_t id;
@@ -49,13 +57,15 @@ typedef struct rovr_bridge_space {
     int32_t type;
     uint8_t focused;
     uint32_t position;
+    uint8_t is_system; // type==2 system space (yabai space_is_system)
 } rovr_bridge_space;
 
 typedef void (*rovr_space_callback)(const rovr_bridge_space *space, void *context);
 
 int rovr_bridge_init(void);
 uint64_t rovr_bridge_capabilities(void);
-int rovr_bridge_enumerate_windows(rovr_window_callback callback, void *context);
+int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void *context);
+int rovr_bridge_refine_windows_for_pid(int32_t pid, rovr_ax_window_callback callback, void *context);
 int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context);
 int rovr_bridge_set_window_frame(uint32_t window_id, double x, double y, double width, double height);
 int rovr_bridge_focus_window(uint32_t window_id);
@@ -66,7 +76,15 @@ int rovr_bridge_focus_space(uint64_t space_id);
 int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta);
 uint64_t rovr_bridge_current_space_for_space(uint64_t space_id);
 uint32_t rovr_bridge_display_for_space(uint64_t space_id);
+int rovr_bridge_toggle_fullscreen(uint32_t window_id); // AXFullScreen attribute toggle with focus+wait; fallback to button; waits for animation (yabai-adapted, MIT)
+int rovr_bridge_close_window(uint32_t window_id);
 int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);
+int32_t rovr_bridge_window_pid(uint32_t window_id);
+uint64_t rovr_bridge_window_space_id(uint32_t window_id);
+int rovr_bridge_space_is_fullscreen(uint64_t space_id);
+int rovr_bridge_space_is_system(uint64_t space_id); // type==2 system space (yabai space_is_system, MIT)
+int rovr_bridge_is_display_animating(uint32_t display_id); // SLSManagedDisplayIsAnimating, 1 if animating
+int rovr_bridge_sls_managed_for_window(uint32_t window_id); // SLS fallback for background apps where AX returns Unknown (yabai level/parent check, MIT)
 int32_t rovr_bridge_dock_pid(void);
 
 // AX event trampoline registration (rovr-platform calls this once at init;
