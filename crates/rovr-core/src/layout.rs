@@ -1090,7 +1090,7 @@ mod tests {
             crate::workspace::WorkspaceState {
                 name: "chat".into(),
                 persistent: true,
-                backing_space: Some(SpaceId(11)),
+                backing: Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) }),
                 desired_display: None,
                 ordinal: 0,
                 last_position: None,

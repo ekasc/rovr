@@ -824,7 +824,7 @@ fn sa_state(client: &rovr_platform::macos::sa::SaClient) -> SaState {
 }
 
 /// Locate build artifacts: env overrides, then cargo target build dirs
-/// relative to this executable.
+/// relative to this executable, then permanent-install locations.
 #[cfg(target_os = "macos")]
 fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
     if let (Ok(dylib), Ok(loader), Ok(helper)) = (
@@ -839,14 +839,51 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         ));
     }
     let exe = std::env::current_exe().context("locate rovr executable")?;
-    // Resolve symlinks first: installs are typically ~/.local/bin/rovr ->
-    // <target>/<profile>/rovr, and current_exe() does NOT resolve them, which
-    // would make the ancestor walk land in ~/.local where cargo never puts
-    // build-script output.
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir where
-    // cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
-    let target_root = exe
+    let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    // 1) Permanent install: SA artifacts installed alongside rovr
+    //    ($PREFIX/bin -> $PREFIX/lib/rovr or $PREFIX/share/rovr).
+    //    scripts/install.sh copies them there.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(bin_dir) = exe_canon.parent() {
+        candidates.push(bin_dir.join("librovr_sa_payload.dylib"));
+        candidates.push(bin_dir.join("rovr-sa-loader"));
+        candidates.push(bin_dir.join("rovr-sa-helper"));
+        if let Some(prefix) = bin_dir.parent() {
+            candidates.push(prefix.join("lib/rovr/librovr_sa_payload.dylib"));
+            candidates.push(prefix.join("lib/rovr/rovr-sa-loader"));
+            candidates.push(prefix.join("lib/rovr/rovr-sa-helper"));
+            candidates.push(prefix.join("share/rovr/librovr_sa_payload.dylib"));
+            candidates.push(prefix.join("share/rovr/rovr-sa-loader"));
+            candidates.push(prefix.join("share/rovr/rovr-sa-helper"));
+        }
+    }
+    // Also check XDG-ish permanent locations directly.
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/lib/rovr/librovr_sa_payload.dylib"));
+        candidates.push(home.join(".local/lib/rovr/rovr-sa-loader"));
+        candidates.push(home.join(".local/lib/rovr/rovr-sa-helper"));
+        candidates.push(home.join(".local/share/rovr/librovr_sa_payload.dylib"));
+    }
+    let dylib_perm = candidates
+        .iter()
+        .find(|p| p.ends_with("librovr_sa_payload.dylib") && p.exists())
+        .cloned();
+    let loader_perm = candidates
+        .iter()
+        .find(|p| p.ends_with("rovr-sa-loader") && p.exists())
+        .cloned();
+    let helper_perm = candidates
+        .iter()
+        .find(|p| p.ends_with("rovr-sa-helper") && p.exists())
+        .cloned();
+    if let (Some(d), Some(l), Some(h)) = (dylib_perm, loader_perm, helper_perm) {
+        return Ok((d, l, h));
+    }
+    // 2) Dev install: cargo target dir relative to the (canonical) exe.
+    //    exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir
+    //    where cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
+    let target_root = exe_canon
         .ancestors()
         .nth(1)
         .map(|p| p.to_path_buf())
@@ -872,11 +909,45 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         hits.sort();
         hits.pop()
     };
+    // 3) Fallback: also check non-canonical exe's build dir (covers copied
+    //    permanent binary where canonical == ~/.local/bin/rovr and has no build).
+    let find_fallback = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
+        let alt_root = exe
+            .ancestors()
+            .nth(1)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if alt_root == target_root {
+            return None;
+        }
+        let base = alt_root.join("build");
+        if !base.is_dir() {
+            return None;
+        }
+        let mut hits: Vec<PathBuf> = std::fs::read_dir(&base)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(crate_prefix))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.join("out").join(artifact))
+            .filter(|p| p.exists())
+            .collect();
+        hits.sort();
+        hits.pop()
+    };
     let dylib = find("rovr-sa-payload", "librovr_sa_payload.dylib")
+        .or_else(|| find_fallback("rovr-sa-payload", "librovr_sa_payload.dylib"))
         .context("payload dylib not built — run `cargo build -p rovr-sa-payload` first")?;
     let loader = find("rovr-sa-loader", "rovr-sa-loader")
+        .or_else(|| find_fallback("rovr-sa-loader", "rovr-sa-loader"))
         .context("loader binary not built — run `cargo build -p rovr-sa-loader` first")?;
     let helper = find("rovr-sa-helper", "rovr-sa-helper")
+        .or_else(|| find_fallback("rovr-sa-helper", "rovr-sa-helper"))
         .context("helper binary not built — run `cargo build -p rovr-sa-helper` first")?;
     Ok((dylib, loader, helper))
 }

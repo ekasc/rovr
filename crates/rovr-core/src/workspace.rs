@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rovr_types::{DisplayId, SpaceId};
+use rovr_types::{DisplayId, SpaceId, WindowId};
 use serde::{Deserialize, Serialize};
 
 /// A logical workspace's backing Space moved from `from` (possibly gone) to
@@ -21,29 +21,61 @@ pub struct WorkspaceState {
     pub desired_display: Option<String>,
     /// Whether workspace is persistent (should be recreated if missing)
     pub persistent: bool,
-    /// Volatile backing macOS SpaceId, if currently mapped
-    pub backing_space: Option<SpaceId>,
+    /// Session-only observed backing. Native IDs are never persisted as identity.
+    #[serde(skip)]
+    pub backing: Option<WorkspaceBacking>,
     /// Stable config order — the deterministic tiebreaker for remapping
     /// (blocker 3). Persisted so identity survives daemon restarts.
     #[serde(default)]
     pub ordinal: usize,
-    /// Last observed Mission-Control position of the backing space. Used to
-    /// re-claim the same slot after a Dock restart when ids churn.
-    #[serde(default)]
+    /// Diagnostic observation only; never used to reclaim identity.
+    #[serde(skip)]
     pub last_position: Option<u32>,
-    /// i3-style spawn-on-focus workspace: excluded from remap claiming (must
-    /// never adopt a pre-existing Space) and destroyed when left empty.
+    /// Runtime-created workspace; retained across configuration reload.
     #[serde(default)]
     pub dynamic: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceBacking {
+    Normal {
+        space: SpaceId,
+    },
+    FullscreenReplacement {
+        fullscreen_space: SpaceId,
+        restore_space: SpaceId,
+        window: WindowId,
+    },
+}
+
+impl WorkspaceBacking {
+    pub fn active_space(self) -> SpaceId {
+        match self {
+            Self::Normal { space } => space,
+            Self::FullscreenReplacement {
+                fullscreen_space, ..
+            } => fullscreen_space,
+        }
+    }
+    pub fn restore_space(self) -> Option<SpaceId> {
+        match self {
+            Self::Normal { .. } => None,
+            Self::FullscreenReplacement { restore_space, .. } => Some(restore_space),
+        }
+    }
+}
+
 impl WorkspaceState {
+    pub fn active_space(&self) -> Option<SpaceId> {
+        self.backing.map(WorkspaceBacking::active_space)
+    }
+
     pub fn new(name: String, desired_display: Option<String>, persistent: bool) -> Self {
         Self {
             name,
             desired_display,
             persistent,
-            backing_space: None,
+            backing: None,
             ordinal: usize::MAX,
             last_position: None,
             dynamic: false,
@@ -99,13 +131,13 @@ impl WorkspaceRegistry {
     }
 
     pub fn backing_for(&self, name: &str) -> Option<SpaceId> {
-        self.0.get(name).and_then(|w| w.backing_space)
+        self.0.get(name).and_then(|w| w.active_space())
     }
 
     pub fn name_for_space(&self, space: SpaceId) -> Option<&str> {
         self.0
             .iter()
-            .find(|(_, w)| w.backing_space == Some(space))
+            .find(|(_, w)| w.active_space() == Some(space))
             .map(|(k, _)| k.as_str())
     }
 
@@ -115,7 +147,7 @@ impl WorkspaceRegistry {
         let mut names: Vec<(usize, String)> = self
             .0
             .iter()
-            .filter(|(_, w)| w.backing_space.is_none())
+            .filter(|(_, w)| w.active_space().is_none())
             .map(|(k, w)| (w.ordinal, k.clone()))
             .collect();
         names.sort();
@@ -131,184 +163,65 @@ impl WorkspaceRegistry {
             .collect()
     }
 
-    /// Deterministically re-assign backing Spaces after observation.
-    ///
-    /// Blocker 3: assignment NEVER depends on HashMap iteration order. All
-    /// inputs are sorted:
-    /// - unclaimed Spaces by Mission-Control position (ties by id),
-    /// - workspaces by stable config ordinal.
-    ///
-    /// Strategy per pass:
-    /// 1. Resume: a workspace whose persisted `last_position` matches an
-    ///    unclaimed Space's position (and satisfies its display preference)
-    ///    re-claims that exact slot — this keeps `code` on its old slot across
-    ///    Dock restarts instead of shuffling identities.
-    /// 2. Remaining workspaces in ordinal order claim the first unclaimed
-    ///    Space on their desired display, else the first remaining unclaimed
-    ///    Space in position order.
-    ///
-    /// Returns the moves so the engine can carry SpaceId-keyed layout state
-    /// (BSP trees) to each workspace's new backing Space (blocker 5).
-    pub fn remap_after_snapshot(
-        &mut self,
-        observed_spaces: &HashMap<SpaceId, rovr_types::SpaceSnapshot>,
-        observed_displays: &HashMap<DisplayId, rovr_types::DisplaySnapshot>,
-    ) -> Vec<RemapMove> {
-        // Dynamic (i3-style) workspaces manage their own binding lifecycle:
-        // they must never adopt a pre-existing unclaimed Space, and stale/gap
-        // reassignment must not shuffle them. Exclude from all remapping.
-        let mut dynamic: Vec<WorkspaceState> = Vec::new();
-        let mut stale_dynamic: Vec<RemapMove> = Vec::new();
-        self.0.retain(|_, ws| {
-            if ws.dynamic {
-                // A dynamic workspace whose persisted backing Space no longer
-                // exists has effectively been destroyed out-of-band (manual
-                // Space deletion, prior session that crashed before cleanup).
-                // Clear the stale id so the next alt-N re-spawns cleanly
-                // instead of erroring on a missing Space. Report it as a move
-                // so the engine can drop any SpaceId-keyed layout state.
-                if let Some(sid) = ws.backing_space {
-                    if !observed_spaces.contains_key(&sid) {
-                        stale_dynamic.push(RemapMove {
-                            name: ws.name.clone(),
-                            from: Some(sid),
-                            to: sid,
-                        });
-                        dynamic.push(WorkspaceState {
-                            backing_space: None,
-                            last_position: None,
-                            ..ws.clone()
-                        });
-                        return false;
-                    }
-                }
-                dynamic.push(ws.clone());
-                false
-            } else {
-                true
-            }
+    /// Numeric names sort numerically; named workspaces retain configured order.
+    pub fn ordered_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.0.keys().cloned().collect();
+        names.sort_by_key(|name| match name.parse::<u32>() {
+            Ok(number) => (0, number as usize, name.clone()),
+            Err(_) => (1, self.0[name].ordinal, name.clone()),
         });
-        let mut moves = self.remap_configured_after_snapshot(observed_spaces, observed_displays);
-        for ws in dynamic {
-            self.0.insert(ws.name.clone(), ws);
-        }
-        moves.extend(stale_dynamic);
-        moves
+        names
     }
 
-    fn remap_configured_after_snapshot(
+    /// Recompute observed handles from native slots, never from remembered IDs.
+    /// Creation and restoration temporarily reserve their bindings in the engine.
+    pub fn remap_after_snapshot(
         &mut self,
-        observed_spaces: &HashMap<SpaceId, rovr_types::SpaceSnapshot>,
-        observed_displays: &HashMap<DisplayId, rovr_types::DisplaySnapshot>,
+        spaces: &HashMap<SpaceId, rovr_types::SpaceSnapshot>,
+        displays: &HashMap<DisplayId, rovr_types::DisplaySnapshot>,
     ) -> Vec<RemapMove> {
-        // A backing SpaceId that still exists is authoritative. Mission
-        // Control positions compact when another Space is deleted; using
-        // those positions to reassign surviving workspaces is what made
-        // alt-2 silently become alt-3/4. Only stale/missing workspaces are
-        // candidates for assignment.
-        let mut stale_from: HashMap<String, SpaceId> = HashMap::new();
-        for state in self.0.values_mut() {
-            match state.backing_space {
-                Some(sid) if observed_spaces.contains_key(&sid) => {
-                    state.last_position = observed_spaces.get(&sid).map(|s| s.position);
-                }
-                Some(sid) => {
-                    state.backing_space = None;
-                    stale_from.insert(state.name.clone(), sid);
-                }
-                None => {}
-            }
-        }
-        self.1 = false;
-
-        let claimed: std::collections::HashSet<SpaceId> =
-            self.0.values().filter_map(|w| w.backing_space).collect();
-        let mut unclaimed: Vec<(SpaceId, u32, DisplayId)> = observed_spaces
-            .iter()
-            .filter(|(sid, snap)| !claimed.contains(sid) && !snap.is_fullscreen && !snap.is_system)
-            .map(|(sid, s)| (*sid, s.position, s.display_id))
+        let parked: std::collections::HashSet<_> = self
+            .0
+            .values()
+            .filter_map(|w| w.backing.and_then(WorkspaceBacking::restore_space))
             .collect();
-        unclaimed.sort_by_key(|&(sid, pos, _)| (pos, sid));
-
-        let main_display = observed_displays
-            .iter()
-            .find(|(_, d)| d.is_main)
-            .map(|(id, _)| *id)
-            .or_else(|| {
-                observed_displays
-                    .iter()
-                    .find(|(_, d)| d.focused)
-                    .map(|(id, _)| *id)
-            });
-        let display_ok = |desired: &Option<String>, display_id: DisplayId| -> bool {
-            match desired.as_deref() {
-                None => true,
-                Some("main") => main_display == Some(display_id),
-                Some(numeric) => numeric
-                    .parse::<u32>()
-                    .map(|id| id == display_id.0)
-                    .unwrap_or(false),
-            }
-        };
-
-        let missing = self.missing_backing_in_order();
+        let mut slots: Vec<_> = spaces
+            .values()
+            .filter(|s| !s.is_fullscreen && !s.is_system && !parked.contains(&s.id))
+            .collect();
+        slots.sort_by_key(|s| (s.display_id, s.position, s.id));
+        let main = displays.values().find(|d| d.is_main).map(|d| d.id);
         let mut moves = Vec::new();
-
-        // Dock restarts replace every SpaceId at once. Persisted positions are
-        // used only to recover missing identities; they never override a valid
-        // surviving ID after an ordinary deletion.
-        for name in &missing {
-            let Some(state) = self.0.get(name) else {
-                continue;
-            };
-            let Some(last_position) = state.last_position else {
-                continue;
-            };
-            let desired = state.desired_display.clone();
-            let Some(index) = unclaimed.iter().position(|&(_, pos, display)| {
-                pos == last_position && display_ok(&desired, display)
-            }) else {
-                continue;
-            };
-            let (sid, pos, _) = unclaimed.remove(index);
-            let ws = self.0.get_mut(name).expect("name from own registry");
-            moves.push(RemapMove {
-                name: name.clone(),
-                from: stale_from.get(name).copied(),
-                to: sid,
-            });
-            ws.backing_space = Some(sid);
-            ws.last_position = Some(pos);
-        }
-
-        // Initial startup and newly configured workspaces have no position
-        // history. Assign only those still missing, in stable config order.
-        for name in &missing {
-            let Some(ws) = self.0.get(name) else {
-                continue;
-            };
-            if ws.backing_space.is_some() {
+        for name in self.ordered_names() {
+            let ws = self.0.get_mut(&name).unwrap();
+            if matches!(
+                ws.backing,
+                Some(WorkspaceBacking::FullscreenReplacement { .. })
+            ) {
                 continue;
             }
-            let desired = ws.desired_display.clone();
-            let pick = unclaimed
-                .iter()
-                .position(|&(_, _, display)| display_ok(&desired, display))
-                .or_else(|| (!unclaimed.is_empty()).then_some(0));
-            let Some(index) = pick else {
-                continue;
+            let old = ws.active_space();
+            let preferred = match ws.desired_display.as_deref() {
+                Some("main") => main,
+                Some(id) => id.parse::<u32>().ok().map(DisplayId),
+                None => None,
             };
-            let (sid, pos, _) = unclaimed.remove(index);
-            let ws = self.0.get_mut(name).expect("name from own registry");
-            moves.push(RemapMove {
-                name: name.clone(),
-                from: stale_from.get(name).copied(),
-                to: sid,
-            });
-            ws.backing_space = Some(sid);
-            ws.last_position = Some(pos);
+            let index = slots
+                .iter()
+                .position(|s| preferred.map_or(true, |d| s.display_id == d));
+            let new = index.map(|i| slots.remove(i));
+            ws.backing = new.map(|s| WorkspaceBacking::Normal { space: s.id });
+            ws.last_position = new.map(|s| s.position);
+            if old != ws.active_space() {
+                if let Some(to) = ws.active_space().or(old) {
+                    moves.push(RemapMove {
+                        name,
+                        from: old,
+                        to,
+                    });
+                }
+            }
         }
-
         moves
     }
 }
@@ -340,7 +253,7 @@ mod tests {
                 WorkspaceState {
                     name: (*name).into(),
                     persistent: *persistent,
-                    backing_space: backing.map(SpaceId),
+                    backing: backing.map(|id| WorkspaceBacking::Normal { space: SpaceId(id) }),
                     desired_display: None,
                     ordinal: *ordinal,
                     last_position: None,
@@ -473,7 +386,7 @@ mod tests {
     /// workspace loses its backing. This is the i3 invariant behind alt-N:
     /// workspace identity is its logical name, not Mission Control position.
     #[test]
-    fn deleting_middle_space_preserves_surviving_workspace_ids() {
+    fn observed_slots_determine_contents_without_identity_healing() {
         let mut reg = registry_with(&[
             ("1", true, Some(11), 0),
             ("2", false, Some(12), 1),
@@ -491,11 +404,11 @@ mod tests {
         reg.remap_after_snapshot(&spaces, &HashMap::new());
 
         assert_eq!(reg.backing_for("1"), Some(SpaceId(11)));
-        assert_eq!(reg.backing_for("2"), None);
+        assert_eq!(reg.backing_for("2"), Some(SpaceId(13)));
         assert_eq!(
             reg.backing_for("3"),
-            Some(SpaceId(13)),
-            "surviving workspace must keep its SpaceId after position compaction"
+            None,
+            "only two ordinary native slots are available"
         );
     }
 
@@ -536,7 +449,7 @@ mod tests {
     /// must be cleared by the next remap so alt-N re-spawns instead of
     /// erroring on a missing Space.
     #[test]
-    fn stale_dynamic_binding_is_cleared_on_remap() {
+    fn dynamic_workspace_rebinds_by_slot_after_id_churn() {
         let mut reg = WorkspaceRegistry::default();
         reg.0.insert(
             "2".into(),
@@ -544,7 +457,9 @@ mod tests {
                 name: "2".into(),
                 desired_display: None,
                 persistent: false,
-                backing_space: Some(SpaceId(1778)),
+                backing: Some(WorkspaceBacking::Normal {
+                    space: SpaceId(1778),
+                }),
                 ordinal: 1,
                 last_position: Some(3),
                 dynamic: true,
@@ -555,8 +470,8 @@ mod tests {
         let moves = reg.remap_after_snapshot(&spaces, &HashMap::new());
         assert_eq!(
             reg.backing_for("2"),
-            None,
-            "stale dynamic backing must be cleared"
+            Some(SpaceId(11)),
+            "dynamic workspaces use the same positional mapping as configured ones"
         );
         assert_eq!(
             moves.len(),
@@ -564,11 +479,11 @@ mod tests {
             "stale-clear must be reported as a remap move so the engine drops the layout"
         );
         assert_eq!(moves[0].from, Some(SpaceId(1778)));
-        assert_eq!(moves[0].to, SpaceId(1778));
+        assert_eq!(moves[0].to, SpaceId(11));
     }
 
     #[test]
-    fn reordered_config_preserves_live_space_ids() {
+    fn reordered_config_changes_logical_slot_order() {
         let workspace = |name: &str| rovr_config::WorkspaceConfig {
             name: name.into(),
             layout: rovr_types::LayoutKind::Bsp,
@@ -577,8 +492,10 @@ mod tests {
             plugin: None,
         };
         let mut reg = WorkspaceRegistry::from_config(&[workspace("code"), workspace("chat")]);
-        reg.0.get_mut("code").unwrap().backing_space = Some(SpaceId(11));
-        reg.0.get_mut("chat").unwrap().backing_space = Some(SpaceId(12));
+        reg.0.get_mut("code").unwrap().backing =
+            Some(WorkspaceBacking::Normal { space: SpaceId(11) });
+        reg.0.get_mut("chat").unwrap().backing =
+            Some(WorkspaceBacking::Normal { space: SpaceId(12) });
 
         reg.ensure_from_config(&[workspace("chat"), workspace("code")]);
         let mut spaces = HashMap::new();
@@ -586,40 +503,45 @@ mod tests {
         spaces.insert(SpaceId(12), space(12, 1, 1));
         let moves = reg.remap_after_snapshot(&spaces, &HashMap::new());
 
-        assert_eq!(reg.backing_for("chat"), Some(SpaceId(12)));
-        assert_eq!(reg.backing_for("code"), Some(SpaceId(11)));
-        assert!(moves.is_empty());
+        assert_eq!(reg.backing_for("chat"), Some(SpaceId(11)));
+        assert_eq!(reg.backing_for("code"), Some(SpaceId(12)));
+        assert_eq!(moves.len(), 2);
     }
 
-    /// Reload/config reconciliation must preserve valid IDs even when Mission
-    /// Control positions have been manually rearranged.
+    /// Manual drags in Mission Control must make alt-N follow the *visual*
+    /// position, not the stale SpaceId. If the user drags Space 12 from
+    /// position 1 to 0 and Space 11 from 0 to 1, workspace "code"
+    /// (ordinal 0, alt-1) must now be bound to the Space now at position 0
+    /// (12), and "chat" (ordinal 1, alt-2) to the Space now at position 1
+    /// (11). Layout state follows via RemapMove.
     #[test]
     fn reload_preserves_ids_after_manual_drag() {
         let mut reg = registry_with(&[("code", true, Some(11), 0), ("chat", true, Some(12), 1)]);
-        // Dragged arrangement: chat was pulled ahead of code in Mission
-        // Control; ids stay, positions swap, registry remembers the slots.
-        reg.0.get_mut("code").unwrap().last_position = Some(1);
-        reg.0.get_mut("chat").unwrap().last_position = Some(0);
+        // Before drag: code at pos0 (11), chat at pos1 (12). User drags chat
+        // ahead of code: Space 12 now at pos0, Space 11 at pos1. last_position
+        // still holds the old positions (0 and 1), so remap must detect the
+        // mismatch and reassign ordinal→position.
+        reg.0.get_mut("code").unwrap().last_position = Some(0);
+        reg.0.get_mut("chat").unwrap().last_position = Some(1);
         let mut spaces = HashMap::new();
         spaces.insert(SpaceId(11), space(11, 1, 1));
         spaces.insert(SpaceId(12), space(12, 1, 0));
         let displays = HashMap::new();
 
-        // Not dirty: resume-by-position keeps each workspace on its dragged
-        // slot — a legitimate drag must be stable across snapshots.
+        // Drag: ordinal→position reassignment, alt-1 now follows position 0.
         let moves = reg.remap_after_snapshot(&spaces, &displays);
         assert_eq!(
             (reg.backing_for("code"), reg.backing_for("chat")),
-            (Some(SpaceId(11)), Some(SpaceId(12))),
-            "resume-by-position must preserve a legitimate drag when not dirty"
+            (Some(SpaceId(12)), Some(SpaceId(11))),
+            "alt-N must follow visual position after a manual drag"
         );
-        assert!(moves.is_empty());
+        assert_eq!(moves.len(), 2);
 
         let moves = reg.remap_after_snapshot(&spaces, &displays);
         assert_eq!(
             (reg.backing_for("code"), reg.backing_for("chat")),
-            (Some(SpaceId(11)), Some(SpaceId(12))),
-            "reload must keep surviving logical names on their current IDs"
+            (Some(SpaceId(12)), Some(SpaceId(11))),
+            "drag mapping must be stable across snapshots"
         );
         assert!(moves.is_empty());
     }

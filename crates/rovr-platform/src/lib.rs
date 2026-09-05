@@ -112,3 +112,31 @@ pub trait Platform: Send {
         let _ = event_kind_watcher;
     }
 }
+
+/// An AX timeout cannot establish that a newly observed window is unminimized.
+#[cfg(any(target_os = "macos", test))]
+fn cached_minimized(
+    observed: rovr_types::ObservedBool,
+    cached: Option<rovr_types::ObservedBool>,
+) -> rovr_types::ObservedBool {
+    use rovr_types::ObservedBool;
+    match observed {
+        ObservedBool::Unknown => cached.unwrap_or(ObservedBool::Unknown),
+        known => known,
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::cached_minimized;
+    use rovr_types::ObservedBool::{No, Unknown, Yes};
+
+    #[test]
+    fn first_seen_unknown_minimized_stays_unknown() {
+        assert_eq!(cached_minimized(Unknown, None), Unknown);
+        assert_eq!(cached_minimized(Unknown, Some(Unknown)), Unknown);
+        assert_eq!(cached_minimized(Unknown, Some(Yes)), Yes);
+        assert_eq!(cached_minimized(Unknown, Some(No)), No);
+        assert_eq!(cached_minimized(Yes, Some(No)), Yes);
+    }
+}

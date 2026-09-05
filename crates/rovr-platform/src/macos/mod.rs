@@ -839,14 +839,15 @@ impl MacPlatform {
 impl Platform for MacPlatform {
     fn capabilities(&self) -> Capabilities {
         let sa_attribs = self.sa_attribs();
+        let bridge_caps = unsafe { rovr_bridge_capabilities() };
         Capabilities {
-            observe_windows: self.bridge_capabilities & ROVR_CAP_OBSERVE_WINDOWS != 0,
-            set_window_frame: self.bridge_capabilities & ROVR_CAP_SET_WINDOW_FRAME != 0,
-            focus_window: self.bridge_capabilities & ROVR_CAP_FOCUS_WINDOW != 0,
-            move_window_to_space: self.bridge_capabilities & ROVR_CAP_MOVE_WINDOW_TO_SPACE != 0,
+            observe_windows: bridge_caps & ROVR_CAP_OBSERVE_WINDOWS != 0,
+            set_window_frame: bridge_caps & ROVR_CAP_SET_WINDOW_FRAME != 0,
+            focus_window: bridge_caps & ROVR_CAP_FOCUS_WINDOW != 0,
+            move_window_to_space: bridge_caps & ROVR_CAP_MOVE_WINDOW_TO_SPACE != 0,
             create_space: sa_attribs & OSAX_ATTRIB_ADD_SPACE != 0,
             destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
-            focus_space: self.bridge_capabilities & ROVR_CAP_FOCUS_SPACE != 0,
+            focus_space: bridge_caps & ROVR_CAP_FOCUS_SPACE != 0,
             reorder_space: sa_attribs & OSAX_ATTRIB_MOV_SPACE != 0,
             set_window_layer: sa_attribs & OSAX_ATTRIB_WINDOW_LAYER != 0,
             set_window_sticky: sa_attribs & OSAX_ATTRIB_WINDOW_STICKY != 0,
@@ -871,17 +872,7 @@ impl Platform for MacPlatform {
             Ok(Ok(mut snap)) => {
                 let mut last = self.last_known_minimized.borrow_mut();
                 for w in &mut snap.windows {
-                    if w.minimized == rovr_types::ObservedBool::Unknown {
-                        if let Some(&known) = last.get(&w.id) {
-                            if known != rovr_types::ObservedBool::Unknown {
-                                w.minimized = known;
-                            } else {
-                                w.minimized = rovr_types::ObservedBool::No;
-                            }
-                        } else {
-                            w.minimized = rovr_types::ObservedBool::No;
-                        }
-                    }
+                    w.minimized = crate::cached_minimized(w.minimized, last.get(&w.id).copied());
                     if w.minimized != rovr_types::ObservedBool::Unknown {
                         last.insert(w.id, w.minimized);
                     }
