@@ -50,9 +50,15 @@ enum TopCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 struct QueryArgs {
     #[command(subcommand)]
-    command: QuerySubcommand,
+    command: Option<QuerySubcommand>,
+    /// Print the canonical current snapshot (`space`/`display`/`window`) as
+    /// bare JSON. Same as `rovr query current`; exists so SketchyBar-style
+    /// consumers can init with a flag: `rovr query --current`.
+    #[arg(long)]
+    current: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -351,11 +357,54 @@ fn main() -> Result<()> {
     if matches!(cli.command, TopCommand::Subscribe) {
         return run_subscribe(&socket);
     }
+    let current_only = is_current_query(&cli.command);
     let command = map_command(cli.command);
     let request = Request::new(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed), command);
     let response = send(&socket, &request)?;
+    if current_only {
+        // Bare snapshot for status-bar consumers: valid JSON, stable fields,
+        // no envelope, no logs on stdout. Failures go to stderr + non-zero.
+        return print_current_response(&response);
+    }
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+/// True for `rovr query current` and `rovr query --current` — both map to the
+/// same `QueryCommand::Current`; only the output framing differs (bare JSON).
+fn is_current_query(command: &TopCommand) -> bool {
+    matches!(
+        command,
+        TopCommand::Query(args) if args.current
+            || matches!(args.command, Some(QuerySubcommand::Current))
+    )
+}
+
+/// Render a `query --current` response as bare snapshot JSON for stdout.
+/// `Ok` → pretty snapshot; `Err` → message for stderr (caller exits non-zero).
+fn render_current_response(response: &Response) -> Result<String, String> {
+    match &response.outcome {
+        ResponseOutcome::Ok { result } => {
+            serde_json::to_string_pretty(result).map_err(|e| format!("encode snapshot: {e}"))
+        }
+        ResponseOutcome::Error { error } => Err(format!(
+            "query --current failed ({}): {}",
+            error.code, error.message
+        )),
+    }
+}
+
+fn print_current_response(response: &Response) -> Result<()> {
+    match render_current_response(response) {
+        Ok(snapshot) => {
+            println!("{snapshot}");
+            Ok(())
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn generate_completions(shell: Shell) {
@@ -456,13 +505,20 @@ fn map_command(command: TopCommand) -> Command {
         TopCommand::Ping => Command::Ping,
         TopCommand::Refresh => Command::Refresh,
         TopCommand::Doctor => Command::Doctor,
-        TopCommand::Query(args) => Command::Query(match args.command {
-            QuerySubcommand::Windows => QueryCommand::Windows,
-            QuerySubcommand::Spaces => QueryCommand::Spaces,
-            QuerySubcommand::Displays => QueryCommand::Displays,
-            QuerySubcommand::State => QueryCommand::State,
-            QuerySubcommand::Focused => QueryCommand::Focused,
-            QuerySubcommand::Current => QueryCommand::Current,
+        TopCommand::Query(args) => Command::Query(if args.current {
+            QueryCommand::Current
+        } else {
+            match args.command {
+                Some(QuerySubcommand::Windows) => QueryCommand::Windows,
+                Some(QuerySubcommand::Spaces) => QueryCommand::Spaces,
+                Some(QuerySubcommand::Displays) => QueryCommand::Displays,
+                Some(QuerySubcommand::State) => QueryCommand::State,
+                Some(QuerySubcommand::Focused) => QueryCommand::Focused,
+                Some(QuerySubcommand::Current) => QueryCommand::Current,
+                // Clap's arg_required_else_help prevents this; flag-first
+                // mapping above keeps `--current` working without a subcommand.
+                None => QueryCommand::Current,
+            }
         }),
         TopCommand::Window(args) => Command::Window(match args.command {
             WindowSubcommand::Focus { window } => WindowCommand::Focus {
@@ -1666,5 +1722,63 @@ mod tests {
                 "{path} is installed but never removed by uninstall"
             );
         }
+    }
+
+    /// `rovr query --current` and `rovr query current` map to the same typed
+    /// command — one command system, two spellings (flag for SketchyBar init
+    /// scripts, subcommand for consistency with other queries).
+    #[test]
+    fn query_current_flag_and_subcommand_agree() {
+        let via_flag = Cli::try_parse_from(["rovr", "query", "--current"]).expect("flag parses");
+        assert!(is_current_query(&via_flag.command));
+        assert_eq!(
+            map_command(via_flag.command),
+            Command::Query(QueryCommand::Current)
+        );
+
+        let via_sub = Cli::try_parse_from(["rovr", "query", "current"]).expect("sub parses");
+        assert!(is_current_query(&via_sub.command));
+        assert_eq!(
+            map_command(via_sub.command),
+            Command::Query(QueryCommand::Current)
+        );
+
+        let other = Cli::try_parse_from(["rovr", "query", "windows"]).expect("other parses");
+        assert!(!is_current_query(&other.command));
+    }
+
+    /// `--current` prints the bare snapshot (not the response envelope) as
+    /// valid JSON with stable fields; absent focus is null, never a placeholder.
+    #[test]
+    fn query_current_renders_bare_snapshot_json() {
+        let snapshot = serde_json::json!({
+            "space": 3,
+            "display": 1,
+            "window": {"id": 482, "pid": 1234, "app": "Ghostty", "title": "~/src/rovr"}
+        });
+        let ok = Response::ok(7, snapshot.clone());
+        let rendered = render_current_response(&ok).expect("ok renders");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value, snapshot);
+        assert_eq!(value["space"], 3);
+        assert_eq!(value["window"]["app"], "Ghostty");
+        // No envelope keys leak into stdout.
+        assert!(value.get("status").is_none());
+        assert!(value.get("result").is_none());
+
+        let unfocused = Response::ok(
+            8,
+            serde_json::json!({"space": 3, "display": 1, "window": null}),
+        );
+        let rendered = render_current_response(&unfocused).expect("unfocused renders");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(value["window"].is_null());
+
+        let err = Response::error(9, "SNAPSHOT_ERROR", "no observation yet");
+        let message = render_current_response(&err).expect_err("error must not render JSON");
+        assert!(
+            message.contains("SNAPSHOT_ERROR"),
+            "stderr names the code: {message}"
+        );
     }
 }

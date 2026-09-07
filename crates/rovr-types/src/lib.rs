@@ -182,3 +182,36 @@ pub struct Capabilities {
     pub set_window_scale: bool,
     pub scripting_addition: bool,
 }
+
+/// Distributed-notification name for the public current-state snapshot.
+///
+/// External consumers (SketchyBar, Hammerspoon, Übersicht, Raycast scripts)
+/// subscribe to this; ROVR owns state, consumers own presentation.
+pub const STATE_CHANGED_NOTIFICATION: &str = "com.rovr.state.changed";
+/// `userInfo` key carrying the full JSON snapshot (a single predictable
+/// field — nested structures are NOT flattened into arbitrary fields).
+pub const STATE_USERINFO_KEY: &str = "state";
+
+/// Focused-window portion of the public snapshot. Uses the same typed IDs
+/// as the rest of ROVR (`WindowId`, `ProcessId`) — no duplicate tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicWindow {
+    pub id: WindowId,
+    pub pid: ProcessId,
+    pub app: String,
+    pub title: String,
+}
+
+/// Canonical public current-state snapshot.
+///
+/// One representation shared by `rovr query --current` and the
+/// `com.rovr.state.changed` distributed notification. `space`/`display` are
+/// the currently focused Space/Display IDs (`None` when nothing is observed
+/// yet); `window` is `None` when no window is focused — never a fabricated
+/// placeholder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicState {
+    pub space: Option<SpaceId>,
+    pub display: Option<DisplayId>,
+    pub window: Option<PublicWindow>,
+}

@@ -8,6 +8,8 @@
 #import <mach-o/nlist.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <mach/mach.h>
+#import <servers/bootstrap.h>
 #import <stdatomic.h>
 #import <stdlib.h>
 #import <string.h>
@@ -167,11 +169,21 @@ enum {
     // manually dragged window is observed (and retiled) promptly after
     // mouse-up instead of waiting for the next periodic tick.
     ROVR_EVENT_DRAG_ENDED = 8,
+    // The currently focused window's title changed. Fires the refresh wake
+    // so the status snapshot updates without waiting for the periodic
+    // recovery tick.
+    ROVR_EVENT_WINDOW_TITLE_CHANGED = 16,
 };
 
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
 
 static rovr_ax_event_trampoline_fn g_event_trampoline = NULL;
+
+// Resolves a window id to its AX element (+1, caller releases) and owning
+// pid. Defined below; needed by the focused-window title tracker.
+static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_pid);
+// Removes the title subscription; caller holds g_title_lock. Defined below.
+static void rovr_untrack_title_locked(void);
 
 #define ROVR_OBSERVER_MAX 128
 struct observed_app {
@@ -182,6 +194,17 @@ struct observed_app {
 static struct observed_app g_observed_apps[ROVR_OBSERVER_MAX];
 static int g_observed_app_count = 0;
 static pthread_mutex_t g_observers_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Focused-window title tracking: exactly one kAXTitleChangedNotification
+// subscription at a time (see below). g_title_observer is borrowed from
+// g_observed_apps; g_title_element is owned (+1).
+// Locking: g_title_lock guards these fields and may nest g_observers_lock
+// briefly for observer lookup — never the reverse.
+static pthread_mutex_t g_title_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_title_wid = 0;
+static pid_t g_title_pid = 0;
+static AXObserverRef g_title_observer = NULL;
+static AXUIElementRef g_title_element = NULL;
 
 void rovr_bridge_install_event_handlers(rovr_ax_event_trampoline_fn callback) {
     g_event_trampoline = callback;
@@ -196,6 +219,8 @@ static void rovr_ax_notification_handler(AXObserverRef observer, AXUIElementRef 
         kind = ROVR_EVENT_WINDOW_FOCUSED;
     } else if (CFStringCompare(notification, kAXUIElementDestroyedNotification, 0) == kCFCompareEqualTo) {
         kind = ROVR_EVENT_WINDOW_DESTROYED;
+    } else if (CFStringCompare(notification, kAXTitleChangedNotification, 0) == kCFCompareEqualTo) {
+        kind = ROVR_EVENT_WINDOW_TITLE_CHANGED;
     } else {
         return;
     }
@@ -284,6 +309,16 @@ static void rovr_prune_observers(void) {
         g_observed_app_count--;
     }
     pthread_mutex_unlock(&g_observers_lock);
+    // If the focused window's app went away, its observer is about to be
+    // freed below — drop the title subscription first, while the observer is
+    // still valid. The next observation retargets if focus is still there.
+    for (int i = 0; i < removed_count; i++) {
+        pthread_mutex_lock(&g_title_lock);
+        if (g_title_pid != 0 && removed[i].pid == g_title_pid) {
+            rovr_untrack_title_locked();
+        }
+        pthread_mutex_unlock(&g_title_lock);
+    }
     for (int i = 0; i < removed_count; i++) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(removed[i].observer), kCFRunLoopDefaultMode);
         CFRunLoopSourceInvalidate(AXObserverGetRunLoopSource(removed[i].observer));
@@ -293,6 +328,90 @@ static void rovr_prune_observers(void) {
         CFRelease(removed[i].observer);
         CFRelease(removed[i].app);
     }
+}
+
+// ---- Focused-window title tracking (status interface) --------------------
+// Exactly one kAXTitleChangedNotification subscription exists at a time, on
+// the currently focused window's AX element. The Rust state loop retargets
+// it after every observation via rovr_bridge_track_focused_window(); a title
+// change only requests an immediate refresh through the normal trampoline —
+// it never publishes or serializes state here, and it creates no title
+// cache. The periodic snapshot remains the fallback when registration fails
+// and the recovery path when the element goes stale. State and locking are
+// declared next to g_observed_apps above.
+
+// Caller holds g_title_lock. Removal errors are ignored: the element may
+// already be destroyed, in which case there is nothing left to unregister.
+static void rovr_untrack_title_locked(void) {
+    if (g_title_observer && g_title_element) {
+        AXObserverRemoveNotification(g_title_observer, g_title_element, kAXTitleChangedNotification);
+    }
+    g_title_observer = NULL;
+    if (g_title_element) {
+        CFRelease(g_title_element);
+        g_title_element = NULL;
+    }
+    g_title_wid = 0;
+    g_title_pid = 0;
+}
+
+// Retarget the single title-change subscription to the currently focused
+// window (0 = none focused: just untrack). Idempotent: re-tracking the same
+// window is a no-op, so per-observation syncs never accumulate subscriptions.
+// Failures are silent — window management and the periodic recovery
+// observation are unaffected.
+void rovr_bridge_track_focused_window(uint32_t window_id) {
+    pthread_mutex_lock(&g_title_lock);
+    if (window_id == g_title_wid) {
+        pthread_mutex_unlock(&g_title_lock);
+        return;
+    }
+    rovr_untrack_title_locked();
+    pthread_mutex_unlock(&g_title_lock);
+    if (window_id == 0) return;
+
+    // Resolve outside the lock: AX IPC subject to the messaging timeout.
+    pid_t pid = 0;
+    AXUIElementRef element = rovr_ax_window_for_id(window_id, &pid);
+    if (!element || pid <= 0) {
+        if (element) CFRelease(element);
+        return;
+    }
+    // Ensure the app-level observer exists (idempotent), then subscribe.
+    rovr_observe_app(pid);
+
+    pthread_mutex_lock(&g_title_lock);
+    if (g_title_wid != 0) {
+        // Retargeted concurrently; drop this resolution.
+        pthread_mutex_unlock(&g_title_lock);
+        CFRelease(element);
+        return;
+    }
+    AXObserverRef observer = NULL;
+    pthread_mutex_lock(&g_observers_lock);
+    for (int i = 0; i < g_observed_app_count; ++i) {
+        if (g_observed_apps[i].pid == pid) {
+            observer = g_observed_apps[i].observer;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_observers_lock);
+    if (!observer) {
+        pthread_mutex_unlock(&g_title_lock);
+        CFRelease(element);
+        return;
+    }
+    AXError err = AXObserverAddNotification(observer, element, kAXTitleChangedNotification, (void *)(uintptr_t)window_id);
+    if (err != kAXErrorSuccess && err != kAXErrorNotificationAlreadyRegistered) {
+        pthread_mutex_unlock(&g_title_lock);
+        CFRelease(element);
+        return;
+    }
+    g_title_observer = observer;
+    g_title_element = element; // ownership transferred; released on untrack
+    g_title_wid = window_id;
+    g_title_pid = pid;
+    pthread_mutex_unlock(&g_title_lock);
 }
 
 // Electron/Chromium accessibility enablement: these apps hide their AX tree
@@ -1905,4 +2024,65 @@ int rovr_bridge_space_is_fullscreen(uint64_t space_id) {
 int rovr_bridge_space_is_system(uint64_t space_id) {
     if (!g_sls_space_get_type || !g_sls_main_connection || space_id == 0) return 0;
     return g_sls_space_get_type(g_sls_main_connection(), space_id) == 2 ? 1 : 0;
+}
+
+void rovr_bridge_post_state_changed(const char *state_json) {
+    if (!state_json) return;
+    @autoreleasepool {
+        NSString *json = [NSString stringWithUTF8String:state_json];
+        if (!json) return;
+        [[NSDistributedNotificationCenter defaultCenter]
+            postNotificationName:@"com.rovr.state.changed"
+                          object:nil
+                        userInfo:@{@"state": json}
+              deliverImmediately:YES];
+    }
+}
+
+// ---- Native SketchyBar trigger (low-latency status path) -----------------
+// Client side of SketchyBar's own Mach helper transport (see SketchyBar
+// src/mach.c: bootstrap service "git.felix.sketchybar", message = NUL-
+// joined argv sent as one out-of-line region). Two deliberate deviations
+// from the CLI helper, both safe for a long-lived daemon:
+//   * zero-timeout send (MACH_SEND_TIMEOUT, timeout 0): a wedged bar can
+//     never stall ROVR's state thread; a dropped superseded state is
+//     re-sent on the next change.
+//   * no response awaited (fire-and-forget) and the looked-up send right is
+//     deallocated after the send instead of leaking per call.
+// No business logic here: the message arrives fully encoded from Rust.
+struct rovr_sketchybar_message {
+    mach_msg_header_t header;
+    mach_msg_size_t descriptor_count;
+    mach_msg_ool_descriptor_t descriptor;
+};
+
+int rovr_bridge_sketchybar_trigger(const char *message, uint32_t length) {
+    if (!message || length == 0) return 1;
+
+    mach_port_t bs_port = MACH_PORT_NULL;
+    if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bs_port) != KERN_SUCCESS) {
+        return 1;
+    }
+    mach_port_t port = MACH_PORT_NULL;
+    if (bootstrap_look_up(bs_port, "git.felix.sketchybar", &port) != KERN_SUCCESS || port == MACH_PORT_NULL) {
+        return 1; // SketchyBar not installed / not running: silent no-op upstream.
+    }
+
+    struct rovr_sketchybar_message msg = { 0 };
+    msg.header.msgh_remote_port = port;
+    msg.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND & MACH_MSGH_BITS_REMOTE_MASK,
+                                              0, 0, MACH_MSGH_BITS_COMPLEX);
+    msg.header.msgh_size = sizeof(msg);
+    msg.descriptor_count = 1;
+    msg.descriptor.address = (void *)message;
+    msg.descriptor.size = length;
+    msg.descriptor.copy = MACH_MSG_VIRTUAL_COPY;
+    msg.descriptor.deallocate = false;
+    msg.descriptor.type = MACH_MSG_OOL_DESCRIPTOR;
+
+    kern_return_t kr = mach_msg(&msg.header,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                sizeof(msg), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    mach_port_deallocate(mach_task_self(), port);
+    return kr == KERN_SUCCESS ? 0 : 2;
 }

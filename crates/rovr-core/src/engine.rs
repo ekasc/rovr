@@ -2302,6 +2302,78 @@ mod tests {
     }
 
     #[test]
+    fn reload_config_recomputes_layout_with_new_screen_padding() {
+        let display = DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
+            label: None,
+            focused: true,
+            is_main: true,
+            generation: 0,
+        };
+        let space = SpaceSnapshot {
+            id: SpaceId(11),
+            display_id: DisplayId(1),
+            label: None,
+            focused: true,
+            generation: 0,
+            position: 0,
+            is_fullscreen: false,
+            is_system: false,
+        };
+        let window = WindowSnapshot {
+            id: WindowId(1),
+            pid: ProcessId(1),
+            app: "app".into(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(11)),
+            display_id: Some(DisplayId(1)),
+            focused: true,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen: rovr_types::ObservedBool::No,
+            managed: rovr_types::ObservedBool::Yes,
+            generation: 0,
+        };
+        let snapshot = || PlatformSnapshot {
+            windows: vec![window.clone()],
+            spaces: vec![space.clone()],
+            displays: vec![display.clone()],
+            complete: true,
+        };
+
+        let mut engine = Engine::new(Config::default());
+        engine.apply_event(Event::Snapshot(snapshot()));
+        let before = engine.desired.windows[&WindowId(1)]
+            .frame
+            .expect("managed window must tile");
+        assert_eq!(before.y, 0.0);
+
+        // Live config reload: the next reconcile lays out from the new
+        // usable frame with no restart, through the same apply_event path.
+        let mut reloaded = Config::default();
+        reloaded.layout.padding.top = 100;
+        engine.reload_config(reloaded);
+        engine.apply_event(Event::Snapshot(snapshot()));
+        let after = engine.desired.windows[&WindowId(1)]
+            .frame
+            .expect("managed window must tile");
+        assert_eq!(after.y, 100.0);
+        assert_eq!(after.height, 800.0);
+    }
+
+    #[test]
     fn direction_focus_uses_nearest_candidate() {
         let mut engine = Engine::default();
         engine.apply_event(Event::Snapshot(snapshot(vec![

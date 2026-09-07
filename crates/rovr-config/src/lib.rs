@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fs, path::Path};
 
 use regex::Regex;
-use rovr_types::LayoutKind;
+use rovr_types::{LayoutKind, Rect};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -13,6 +13,8 @@ pub struct Config {
     pub config_version: u32,
     #[serde(default)]
     pub general: GeneralConfig,
+    #[serde(default)]
+    pub layout: LayoutConfig,
     #[serde(default)]
     pub focus: FocusConfig,
     #[serde(default)]
@@ -32,6 +34,7 @@ impl Default for Config {
         Self {
             config_version: CURRENT_CONFIG_VERSION,
             general: GeneralConfig::default(),
+            layout: LayoutConfig::default(),
             focus: FocusConfig::default(),
             animations: AnimationConfig::default(),
             workspaces: Vec::new(),
@@ -69,6 +72,67 @@ impl Default for GeneralConfig {
             reconcile_interval_ms: 1000,
             plugin: None,
         }
+    }
+}
+
+/// Layout-area configuration (`[layout]` table).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct LayoutConfig {
+    /// Four-sided screen padding (`[layout.padding]`). Reserved along each
+    /// display edge BEFORE tiling is calculated — for status bars, docks,
+    /// widgets, or custom spacing. Distinct from `general.gap` (spacing
+    /// between tiled windows) and `general.padding` (uniform inner inset,
+    /// kept for back-compat). Applies independently to every display.
+    #[serde(default)]
+    pub padding: ScreenPadding,
+}
+
+/// Four-sided screen padding in pixels. All sides default to zero, which
+/// preserves existing behavior exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScreenPadding {
+    #[serde(default)]
+    pub top: i32,
+    #[serde(default)]
+    pub right: i32,
+    #[serde(default)]
+    pub bottom: i32,
+    #[serde(default)]
+    pub left: i32,
+}
+
+impl ScreenPadding {
+    /// True when every side is zero — the usable frame is the display frame.
+    pub fn is_zero(self) -> bool {
+        self.top == 0 && self.right == 0 && self.bottom == 0 && self.left == 0
+    }
+
+    /// Usable display frame after reserving each edge. `None` when the
+    /// padding consumes the frame (`left + right >= width` or
+    /// `top + bottom >= height`): callers must skip tiling rather than emit
+    /// degenerate frames. All math runs in f64 so i32 sides cannot
+    /// overflow/underflow.
+    ///
+    /// ROVR coordinates (same convention as the bridge's
+    /// `rovr_display_constrained_bounds`, which reserves the menu bar with
+    /// `y += h` and a bottom dock with `height -= h`): the top edge is the
+    /// `y` side, the bottom edge is the `y + height` side.
+    pub fn apply_to(self, frame: Rect) -> Option<Rect> {
+        let left = self.left as f64;
+        let right = self.right as f64;
+        let top = self.top as f64;
+        let bottom = self.bottom as f64;
+        let width = frame.width - left - right;
+        let height = frame.height - top - bottom;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some(Rect {
+            x: frame.x + left,
+            y: frame.y + top,
+            width,
+            height,
+        })
     }
 }
 
@@ -188,6 +252,8 @@ pub enum ConfigError {
     NegativeGap,
     #[error("padding must be non-negative")]
     NegativePadding,
+    #[error("layout.padding values must be non-negative")]
+    NegativeScreenPadding,
     #[error("workspace name cannot be empty")]
     EmptyWorkspaceName,
     #[error("duplicate workspace name: {0}")]
@@ -242,6 +308,10 @@ impl Config {
         }
         if self.general.padding < 0 {
             return Err(ConfigError::NegativePadding);
+        }
+        let screen = &self.layout.padding;
+        if screen.top < 0 || screen.right < 0 || screen.bottom < 0 || screen.left < 0 {
+            return Err(ConfigError::NegativeScreenPadding);
         }
 
         let mut names = HashSet::new();
@@ -634,5 +704,186 @@ mod tests {
         };
         assert!(title.is_match("Settings"));
         assert_eq!(rules[1].target_workspace.as_deref(), Some("main"));
+    }
+
+    // ---- Screen padding ([layout.padding]) ----
+
+    #[test]
+    fn screen_padding_defaults_to_zero() {
+        let config = Config::parse("").expect("empty config parses");
+        assert!(config.layout.padding.is_zero());
+        assert_eq!(config.layout.padding, ScreenPadding::default());
+        assert_eq!(Config::default().layout.padding, ScreenPadding::default());
+    }
+
+    #[test]
+    fn parses_four_sided_screen_padding() {
+        let config = Config::parse(
+            r#"
+            [layout.padding]
+            top = 28
+            right = 0
+            bottom = 0
+            left = 0
+            "#,
+        )
+        .expect("four-sided padding parses");
+        assert_eq!(config.layout.padding.top, 28);
+        assert_eq!(config.layout.padding.right, 0);
+        assert_eq!(config.layout.padding.bottom, 0);
+        assert_eq!(config.layout.padding.left, 0);
+    }
+
+    #[test]
+    fn partial_padding_table_defaults_missing_sides_to_zero() {
+        let config = Config::parse(
+            r#"
+            [layout.padding]
+            top = 28
+            "#,
+        )
+        .expect("partial padding parses");
+        assert_eq!(config.layout.padding.top, 28);
+        assert_eq!(config.layout.padding.right, 0);
+        assert_eq!(config.layout.padding.bottom, 0);
+        assert_eq!(config.layout.padding.left, 0);
+    }
+
+    #[test]
+    fn rejects_negative_screen_padding_on_any_side() {
+        for side in ["top", "right", "bottom", "left"] {
+            let err = Config::parse(&format!("[layout.padding]\n{side} = -1")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::NegativeScreenPadding),
+                "{side} = -1 must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn screen_padding_serialization_round_trip() {
+        let mut config = Config::default();
+        config.layout.padding.top = 28;
+        let dumped = toml::to_string_pretty(&config).expect("default config serializes");
+        assert!(
+            dumped.contains("[layout.padding]"),
+            "full dump must include the padding table:\n{dumped}"
+        );
+        let back = Config::parse(&dumped).expect("dump re-parses");
+        assert_eq!(back.layout.padding.top, 28);
+        assert_eq!(back.layout.padding, config.layout.padding);
+    }
+
+    fn frame(x: f64, y: f64, w: f64, h: f64) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn zero_padding_returns_frame_unchanged() {
+        let frame = frame(1440.0, 0.0, 1440.0, 900.0);
+        assert_eq!(ScreenPadding::default().apply_to(frame), Some(frame));
+    }
+
+    #[test]
+    fn top_padding_moves_y_down_not_up() {
+        // ROVR coordinates: the top edge is the `y` side (same convention as
+        // the bridge reserving the menu bar with `y += h`).
+        let padding = ScreenPadding {
+            top: 28,
+            ..Default::default()
+        };
+        assert_eq!(
+            padding.apply_to(frame(0.0, 0.0, 1000.0, 800.0)),
+            Some(frame(0.0, 28.0, 1000.0, 772.0))
+        );
+    }
+
+    #[test]
+    fn each_side_reserves_only_its_own_edge() {
+        let base = frame(0.0, 0.0, 1000.0, 800.0);
+        let left = ScreenPadding {
+            left: 5,
+            ..Default::default()
+        };
+        assert_eq!(left.apply_to(base), Some(frame(5.0, 0.0, 995.0, 800.0)));
+        let right = ScreenPadding {
+            right: 7,
+            ..Default::default()
+        };
+        assert_eq!(right.apply_to(base), Some(frame(0.0, 0.0, 993.0, 800.0)));
+        let bottom = ScreenPadding {
+            bottom: 10,
+            ..Default::default()
+        };
+        assert_eq!(bottom.apply_to(base), Some(frame(0.0, 0.0, 1000.0, 790.0)));
+    }
+
+    #[test]
+    fn asymmetric_padding_on_offset_display() {
+        let padding = ScreenPadding {
+            top: 1,
+            right: 2,
+            bottom: 3,
+            left: 4,
+        };
+        assert_eq!(
+            padding.apply_to(frame(100.0, 200.0, 1000.0, 800.0)),
+            Some(frame(104.0, 201.0, 994.0, 796.0))
+        );
+    }
+
+    #[test]
+    fn padding_consuming_the_frame_yields_none() {
+        let base = frame(0.0, 0.0, 1000.0, 800.0);
+        // Exactly consuming an axis is degenerate: no tilable area remains.
+        for padding in [
+            ScreenPadding {
+                left: 500,
+                right: 500,
+                ..Default::default()
+            },
+            ScreenPadding {
+                left: 600,
+                right: 500,
+                ..Default::default()
+            },
+            ScreenPadding {
+                top: 400,
+                bottom: 400,
+                ..Default::default()
+            },
+            ScreenPadding {
+                top: 500,
+                bottom: 400,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(padding.apply_to(base), None);
+        }
+        // One pixel to spare still tiles.
+        let tight = ScreenPadding {
+            left: 500,
+            right: 499,
+            ..Default::default()
+        };
+        assert_eq!(tight.apply_to(base), Some(frame(500.0, 0.0, 1.0, 800.0)));
+    }
+
+    #[test]
+    fn extreme_padding_cannot_overflow() {
+        // i32::MAX sides must safely degrade to None, never panic in debug
+        // (plain i32 addition would overflow).
+        let padding = ScreenPadding {
+            top: i32::MAX,
+            right: i32::MAX,
+            bottom: i32::MAX,
+            left: i32::MAX,
+        };
+        assert_eq!(padding.apply_to(frame(0.0, 0.0, 1440.0, 900.0)), None);
     }
 }

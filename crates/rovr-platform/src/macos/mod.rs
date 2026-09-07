@@ -181,6 +181,9 @@ extern "C" {
     fn rovr_bridge_is_display_animating(display_id: u32) -> i32;
     fn rovr_bridge_sls_managed_for_window(window_id: u32) -> i32;
     fn rovr_bridge_dock_pid() -> i32;
+    fn rovr_bridge_post_state_changed(state_json: *const c_char);
+    fn rovr_bridge_track_focused_window(window_id: u32);
+    fn rovr_bridge_sketchybar_trigger(message: *const c_char, length: u32) -> std::ffi::c_int;
 }
 
 #[derive(Clone, Copy)]
@@ -1091,6 +1094,28 @@ impl Platform for MacPlatform {
 
     fn set_event_watcher(&mut self, event_kind_watcher: std::sync::Arc<dyn Fn(u32) + Send + Sync>) {
         MacPlatform::set_event_watcher(self, event_kind_watcher);
+    }
+
+    fn publish_public_state(&self, state_json: &str) {
+        if let Ok(c) = std::ffi::CString::new(state_json) {
+            unsafe { rovr_bridge_post_state_changed(c.as_ptr()) };
+        }
+    }
+
+    fn track_focused_window(&self, window_id: u32) {
+        unsafe { rovr_bridge_track_focused_window(window_id) };
+    }
+
+    fn sketchybar_trigger(&self, message: &[u8]) -> bool {
+        if message.is_empty() || message.len() > u32::MAX as usize {
+            return false;
+        }
+        unsafe {
+            rovr_bridge_sketchybar_trigger(
+                message.as_ptr().cast::<std::ffi::c_char>(),
+                message.len() as u32,
+            ) == 0
+        }
     }
 }
 
