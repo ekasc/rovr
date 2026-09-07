@@ -17,3 +17,6 @@
 
 # Logs
 *.log
+
+# Local agent runtime state (per-machine, never commit)
+.pi/

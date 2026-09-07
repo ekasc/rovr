@@ -7,6 +7,17 @@ padding = 8
 reconcile_on_wake = true
 reconcile_interval_ms = 1000
 
+# Screen padding: reserves space along the edges of each display before ROVR
+# calculates tiled window layouts. Useful for status bars such as SketchyBar
+# or for custom desktop spacing. This is distinct from `gap` (spacing between
+# tiled windows) and from `general.padding` (uniform inner inset). Applies
+# independently to every display. All values are pixels, all default to 0.
+[layout.padding]
+top = 28
+right = 0
+bottom = 0
+left = 0
+
 [focus]
 follows_mouse = false
 

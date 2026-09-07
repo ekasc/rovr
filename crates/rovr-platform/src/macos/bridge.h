@@ -91,3 +91,22 @@ int32_t rovr_bridge_dock_pid(void);
 // the callback is invoked on the main thread for created/focused events).
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
 void rovr_bridge_install_event_handlers(rovr_ax_event_trampoline_fn callback);
+
+// Public status interface: post the canonical JSON snapshot to
+// NSDistributedNotificationCenter as `com.rovr.state.changed` with the JSON
+// in userInfo["state"]. Event-driven only; the Rust side dedups identical
+// snapshots before calling. Never spawns processes or touches SketchyBar.
+void rovr_bridge_post_state_changed(const char *state_json);
+
+// Focused-window title tracking: subscribe kAXTitleChangedNotification on
+// the given window's AX element (0 = none: remove the subscription). At most
+// one such subscription exists; retargeting removes the previous one first.
+// A title change only fires the normal event trampoline (kind 16) — state is
+// re-observed and published through the usual path, never from the callback.
+void rovr_bridge_track_focused_window(uint32_t window_id);
+
+// Native SketchyBar trigger: send a pre-encoded `--trigger` message (NUL-
+// joined argv + trailing NUL, exactly SketchyBar CLI wire format) to the
+// running bar over Mach. Returns 0 on send, nonzero when SketchyBar is
+// absent or the send fails. Fire-and-forget, non-blocking, no response.
+int rovr_bridge_sketchybar_trigger(const char *message, uint32_t length);

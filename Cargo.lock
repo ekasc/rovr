@@ -706,6 +706,7 @@ dependencies = [
  "cc",
  "rovr-core",
  "rovr-types",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
