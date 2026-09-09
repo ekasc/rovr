@@ -90,6 +90,38 @@ pub trait Platform: Send {
     fn needs_refresh(&self) -> bool {
         false
     }
+    /// Publish the canonical public snapshot to external consumers.
+    ///
+    /// On macOS this posts `com.rovr.state.changed` to
+    /// `NSDistributedNotificationCenter` with the full JSON snapshot in
+    /// `userInfo["state"]`. The default is a no-op (non-macOS builds, tests).
+    /// The daemon calls this only when the snapshot differs from the last
+    /// published one — duplicate identical snapshots are suppressed there,
+    /// not here. Must never spawn shell processes or touch SketchyBar.
+    fn publish_public_state(&self, _state_json: &str) {}
+    /// Retarget the focused-window title-change subscription.
+    ///
+    /// On macOS this subscribes `kAXTitleChangedNotification` on the given
+    /// window (`0` = none focused: remove the subscription) so title edits on
+    /// the focused window wake the state loop without waiting for the
+    /// periodic recovery tick. At most one such subscription exists; the
+    /// bridge removes the previous window's registration first and ignores
+    /// failures (recovery observation still catches the title). The default
+    /// is a no-op. Never publishes or serializes state — the callback only
+    /// requests a normal re-observation.
+    fn track_focused_window(&self, _window_id: u32) {}
+    /// Fire a pre-encoded SketchyBar `--trigger` message at the running bar.
+    ///
+    /// On macOS this sends `message` (NUL-joined argv + trailing NUL, exactly
+    /// SketchyBar CLI wire format) to the bar's Mach bootstrap port
+    /// (`git.felix.sketchybar`). Fire-and-forget with a zero-timeout send:
+    /// returns `true` on send, `false` when SketchyBar is absent or the send
+    /// fails — never blocks, retries, spawns, or crashes. The default
+    /// reports absent. Callers send only on deduped state changes, so each
+    /// send is already the latest state (no queue, no backlog possible).
+    fn sketchybar_trigger(&self, _message: &[u8]) -> bool {
+        false
+    }
     /// Milliseconds the observation worker has been wedged, if it has.
     /// Diagnostics-only; lets `doctor` expose a hung AX/SkyLight worker
     /// instead of hiding it behind generic timeouts.

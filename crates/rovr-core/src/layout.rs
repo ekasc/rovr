@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rovr_config::{CompiledRule, Config, ScratchpadConfig, Selector};
+use rovr_config::{CompiledRule, Config, ScratchpadConfig, ScreenPadding, Selector};
 use rovr_layout::{compute, LayoutRequest};
 use rovr_types::{DisplayId, LayoutKind, Rect, SpaceId, WindowId, WindowSnapshot};
 
@@ -178,6 +178,14 @@ pub fn apply_layout(
     } else {
         config.general.padding as f64
     };
+    // Screen padding narrows each display frame to the usable layout area
+    // BEFORE gaps/subdivision run. The session toggle collapses it like all
+    // other insets.
+    let screen_padding = if insets_off {
+        ScreenPadding::default()
+    } else {
+        config.layout.padding
+    };
 
     desired
         .windows
@@ -244,9 +252,20 @@ pub fn apply_layout(
             }
             continue;
         };
+        // The one place display geometry becomes layout area: reserve the
+        // configured screen edges first. Every path below (plugin, BSP,
+        // stateless) consumes this usable frame, so per-algorithm handling
+        // is unnecessary. A fully consumed display leaves windows alone —
+        // no tiling target is written, like fullscreen/system spaces above.
+        let Some(usable) = screen_padding.apply_to(display.frame) else {
+            if let Some(t) = desired.windows.get_mut(&w.id) {
+                t.frame = None;
+            }
+            continue;
+        };
         by_space
             .entry(space.id)
-            .or_insert((space.display_id, display.frame, Vec::new()))
+            .or_insert((space.display_id, usable, Vec::new()))
             .2
             .push(w.id);
     }
@@ -357,7 +376,7 @@ pub fn apply_layout(
 mod tests {
     use super::*;
     use crate::layout_state::Layouts;
-    use rovr_config::{Config, RuleConfig, WorkspaceConfig};
+    use rovr_config::{Config, RuleConfig, ScreenPadding, WorkspaceConfig};
     use rovr_types::{
         DisplayId, DisplaySnapshot, LayoutKind, ProcessId, Rect, SpaceId, SpaceSnapshot, WindowId,
         WindowSnapshot,
@@ -1619,6 +1638,321 @@ mod tests {
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
             None,
             "window matching a closed pad first + open pad later must float"
+        );
+    }
+
+    // ---- Screen padding ([layout.padding]) ----
+
+    fn padded_display(id: u32, x: f64, width: f64, height: f64) -> DisplaySnapshot {
+        DisplaySnapshot {
+            id: DisplayId(id),
+            frame: Rect {
+                x,
+                y: 0.0,
+                width,
+                height,
+            },
+            label: None,
+            focused: false,
+            is_main: id == 1,
+            generation: 0,
+        }
+    }
+
+    fn padded_space(id: u64, display: u32, position: u32) -> SpaceSnapshot {
+        SpaceSnapshot {
+            id: SpaceId(id),
+            display_id: DisplayId(display),
+            label: None,
+            focused: false,
+            generation: 0,
+            position,
+            is_fullscreen: false,
+            is_system: false,
+        }
+    }
+
+    fn padded_window(
+        id: u32,
+        space: u64,
+        display: u32,
+        managed: rovr_types::ObservedBool,
+        fullscreen: rovr_types::ObservedBool,
+    ) -> WindowSnapshot {
+        WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1),
+            app: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            space_id: Some(SpaceId(space)),
+            display_id: Some(DisplayId(display)),
+            focused: false,
+            minimized: rovr_types::ObservedBool::No,
+            fullscreen,
+            managed,
+            generation: 0,
+        }
+    }
+
+    fn tileable(id: u32, space: u64, display: u32) -> WindowSnapshot {
+        padded_window(
+            id,
+            space,
+            display,
+            rovr_types::ObservedBool::Yes,
+            rovr_types::ObservedBool::No,
+        )
+    }
+
+    fn run_layout(config: &Config, observed: &ObservedState, insets_off: bool) -> DesiredState {
+        let mut desired = DesiredState::default();
+        apply_layout(
+            config,
+            observed,
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &[],
+            insets_off,
+            &std::collections::HashSet::new(),
+        );
+        desired
+    }
+
+    fn observed_single_display(
+        width: f64,
+        height: f64,
+        windows: Vec<WindowSnapshot>,
+    ) -> ObservedState {
+        let mut observed = ObservedState::default();
+        observed
+            .displays
+            .insert(DisplayId(1), padded_display(1, 0.0, width, height));
+        observed.spaces.insert(SpaceId(11), padded_space(11, 1, 0));
+        for w in windows {
+            observed.windows.insert(w.id, w);
+        }
+        observed
+    }
+
+    /// Zero screen padding is the identity: behavior matches no padding.
+    #[test]
+    fn screen_padding_zero_leaves_frame_unchanged() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        assert!(config.layout.padding.is_zero());
+        let observed = observed_single_display(1440.0, 900.0, vec![tileable(1, 11, 1)]);
+        let desired = run_layout(&config, &observed, false);
+        assert_eq!(
+            desired.windows[&WindowId(1)].frame,
+            Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            "zero screen padding must return the display frame unchanged"
+        );
+    }
+
+    /// Screen padding narrows the area BEFORE gaps/subdivision: the outer
+    /// bbox equals the usable frame exactly (shrinking each window after
+    /// layout would instead inset the outer edges twice and widen gaps).
+    #[test]
+    fn screen_padding_top_applies_before_gaps() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Bsp;
+        config.general.gap = 8;
+        config.layout.padding.top = 28;
+        let observed = observed_single_display(
+            1440.0,
+            900.0,
+            vec![tileable(1, 11, 1), tileable(2, 11, 1), tileable(3, 11, 1)],
+        );
+        let desired = run_layout(&config, &observed, false);
+        let frames: Vec<Rect> = [WindowId(1), WindowId(2), WindowId(3)]
+            .iter()
+            .map(|id| desired.windows[id].frame.unwrap())
+            .collect();
+        let min_x = frames.iter().map(|f| f.x).fold(f64::INFINITY, f64::min);
+        let max_x = frames
+            .iter()
+            .map(|f| f.x + f.width)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = frames.iter().map(|f| f.y).fold(f64::INFINITY, f64::min);
+        let max_y = frames
+            .iter()
+            .map(|f| f.y + f.height)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let eps = 1e-9;
+        assert!((min_x - 0.0).abs() <= eps, "min_x={min_x} expected 0");
+        assert!((max_x - 1440.0).abs() <= eps, "max_x={max_x} expected 1440");
+        assert!((min_y - 28.0).abs() <= eps, "min_y={min_y} expected 28");
+        assert!((max_y - 900.0).abs() <= eps, "max_y={max_y} expected 900");
+    }
+
+    /// All four asymmetric sides compose into one usable frame.
+    #[test]
+    fn screen_padding_all_sides_stack_exact() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        config.layout.padding = ScreenPadding {
+            top: 30,
+            right: 20,
+            bottom: 40,
+            left: 10,
+        };
+        let observed =
+            observed_single_display(1000.0, 800.0, vec![tileable(1, 11, 1), tileable(2, 11, 1)]);
+        let desired = run_layout(&config, &observed, false);
+        let expected = Rect {
+            x: 10.0,
+            y: 30.0,
+            width: 970.0,
+            height: 730.0,
+        };
+        for id in [WindowId(1), WindowId(2)] {
+            assert_eq!(
+                desired.windows[&id].frame,
+                Some(expected),
+                "stack overlay must fill the usable frame exactly"
+            );
+        }
+    }
+
+    /// Global padding applies independently to every display, honoring each
+    /// display's origin.
+    #[test]
+    fn screen_padding_applies_to_every_display() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        config.layout.padding.left = 10;
+        let mut observed = ObservedState::default();
+        observed
+            .displays
+            .insert(DisplayId(1), padded_display(1, 0.0, 1440.0, 900.0));
+        observed
+            .displays
+            .insert(DisplayId(2), padded_display(2, 1440.0, 1440.0, 900.0));
+        observed.spaces.insert(SpaceId(11), padded_space(11, 1, 0));
+        observed.spaces.insert(SpaceId(12), padded_space(12, 2, 0));
+        observed.windows.insert(WindowId(1), tileable(1, 11, 1));
+        observed.windows.insert(WindowId(2), tileable(2, 12, 2));
+        let desired = run_layout(&config, &observed, false);
+        assert_eq!(
+            desired.windows[&WindowId(1)].frame.unwrap().x,
+            10.0,
+            "first display reserves its left edge"
+        );
+        assert_eq!(
+            desired.windows[&WindowId(2)].frame.unwrap().x,
+            1450.0,
+            "second display reserves its own left edge from its own origin"
+        );
+        assert_eq!(desired.windows[&WindowId(2)].frame.unwrap().width, 1430.0);
+    }
+
+    /// Padding that consumes a display writes no tiling target (windows stay
+    /// put) and never panics; a healthy display is unaffected.
+    #[test]
+    fn screen_padding_consuming_display_writes_no_frame() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        config.layout.padding.left = 600;
+        config.layout.padding.right = 500;
+        let mut observed = ObservedState::default();
+        observed
+            .displays
+            .insert(DisplayId(1), padded_display(1, 0.0, 1000.0, 800.0));
+        observed
+            .displays
+            .insert(DisplayId(2), padded_display(2, 1000.0, 2000.0, 800.0));
+        observed.spaces.insert(SpaceId(11), padded_space(11, 1, 0));
+        observed.spaces.insert(SpaceId(12), padded_space(12, 2, 0));
+        observed.windows.insert(WindowId(1), tileable(1, 11, 1));
+        observed.windows.insert(WindowId(2), tileable(2, 12, 2));
+        let desired = run_layout(&config, &observed, false);
+        assert_eq!(
+            desired.windows[&WindowId(1)].frame,
+            None,
+            "consumed display must not produce a frame"
+        );
+        assert!(
+            desired.windows[&WindowId(2)].frame.is_some(),
+            "healthy display must still tile"
+        );
+    }
+
+    /// Only normal tiling consumes the usable frame: floating and fullscreen
+    /// windows are left alone even with padding configured.
+    #[test]
+    fn screen_padding_skips_floating_and_fullscreen() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        config.layout.padding.top = 28;
+        let mut observed = observed_single_display(1440.0, 900.0, vec![]);
+        observed.windows.insert(WindowId(1), tileable(1, 11, 1));
+        observed.windows.insert(
+            WindowId(7),
+            padded_window(
+                7,
+                11,
+                1,
+                rovr_types::ObservedBool::No,
+                rovr_types::ObservedBool::No,
+            ),
+        );
+        observed.windows.insert(
+            WindowId(9),
+            padded_window(
+                9,
+                11,
+                1,
+                rovr_types::ObservedBool::Yes,
+                rovr_types::ObservedBool::Yes,
+            ),
+        );
+        let desired = run_layout(&config, &observed, false);
+        let tiled = desired.windows[&WindowId(1)].frame.unwrap();
+        assert_eq!(tiled.y, 28.0, "managed window tiles inside the padding");
+        assert_eq!(
+            desired.windows[&WindowId(7)].frame,
+            None,
+            "floating window must not be tiled"
+        );
+        assert_eq!(
+            desired.windows[&WindowId(9)].frame,
+            None,
+            "fullscreen window must not be tiled"
+        );
+    }
+
+    /// The session insets toggle collapses screen padding like other insets.
+    #[test]
+    fn insets_off_collapses_screen_padding() {
+        let mut config = Config::default();
+        config.general.layout = LayoutKind::Stack;
+        config.layout.padding.top = 28;
+        let observed = observed_single_display(1440.0, 900.0, vec![tileable(1, 11, 1)]);
+        let desired = run_layout(&config, &observed, true);
+        assert_eq!(
+            desired.windows[&WindowId(1)].frame,
+            Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            "toggle-insets must restore the full display frame"
         );
     }
 }

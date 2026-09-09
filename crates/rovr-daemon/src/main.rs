@@ -26,9 +26,10 @@ use rovr_protocol::{
     Command, ConfigCommand, DebugCommand, LayoutCommand, Notification, QueryCommand, Request,
     Response, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand, PROTOCOL_VERSION,
 };
-use rovr_types::{Capabilities, DisplayId, SpaceId, WindowId};
+use rovr_types::{Capabilities, DisplayId, PublicState, SpaceId, WindowId};
 
 mod hotkey;
+mod sketchybar;
 use serde_json::json;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -37,13 +38,17 @@ use tracing_subscriber::EnvFilter;
 const SUBSCRIBER_BACKLOG: usize = 64;
 const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const WINDOW_CREATED_EVENT_KIND: u32 = 1;
+const WINDOW_FOCUSED_EVENT_KIND: u32 = 2;
 const WINDOW_DESTROYED_EVENT_KIND: u32 = 4;
 const DRAG_ENDED_EVENT_KIND: u32 = 8;
+const WINDOW_TITLE_CHANGED_EVENT_KIND: u32 = 16;
 
 fn event_requests_immediate_refresh(event_kind: u32) -> bool {
     event_kind == WINDOW_CREATED_EVENT_KIND
+        || event_kind == WINDOW_FOCUSED_EVENT_KIND
         || event_kind == WINDOW_DESTROYED_EVENT_KIND
         || event_kind == DRAG_ENDED_EVENT_KIND
+        || event_kind == WINDOW_TITLE_CHANGED_EVENT_KIND
 }
 
 #[derive(Default)]
@@ -104,6 +109,10 @@ struct Daemon {
     /// tick so the degraded/restored transitions notify exactly once —
     /// ticks while the state is stable stay silent.
     ax_control_available: bool,
+    /// Last externally published public snapshot. Compared on every state
+    /// transition so `com.rovr.state.changed` carries the full current state
+    /// exactly when it changes — identical snapshots are suppressed.
+    last_published_state: Option<PublicState>,
 }
 
 /// Accessibility-backed window control (tiling corrections, window focus,
@@ -191,6 +200,7 @@ fn main() -> Result<()> {
         // Optimistic until the first observation tick reports otherwise; a
         // degraded first tick notifies once via the transition below.
         ax_control_available: true,
+        last_published_state: None,
     };
     match daemon.platform.snapshot() {
         Ok(snapshot) => {
@@ -425,6 +435,13 @@ fn state_loop_with_interval(
     if daemon.refresh_observation() {
         deliver_notification(&subscribers, &Notification::StateChanged);
     }
+    // Publish the first external snapshot for consumers that are already
+    // subscribed when ROVR starts. (Late consumers initialize through
+    // `rovr query --current`, not through this.)
+    daemon.maybe_publish_public_state();
+    // Subscribe title changes on the focused window so its edits wake the
+    // loop promptly instead of waiting for the recovery tick.
+    daemon.sync_title_tracking();
     tracing::debug!(
         warmup_ms = t_warm.elapsed().as_millis() as u64,
         "startup observation warm-up complete"
@@ -444,6 +461,12 @@ fn state_loop_with_interval(
             if daemon.refresh_observation() {
                 deliver_notification(&subscribers, &Notification::StateChanged);
             }
+            // Independent of the IPC hint above: title-only changes produce
+            // no reconcile actions, yet the public snapshot DID change and
+            // must still publish. Dedup suppresses identical snapshots.
+            daemon.maybe_publish_public_state();
+            // Focus may have moved; retarget the title subscription.
+            daemon.sync_title_tracking();
             let obs_ms = t_obs.elapsed().as_millis() as u64;
             if obs_ms > 100 {
                 tracing::info!(obs_ms, "slow periodic observation");
@@ -478,6 +501,15 @@ fn state_loop_with_interval(
         };
         let t_handle = std::time::Instant::now();
         let result = daemon.handle(envelope.request);
+        // The published snapshot must equal current state at publish time.
+        // Several internal events may land during one transition (observation
+        // + verify + reconcile); dedup keeps only the net externally visible
+        // change. Runs after EVERY request so focus/space/title transitions
+        // driven by commands publish without extra polling.
+        daemon.maybe_publish_public_state();
+        // Keep the title subscription on the focused window, whatever the
+        // request just did.
+        daemon.sync_title_tracking();
         if observes_internally {
             next_observation = std::time::Instant::now() + interval;
         }
@@ -724,14 +756,10 @@ impl Daemon {
                     HandleResult::ok(id, focused)
                 }
                 QueryCommand::Current => {
-                    let id_val = self
-                        .engine
-                        .observed
-                        .windows
-                        .values()
-                        .find(|w| w.focused)
-                        .map(|w| w.id.0);
-                    HandleResult::ok(id, json!({ "id": id_val }))
+                    // Canonical snapshot shared with the distributed
+                    // notification publisher — one builder, no parallel
+                    // implementation. `window` is null when unfocused.
+                    HandleResult::ok(id, self.current_public_state())
                 }
             },
             Command::Window(command) => {
@@ -1423,6 +1451,63 @@ impl Daemon {
         space.or_else(|| self.current_space())
     }
 
+    /// Canonical public snapshot: the same builder behind `query current`
+    /// and `com.rovr.state.changed`. Space/display come from the daemon's
+    /// active-display/current-space tracking; focus details come from the
+    /// engine's deterministic focus resolution. No duplicate state.
+    fn current_public_state(&self) -> PublicState {
+        let space = self.current_space();
+        let display = self.active_display();
+        self.engine.public_state(space, display)
+    }
+
+    /// Publish via the platform layer iff the snapshot differs from the last
+    /// published one. Returns the new state when published, `None` when
+    /// suppressed as a duplicate. Serialization happens once here so CLI and
+    /// notification payloads can never drift.
+    ///
+    /// The native SketchyBar trigger fires on the same deduped seam, first
+    /// for latency: same `PublicState`, no subprocess, no shell. A failed or
+    /// absent bar never affects the generic publication below it.
+    fn maybe_publish_public_state(&mut self) -> Option<PublicState> {
+        let current = self.current_public_state();
+        if self.last_published_state.as_ref() == Some(&current) {
+            return None;
+        }
+        match serde_json::to_string(&current) {
+            Ok(json) => {
+                let t_sb = std::time::Instant::now();
+                let sketchybar_sent =
+                    self.platform
+                        .sketchybar_trigger(&sketchybar::encode_mach_message(
+                            &sketchybar::trigger_args(&current),
+                        ));
+                tracing::debug!(
+                    elapsed_us = t_sb.elapsed().as_micros() as u64,
+                    sketchybar_sent,
+                    "native sketchybar trigger"
+                );
+                self.platform.publish_public_state(&json);
+                self.last_published_state = Some(current.clone());
+                Some(current)
+            }
+            Err(err) => {
+                warn!(%err, "failed to serialize public state for publication");
+                None
+            }
+        }
+    }
+
+    /// Retarget the platform's focused-window title subscription to the
+    /// currently focused window (`0` when unfocused, which untracks).
+    /// Runs after every observation so a title edit on the focused window
+    /// wakes the state loop promptly; failures are silent by contract and
+    /// the periodic observation remains the fallback. Never publishes.
+    fn sync_title_tracking(&self) {
+        let window = self.engine.focused_window().map(|id| id.0).unwrap_or(0);
+        self.platform.track_focused_window(window);
+    }
+
     /// Actions to focus the previous space, if one is known and still exists.
     /// Also returns the space being focused so the caller can record the
     /// switch immediately (two-way toggle without waiting for observation).
@@ -1721,13 +1806,25 @@ mod tests {
     }
 
     #[test]
-    fn only_window_creation_requests_an_immediate_refresh() {
+    fn focus_and_lifecycle_events_request_an_immediate_refresh() {
+        // Creation, focus, destruction, drag-end and focused-window title
+        // changes all change the externally visible snapshot (space / window
+        // / title / display), so they wake the state loop for one coalesced
+        // observation that publishes `com.rovr.state.changed`. Focus (kind 2)
+        // is included deliberately: without it a mouse-driven focus change
+        // would wait for the 5 s recovery watchdog before the status bar
+        // updated. Title (kind 16) is the focused window's AX title
+        // notification: without it a title edit would likewise wait.
         assert!(event_requests_immediate_refresh(WINDOW_CREATED_EVENT_KIND));
+        assert!(event_requests_immediate_refresh(WINDOW_FOCUSED_EVENT_KIND));
         assert!(event_requests_immediate_refresh(
             WINDOW_DESTROYED_EVENT_KIND
         ));
         assert!(event_requests_immediate_refresh(DRAG_ENDED_EVENT_KIND));
-        assert!(!event_requests_immediate_refresh(2));
+        assert!(event_requests_immediate_refresh(
+            WINDOW_TITLE_CHANGED_EVENT_KIND
+        ));
+        assert!(!event_requests_immediate_refresh(99));
     }
 
     /// M4b: a slow or disconnected subscriber is evicted and never blocks the
@@ -1842,6 +1939,7 @@ mod tests {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
             ax_control_available: true,
+            last_published_state: None,
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -2414,11 +2512,16 @@ mod tests {
             },
             executed: vec![],
             diagnostics: vec![],
+            published: Default::default(),
+            tracked: Default::default(),
+            sketchybar_sent: Default::default(),
+            sketchybar_ok: std::sync::Mutex::new(true),
         };
         let mut daemon = Daemon {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
             ax_control_available: true,
+            last_published_state: None,
             engine: Engine::new(Config::default()),
             platform: Box::new(platform),
             config: Config::default(),
@@ -2562,6 +2665,10 @@ mod tests {
             },
             executed: vec![],
             diagnostics: vec![],
+            published: Default::default(),
+            tracked: Default::default(),
+            sketchybar_sent: Default::default(),
+            sketchybar_ok: std::sync::Mutex::new(true),
         });
         daemon.refresh_observation();
         daemon.note_space_switched_to(SpaceId(12));
@@ -2629,6 +2736,7 @@ mod creation_failure_tests {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
             ax_control_available: true,
+            last_published_state: None,
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -2822,6 +2930,7 @@ mod reload_recovery_tests {
             space_history: std::cell::RefCell::new(HashMap::new()),
             refresh_wake: Arc::new(RefreshWake::default()),
             ax_control_available: true,
+            last_published_state: None,
             engine: Engine::new(Config::default()),
             platform: Box::new(MockPlatform::default()),
             config: Config::default(),
@@ -3043,5 +3152,419 @@ mod reload_recovery_tests {
             1,
             "post-grant reload must emit the correction with no Space switch"
         );
+    }
+}
+
+#[cfg(test)]
+mod public_state_tests {
+    use super::*;
+    use rovr_platform::{MockPlatform, PlatformError};
+    use rovr_types::{
+        DisplayId, DisplaySnapshot, ObservedBool, PlatformSnapshot, ProcessId, Rect, SpaceId,
+        SpaceSnapshot, WindowId, WindowSnapshot,
+    };
+
+    /// Platform that records title-tracking retargets and SketchyBar sends
+    /// via shared handles so tests can assert both follow focus without
+    /// macOS APIs.
+    struct TrackingPlatform {
+        snapshot: PlatformSnapshot,
+        tracked: Arc<Mutex<Vec<u32>>>,
+        sketchybar_sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        sketchybar_ok: Arc<Mutex<bool>>,
+        published: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TrackingPlatform {
+        fn sent_vars(sent: &[Vec<u8>]) -> Vec<Vec<String>> {
+            sent.iter()
+                .map(|message| {
+                    message
+                        .split(|b| *b == 0)
+                        .filter(|part| !part.is_empty())
+                        .map(|part| String::from_utf8(part.to_vec()).unwrap())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    impl Platform for TrackingPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                observe_windows: true,
+                set_window_frame: true,
+                focus_window: true,
+                move_window_to_space: true,
+                create_space: true,
+                destroy_space: true,
+                focus_space: true,
+                reorder_space: true,
+                set_window_layer: true,
+                set_window_sticky: true,
+                set_window_shadow: true,
+                set_window_opacity: true,
+                set_window_scale: true,
+                scripting_addition: false,
+            }
+        }
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            Ok(self.snapshot.clone())
+        }
+        fn execute(&mut self, _action: &Action) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn track_focused_window(&self, window_id: u32) {
+            self.tracked.lock().unwrap().push(window_id);
+        }
+        fn publish_public_state(&self, state_json: &str) {
+            self.published.lock().unwrap().push(state_json.to_string());
+        }
+        fn sketchybar_trigger(&self, message: &[u8]) -> bool {
+            self.sketchybar_sent.lock().unwrap().push(message.to_vec());
+            *self.sketchybar_ok.lock().unwrap()
+        }
+    }
+
+    fn rect() -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        }
+    }
+
+    fn window(id: u32, app: &str, title: &str, focused: bool) -> WindowSnapshot {
+        WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(1000 + id as i32),
+            app: app.into(),
+            bundle_id: None,
+            title: title.into(),
+            frame: rect(),
+            space_id: Some(SpaceId(3)),
+            display_id: Some(DisplayId(1)),
+            focused,
+            minimized: ObservedBool::No,
+            fullscreen: ObservedBool::No,
+            managed: ObservedBool::Yes,
+            generation: 1,
+        }
+    }
+
+    fn snapshot(windows: Vec<WindowSnapshot>, focused_space: SpaceId) -> PlatformSnapshot {
+        PlatformSnapshot {
+            windows,
+            spaces: vec![
+                SpaceSnapshot {
+                    id: SpaceId(3),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: focused_space == SpaceId(3),
+                    generation: 1,
+                    position: 0,
+                    is_fullscreen: false,
+                    is_system: false,
+                },
+                SpaceSnapshot {
+                    id: SpaceId(4),
+                    display_id: DisplayId(1),
+                    label: None,
+                    focused: focused_space == SpaceId(4),
+                    generation: 1,
+                    position: 1,
+                    is_fullscreen: false,
+                    is_system: false,
+                },
+            ],
+            displays: vec![DisplaySnapshot {
+                id: DisplayId(1),
+                frame: rect(),
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 1,
+            }],
+            complete: true,
+        }
+    }
+
+    fn daemon_with(snapshot: PlatformSnapshot) -> Daemon {
+        let mut daemon = Daemon {
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
+            last_published_state: None,
+            engine: Engine::new(Config::default()),
+            platform: Box::new(MockPlatform::with_snapshot(snapshot)),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        };
+        // Drive one observation so engine + space history match the platform.
+        daemon.refresh_observation();
+        // Seed history the way the periodic tick does (refresh_observation
+        // updates it from focused flags).
+        daemon.last_published_state = None;
+        daemon
+    }
+
+    #[test]
+    fn query_current_returns_canonical_snapshot() {
+        let mut daemon = daemon_with(snapshot(
+            vec![window(482, "Ghostty", "~/src/rovr", true)],
+            SpaceId(3),
+        ));
+        // Publish once so later dedup tests start from a known baseline.
+        let first = daemon.maybe_publish_public_state().expect("first publish");
+        assert_eq!(first.space, Some(SpaceId(3)));
+        assert_eq!(first.display, Some(DisplayId(1)));
+        let w = first.window.as_ref().expect("focused window");
+        assert_eq!(w.app, "Ghostty");
+        assert_eq!(w.title, "~/src/rovr");
+
+        let result = daemon.handle(Request::new(1, Command::Query(QueryCommand::Current)));
+        let value = serde_json::to_value(&result.response).unwrap();
+        let result_state: PublicState =
+            serde_json::from_value(value["result"].clone()).expect("result is PublicState");
+        assert_eq!(
+            result_state, first,
+            "CLI and notification share one builder"
+        );
+    }
+
+    #[test]
+    fn identical_snapshots_are_suppressed() {
+        let mut daemon = daemon_with(snapshot(vec![window(1, "A", "t", true)], SpaceId(3)));
+        assert!(daemon.maybe_publish_public_state().is_some());
+        // No state change: second call must suppress.
+        assert_eq!(daemon.maybe_publish_public_state(), None);
+        // Querying must not publish by itself (read-only path).
+        let before = daemon.last_published_state.clone();
+        let _ = daemon.handle(Request::new(2, Command::Query(QueryCommand::Current)));
+        // handle() itself does not publish; the state loop does. The stored
+        // baseline must be unchanged by a pure query.
+        assert_eq!(daemon.last_published_state, before);
+    }
+
+    #[test]
+    fn each_visible_transition_publishes_once() {
+        let mut daemon = daemon_with(snapshot(vec![window(1, "A", "one", true)], SpaceId(3)));
+        assert!(daemon.maybe_publish_public_state().is_some());
+        assert_eq!(daemon.maybe_publish_public_state(), None);
+
+        // Focused window change.
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![
+                WindowSnapshot {
+                    focused: false,
+                    ..window(1, "A", "one", true)
+                },
+                window(2, "B", "two", true),
+            ],
+            SpaceId(3),
+        )));
+        assert!(daemon.maybe_publish_public_state().is_some());
+        assert_eq!(daemon.maybe_publish_public_state(), None);
+
+        // Title change on the focused window (no focus/space move).
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![
+                WindowSnapshot {
+                    focused: false,
+                    ..window(1, "A", "one", true)
+                },
+                WindowSnapshot {
+                    title: "two-renamed".into(),
+                    ..window(2, "B", "two", true)
+                },
+            ],
+            SpaceId(3),
+        )));
+        assert!(daemon.maybe_publish_public_state().is_some());
+
+        // Space change.
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![
+                WindowSnapshot {
+                    focused: false,
+                    ..window(1, "A", "one", true)
+                },
+                WindowSnapshot {
+                    space_id: Some(SpaceId(4)),
+                    ..window(2, "B", "two-renamed", true)
+                },
+            ],
+            SpaceId(4),
+        )));
+        // Sync per-display history without re-reading the fixed mock snapshot
+        // (refresh_observation would clobber the manual apply_event above).
+        // Clearing falls back to focused flags — the same value the periodic
+        // tick would record.
+        daemon.space_history.borrow_mut().clear();
+        assert!(daemon.maybe_publish_public_state().is_some());
+
+        // Focus lost (desktop focused): window disappears.
+        daemon
+            .engine
+            .apply_event(Event::Snapshot(snapshot(vec![], SpaceId(4))));
+        daemon.space_history.borrow_mut().clear();
+        let state = daemon
+            .maybe_publish_public_state()
+            .expect("focus loss publishes");
+        assert_eq!(state.window, None);
+        assert_eq!(state.space, Some(SpaceId(4)));
+    }
+
+    #[test]
+    fn query_current_with_no_focus_is_valid_json_with_null_window() {
+        let mut daemon = daemon_with(snapshot(vec![], SpaceId(3)));
+        let state = daemon.current_public_state();
+        assert_eq!(state.window, None);
+        let json = serde_json::to_string(&state).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["window"].is_null());
+        assert_eq!(value["space"], 3);
+        // Daemon response wraps it as result; the result itself is the snapshot.
+        let result = daemon.handle(Request::new(9, Command::Query(QueryCommand::Current)));
+        let wrapped = serde_json::to_value(&result.response).unwrap();
+        assert!(wrapped["result"]["window"].is_null());
+    }
+
+    type TrackingHandles = (
+        Arc<Mutex<Vec<u32>>>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        Arc<Mutex<bool>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    fn tracking_daemon(initial: PlatformSnapshot) -> (Daemon, TrackingHandles) {
+        let tracked = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let ok = Arc::new(Mutex::new(true));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let daemon = Daemon {
+            space_history: std::cell::RefCell::new(HashMap::new()),
+            refresh_wake: Arc::new(RefreshWake::default()),
+            ax_control_available: true,
+            last_published_state: None,
+            engine: Engine::new(Config::default()),
+            platform: Box::new(TrackingPlatform {
+                snapshot: initial,
+                tracked: tracked.clone(),
+                sketchybar_sent: sent.clone(),
+                sketchybar_ok: ok.clone(),
+                published: published.clone(),
+            }),
+            config: Config::default(),
+            config_path: PathBuf::from("/dev/null/rovr-test-config.toml"),
+            state_path: PathBuf::from("/dev/null/rovr-test-state.json"),
+        };
+        (daemon, (tracked, sent, ok, published))
+    }
+
+    #[test]
+    fn title_tracking_follows_focus_and_untracks_on_focus_loss() {
+        let (mut daemon, (tracked, _, _, _)) =
+            tracking_daemon(snapshot(vec![window(1, "A", "one", true)], SpaceId(3)));
+        daemon.refresh_observation();
+        daemon.sync_title_tracking();
+        assert_eq!(*tracked.lock().unwrap(), vec![1]);
+        // Focus moves: the previously focused window's registration must be
+        // replaced (bridge removes it first), never accumulated.
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![
+                WindowSnapshot {
+                    focused: false,
+                    ..window(1, "A", "one", true)
+                },
+                window(2, "B", "two", true),
+            ],
+            SpaceId(3),
+        )));
+        daemon.sync_title_tracking();
+        assert_eq!(*tracked.lock().unwrap(), vec![1, 2]);
+        // Desktop focused: untrack with 0 so no stale element stays subscribed.
+        daemon
+            .engine
+            .apply_event(Event::Snapshot(snapshot(vec![], SpaceId(3))));
+        daemon.sync_title_tracking();
+        assert_eq!(*tracked.lock().unwrap(), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn sketchybar_trigger_fires_once_per_deduped_change() {
+        let (mut daemon, (_, sent, _, _)) = tracking_daemon(snapshot(
+            vec![window(1, "Ghostty", "~/src/rovr", true)],
+            SpaceId(3),
+        ));
+        daemon.refresh_observation();
+        assert!(daemon.maybe_publish_public_state().is_some());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // Identical snapshot: neither generic nor native publication repeats.
+        assert_eq!(daemon.maybe_publish_public_state(), None);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // Changed title emits again with distinct bytes.
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![window(1, "Ghostty", "~/other", true)],
+            SpaceId(3),
+        )));
+        assert!(daemon.maybe_publish_public_state().is_some());
+        let sends = TrackingPlatform::sent_vars(&sent.lock().unwrap());
+        assert_eq!(sends.len(), 2);
+        assert_ne!(sends[0], sends[1]);
+        assert_eq!(
+            &sends[1][..2],
+            &["--trigger".to_string(), "rovr_state".to_string()]
+        );
+        assert!(sends[1].contains(&"APP=Ghostty".to_string()));
+        assert!(sends[1].contains(&"TITLE=~/other".to_string()));
+        assert!(sends[1].contains(&"WINDOW_ID=1".to_string()));
+    }
+
+    #[test]
+    fn sketchybar_focus_loss_sends_empty_window_fields() {
+        let (mut daemon, (_, sent, _, _)) =
+            tracking_daemon(snapshot(vec![window(1, "A", "one", true)], SpaceId(3)));
+        daemon.refresh_observation();
+        assert!(daemon.maybe_publish_public_state().is_some());
+        daemon
+            .engine
+            .apply_event(Event::Snapshot(snapshot(vec![], SpaceId(3))));
+        daemon.space_history.borrow_mut().clear();
+        assert!(daemon.maybe_publish_public_state().is_some());
+        let sends = TrackingPlatform::sent_vars(&sent.lock().unwrap());
+        assert_eq!(sends.len(), 2);
+        for var in ["WINDOW_ID=", "PID=", "APP=", "TITLE="] {
+            assert!(
+                sends[1].contains(&var.to_string()),
+                "focus loss must send empty {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_sketchybar_never_fails_publication_or_poisons_retry() {
+        let (mut daemon, (_, sent, ok, published)) =
+            tracking_daemon(snapshot(vec![window(1, "A", "one", true)], SpaceId(3)));
+        *ok.lock().unwrap() = false; // bar not running: every send reports failure.
+        daemon.refresh_observation();
+        // Generic publication still succeeds; the attempt was made once.
+        assert!(daemon.maybe_publish_public_state().is_some());
+        assert_eq!(published.lock().unwrap().len(), 1);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // Duplicate still suppressed (dedup is independent of send outcome).
+        assert_eq!(daemon.maybe_publish_public_state(), None);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // Bar reappears: the next change sends again — no poisoning.
+        *ok.lock().unwrap() = true;
+        daemon.engine.apply_event(Event::Snapshot(snapshot(
+            vec![window(2, "B", "two", true)],
+            SpaceId(3),
+        )));
+        assert!(daemon.maybe_publish_public_state().is_some());
+        assert_eq!(sent.lock().unwrap().len(), 2);
     }
 }
