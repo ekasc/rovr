@@ -4,7 +4,7 @@ ROVR owns state. Consumers (SketchyBar, Hammerspoon, Übersicht, Raycast
 scripts) own presentation. ROVR never executes `sketchybar`, detects it,
 spawns shells on focus changes, or renders status-bar UI.
 
-Three layers, from live to ad-hoc:
+The interface has three layers, from live to ad-hoc:
 
 ```text
 ROVR
@@ -16,7 +16,7 @@ ROVR
 ## 1. Native SketchyBar transport (live path)
 
 On every deduped `PublicState` change the daemon fires a `rovr_state`
-trigger straight into the running bar over Mach — no `rovr query`, no
+trigger straight into the running bar over Mach. No `rovr query`, no
 shell, no `jq`, no subprocess, no polling:
 
 ```text
@@ -29,28 +29,30 @@ macOS event
 Transport: SketchyBar's own Mach helper protocol (`src/mach.c` in the
 SketchyBar repo, v2.24.0): bootstrap service `git.felix.sketchybar`,
 message = NUL-joined `--trigger` argv sent as one out-of-line region.
-ROVR vendors only that client send path, with two hardening tweaks:
-zero-timeout send (a wedged bar can never stall the state thread) and no
-awaited response (fire-and-forget). The looked-up send right is released
-after each send, so nothing leaks across the daemon's lifetime. Lookup
-happens per send, so a restarted bar is picked up on the next change
-with no polling and no reconnect tracking.
+ROVR vendors only that client send path, with two changes for daemon
+use: a zero-timeout send, so a wedged bar can never stall the state
+thread, and no awaited response (fire-and-forget). The looked-up send
+right is released after each send, so nothing leaks across the
+daemon's lifetime. Lookup happens per send, so a restarted bar is
+picked up on the next change with no polling and no reconnect
+tracking.
 
 The send runs synchronously on the daemon's single state-loop thread,
-inside `maybe_publish_public_state()` right after the `PublicState`
-equality check passes — so the same dedup that guards the distributed
-notification guards SketchyBar updates, and sends are inherently
-in-order with no queue that could backlog (each send already *is* the
-latest state).
+inside `maybe_publish_public_state()`, right after the `PublicState`
+equality check passes. The same dedup that guards the distributed
+notification guards SketchyBar updates. Sends stay in order with no
+queue behind them. Each send already is the latest state.
 
-Failure is silent and local: bar absent / no port / rejected message
-just reports `false`, logged at debug level only. Window management
-never blocks, retries, or waits; the next state change tries again.
+Failure is silent and local. An absent bar, a missing port, or a
+rejected message reports `false`, logged at debug level only. Window
+management never blocks, retries, or waits. The next state change
+tries again.
 
 ### Native event contract (stable)
 
-Event name: `rovr_state`. Variables (raw ROVR ids; empty when absent —
-ROVR never invents labels like `"Desktop"`, presentation is the bar's):
+Event name: `rovr_state`. Variables carry raw ROVR ids. A missing
+value encodes as empty. ROVR never invents labels like `"Desktop"`.
+Presentation belongs to the bar.
 
 ```text
 SPACE      e.g. 1098 (empty when nothing observed yet)
@@ -62,16 +64,16 @@ TITLE      e.g. ~/src/rovr
 ```
 
 Encoding: values travel as NUL-separated C strings, so spaces, quotes,
-`$`, `;`, backticks, unicode, and emoji pass through literally — this is
-not a shell command and is never shell-quoted. The only transformation
-is NUL bytes inside app/title, which cannot cross the boundary and are
-replaced with U+FFFD.
+`$`, `;`, backticks, unicode, and emoji pass through literally. This
+is not a shell command and is never shell-quoted. The only
+transformation is NUL bytes inside app/title, which cannot cross the
+boundary and are replaced with U+FFFD.
 
-### SbarLua example (reactive path — no processes spawned)
+### SbarLua example
 
-Verified against the SbarLua API (`sbar.add("event", <name>)` for custom
-trigger events, `item:subscribe(event, fn)` receiving trigger variables
-as `env`):
+Verified against the SbarLua API (`sbar.add("event",
+<name>)` for custom trigger events, `item:subscribe(event, fn)`
+receiving trigger variables as `env`):
 
 ```lua
 -- ~/.config/sketchybar/init.lua (needs the SbarLua module installed;
@@ -107,11 +109,11 @@ end)
 
 The callback spawns nothing: rendering comes purely from the event env.
 
-### Startup initialization
+### Initialize the bar at startup
 
-Reactive events don't reach a bar that starts after ROVR. The supported
-init is a **one-time** query at SketchyBar startup (a per-event CLI call
-is explicitly not the live path):
+Reactive events don't reach a bar that starts after ROVR. The
+supported init is a one-time query at SketchyBar startup. Use it once.
+A per-event CLI call is not the live path:
 
 ```sh
 # in sketchybarrc, once at startup (@sh quotes values safely for eval;
@@ -134,12 +136,15 @@ at init with the same mapping is the equivalent.)
 ## 2. Distributed notification (generic integrations)
 
 `com.rovr.state.changed` via `NSDistributedNotificationCenter`, full JSON
-snapshot in `userInfo["state"]`. Same triggers and same dedup as above.
-For Hammerspoon, Übersicht, and other consumers — not for the live
-SketchyBar item.
+snapshot in `userInfo["state"]`. It shares the native path's triggers
+and dedup. For Hammerspoon, Übersicht, and other consumers. Not for
+the live SketchyBar item.
 
-## 3. CLI query (scripts/debugging)
+## 3. CLI query (scripts and debugging)
 
 `rovr query --current` (or `rovr query current`) prints the canonical
 snapshot as bare JSON. Same builder as both publication paths, so the
 three layers can never drift.
+
+---
+ROVR takes inspiration from yabai.
