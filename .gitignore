@@ -20,3 +20,6 @@
 
 # Local agent runtime state (per-machine, never commit)
 .pi/
+
+# Personal reference doc (local only, never commit)
+docs/how-it-works.html
