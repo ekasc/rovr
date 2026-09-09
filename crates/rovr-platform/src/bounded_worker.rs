@@ -325,9 +325,14 @@ mod tests {
     #[test]
     fn all_waits_share_the_callers_absolute_deadline() {
         let worker = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
+        // Gate-blocked job: it CANNOT complete no matter how the OS schedules
+        // threads, so the deadline must bound the wait deterministically (a
+        // fixed sleep could finish inside a deschedule gap on loaded machines
+        // and flake the Timeout assert below).
+        let (gate_tx, gate_rx) = channel::<()>();
         let epoch = worker
-            .submit(|| {
-                std::thread::sleep(Duration::from_millis(300));
+            .submit(move || {
+                let _ = gate_rx.recv();
                 1
             })
             .unwrap();
@@ -346,6 +351,9 @@ mod tests {
             elapsed >= Duration::from_millis(60),
             "wait should respect the deadline; elapsed={elapsed:?}"
         );
+        // Release the gate so the worker thread can exit instead of blocking
+        // forever (drop order then unwinds cleanly).
+        drop(gate_tx);
     }
 
     #[test]
@@ -377,9 +385,14 @@ mod tests {
     fn slow_worker_does_not_hide_healthy_result_at_shared_deadline() {
         let slow = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
         let healthy = BoundedWorker::new(Duration::from_secs(1), Duration::ZERO);
+        // Gate-blocked job: it CANNOT complete no matter how the OS schedules
+        // threads, so the Timeout below is structural, not timing luck. (The
+        // previous 80ms sleep could finish inside a deschedule gap on loaded
+        // machines, returning Ok and flaking — observed on CI.)
+        let (gate_tx, gate_rx) = channel::<()>();
         let slow_epoch = slow
-            .submit(|| {
-                std::thread::sleep(Duration::from_millis(80));
+            .submit(move || {
+                let _ = gate_rx.recv();
                 1
             })
             .unwrap();
@@ -390,5 +403,8 @@ mod tests {
             Err(BoundedError::Timeout)
         );
         assert_eq!(healthy.wait_until(healthy_epoch, deadline), Ok(2));
+        // Release the gate so the worker thread can exit instead of blocking
+        // forever (drop order then unwinds cleanly).
+        drop(gate_tx);
     }
 }
