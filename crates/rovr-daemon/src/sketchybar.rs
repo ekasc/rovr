@@ -232,7 +232,7 @@ mod tests {
         let args = trigger_args(&state(Some(3), Some(1), Some((1, 2, "A", "t"))));
         let message = encode_mach_message(&args);
         assert!(message.ends_with(&[0, 0]));
-        assert!(!message.windows(2).any(|w| w == [b'$', b'(']));
+        assert!(!message.windows(2).any(|w| w == *b"$("));
         let text = String::from_utf8(message).unwrap();
         assert!(!text.contains("sketchybar"));
         assert!(!text.contains("jq"));
