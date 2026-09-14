@@ -208,13 +208,14 @@ static bool verify_os_version(NSOperatingSystemVersion os_version)
     if (os_version.majorVersion == 12 || os_version.majorVersion == 13 ||
         os_version.majorVersion == 14) {
         return true;
-    } else if (os_version.majorVersion == 15 || os_version.majorVersion == 26) {
+    } else if (os_version.majorVersion == 15 || os_version.majorVersion == 26 ||
+               os_version.majorVersion == 27) {
         macOSSequoia = true;
         return true;
     }
 #endif
 
-    NSLog(@"[rovr-sa] spaces functionality is only supported on macOS Monterey 12+, Ventura 13+, Sonoma 14+, Sequoia 15+ and Tahoe 26+");
+    NSLog(@"[rovr-sa] spaces functionality is only supported on macOS Monterey 12+, Ventura 13+, Sonoma 14+, Sequoia 15+, Tahoe 26+ and Golden Gate 27+");
     return false;
 }
 
