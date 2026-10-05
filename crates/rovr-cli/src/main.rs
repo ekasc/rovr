@@ -173,6 +173,9 @@ enum WindowSubcommand {
         #[arg(long)]
         window: Option<u32>,
         edge: DirectionArg,
+        // Negative deltas shrink the edge; without allow_hyphen_values clap
+        // reads `-20` as an unknown flag and the bind never reaches the daemon.
+        #[arg(allow_hyphen_values = true)]
         delta: i32,
     },
 }
@@ -190,6 +193,20 @@ enum SpaceSubcommand {
     },
     #[command(name = "focus-recent", about = "Focus the previously active Space")]
     FocusRecent,
+    #[command(
+        name = "next",
+        about = "Step to the next Space (wrapping); defaults to the focused display"
+    )]
+    Next {
+        display: Option<String>,
+    },
+    #[command(
+        name = "prev",
+        about = "Step to the previous Space; defaults to the focused display"
+    )]
+    Prev {
+        display: Option<String>,
+    },
     Create {
         anchor: Option<u64>,
     },
@@ -245,10 +262,6 @@ enum ConfigSubcommand {
     },
     Check {
         path: String,
-    },
-    #[command(name = "gen-skhd", about = "Generate skhd config from rovr.toml binds")]
-    GenSkhd {
-        path: Option<String>,
     },
 }
 
@@ -346,7 +359,6 @@ fn main() -> Result<()> {
     if let TopCommand::Config(args) = &cli.command {
         match &args.command {
             ConfigSubcommand::Dump { full } => return run_config_dump(*full),
-            ConfigSubcommand::GenSkhd { path } => return run_gen_skhd(path.as_deref()),
             ConfigSubcommand::Reload { .. } | ConfigSubcommand::Check { .. } => {}
         }
     }
@@ -617,6 +629,8 @@ fn map_command(command: TopCommand) -> Command {
                 space: SpaceId(space),
             },
             SpaceSubcommand::FocusRecent => SpaceCommand::FocusRecent,
+            SpaceSubcommand::Next { display } => SpaceCommand::Next { display },
+            SpaceSubcommand::Prev { display } => SpaceCommand::Prev { display },
             SpaceSubcommand::Create { anchor } => SpaceCommand::Create {
                 anchor: anchor.map(SpaceId),
             },
@@ -635,9 +649,6 @@ fn map_command(command: TopCommand) -> Command {
             }
             ConfigSubcommand::Reload { path } => ConfigCommand::Reload { path },
             ConfigSubcommand::Check { path } => ConfigCommand::Check { path },
-            ConfigSubcommand::GenSkhd { .. } => {
-                unreachable!("gen-skhd is handled in main() before map_command")
-            }
         }),
         TopCommand::Debug(args) => Command::Debug(match args.command {
             DebugSubcommand::Events => DebugCommand::Events,
@@ -709,8 +720,8 @@ fn run_sa_status() -> Result<()> {
     // Probe SA directly (without daemon) and also query daemon doctor for its view.
     #[cfg(target_os = "macos")]
     {
-        use rovr_platform::macos::sa::{SaClient, ROVR_SA_VERSION_PREFIX};
-        let client = SaClient::new();
+        use rovr_platform::macos::sa::ROVR_SA_VERSION_PREFIX;
+        let client = sa_console_client()?;
         let socket = client.socket_path().clone();
         println!("socket: {}", socket.display());
         println!("expected_prefix: {}", ROVR_SA_VERSION_PREFIX);
@@ -1020,6 +1031,24 @@ fn console_uid() -> Option<u32> {
     s.trim().parse::<u32>().ok()
 }
 
+/// An SA client for the GUI session's user, not for whoever is asking.
+///
+/// The payload binds `/tmp/rovr-<uid>/sa.sock` with the uid of the Dock process
+/// that loaded it, which is the console session user. A client keyed on
+/// `getuid()` therefore probes `/tmp/rovr-0/sa.sock` under `sudo` and reports a
+/// live payload as `present: false`. Since `sa install` must run as root, every
+/// CLI path that talks to the payload has to key on the console uid.
+#[cfg(target_os = "macos")]
+fn sa_console_client() -> Result<rovr_platform::macos::sa::SaClient> {
+    let uid = console_uid().context("determine console uid from /dev/console")?;
+    Ok(
+        rovr_platform::macos::sa::SaClient::with_socket_path_for_uid(
+            rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
+            uid,
+        ),
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn check_sip_for_install() -> Result<()> {
     let out = std::process::Command::new("csrutil")
@@ -1137,11 +1166,9 @@ fn run_sa_install() -> Result<()> {
         }
 
         // ---- 4. Verify the SA handshake ------------------------------------
-        let uid = console_uid().context("determine console uid")?;
-        let client = rovr_platform::macos::sa::SaClient::with_socket_path_for_uid(
-            rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
-            uid,
-        );
+        // Keyed on the console uid, not ours: `sudo` would otherwise probe
+        // /tmp/rovr-0/sa.sock and report a live payload as missing.
+        let client = sa_console_client()?;
         let mut handshake_version = None;
         for _ in 0..20 {
             if let Some(info) = client.probe() {
@@ -1156,7 +1183,11 @@ fn run_sa_install() -> Result<()> {
         }
         let Some(version) = handshake_version else {
             anyhow::bail!(
-                "sa install: injection ran but the payload socket did not answer — check `rovr sa status` and Console.app for [rovr-sa] logs"
+                "sa install: injection ran but the payload socket did not answer. \
+                 If a previous payload is already loaded in Dock, dlopen is a no-op — \
+                 restart Dock (`killall Dock`), wait a few seconds, then run \
+                 `sudo rovr sa install` again. Otherwise check `rovr sa status` and \
+                 Console.app for [rovr-sa] logs."
             )
         };
 
@@ -1408,6 +1439,27 @@ fn derive_service_state(
     }
 }
 
+/// Does the privileged helper answer at all?
+///
+/// A refusal is a response. The helper's caller check runs before it reads any
+/// request byte and replies `ROVR_SA_ST_UNAUTHORIZED`, which the client maps to
+/// `Rejected`. Counting that as "not answering" is how `sudo rovr sa status`
+/// came to report a healthy service as `installed` with `hint: the helper does
+/// not answer` — a root caller can never match the console session uid, so it is
+/// always refused. Only a transport failure means the service is really gone.
+fn helper_is_answering(
+    result: &Result<
+        rovr_platform::macos::reinject::HelperResponse,
+        rovr_platform::macos::reinject::HelperError,
+    >,
+) -> bool {
+    use rovr_platform::macos::reinject::HelperError;
+    match result {
+        Ok(_) | Err(HelperError::Rejected { .. }) => true,
+        Err(HelperError::Unavailable(_) | HelperError::Protocol(_)) => false,
+    }
+}
+
 /// Extend `rovr sa status` with the full lifecycle picture: privileged
 /// service state, payload identity, and installed-vs-injected mismatch.
 #[cfg(target_os = "macos")]
@@ -1420,9 +1472,9 @@ fn print_sa_lifecycle_status(client: &rovr_platform::macos::sa::SaClient) {
     let files_installed = std::path::Path::new(SA_INSTALLED_DYLIB).exists()
         && std::path::Path::new(SA_INSTALLED_HELPER).exists();
     let plist_present = std::path::Path::new(SA_PLIST_PATH).exists();
-    let helper_ok = rovr_platform::macos::reinject::HelperClient::new()
-        .status(Duration::from_secs(1))
-        .is_ok();
+    let helper_ok = helper_is_answering(
+        &rovr_platform::macos::reinject::HelperClient::new().status(Duration::from_secs(1)),
+    );
     let service_str = match derive_service_state(files_installed, plist_present, helper_ok) {
         ServiceState::Registered => "registered",
         ServiceState::Installed => "installed",
@@ -1490,22 +1542,6 @@ extern "C" {
 #[cfg(target_os = "macos")]
 unsafe fn libc_getuid() -> u32 {
     getuid()
-}
-
-fn run_gen_skhd(path: Option<&str>) -> Result<()> {
-    let cfg_path = path.map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/rovr/rovr.toml")
-    });
-    let content = std::fs::read_to_string(&cfg_path)
-        .with_context(|| format!("read config {}", cfg_path.display()))?;
-    let cfg: rovr_config::Config =
-        toml::from_str(&content).with_context(|| format!("parse {}", cfg_path.display()))?;
-    cfg.validate()?;
-    for bind in &cfg.binds {
-        println!("{} : rovr {}", bind.key, bind.command);
-    }
-    Ok(())
 }
 
 fn send(path: &Path, request: &Request) -> Result<Response> {
@@ -1586,6 +1622,65 @@ mod tests {
                 command: ConfigSubcommand::Dump { full: true }
             })
         ));
+    }
+
+    /// A shrink bind such as `alt - y : rovr window resize west -20` must reach
+    /// the daemon. clap reads a bare `-20` as an unknown flag unless the delta
+    /// arg allows hyphen values, which silently kills the bind.
+    #[test]
+    fn window_resize_parses_a_negative_delta() {
+        let cli = Cli::try_parse_from(["rovr", "window", "resize", "west", "-20"])
+            .expect("negative delta parses");
+        let TopCommand::Window(args) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            args.command,
+            WindowSubcommand::Resize {
+                edge: DirectionArg::West,
+                delta: -20,
+                ..
+            }
+        ));
+        assert_eq!(
+            map_command(TopCommand::Window(WindowArgs {
+                command: WindowSubcommand::Resize {
+                    window: None,
+                    edge: DirectionArg::West,
+                    delta: -20,
+                },
+            })),
+            Command::Window(WindowCommand::Resize {
+                window: None,
+                edge: rovr_types::Direction::West,
+                delta: -20,
+            })
+        );
+    }
+
+    /// `space next` / `space prev` exist so the alt+tab binds can live in skhd
+    /// as ordinary CLI calls; the protocol supported them but the CLI did not.
+    #[test]
+    fn space_next_and_prev_parse_and_map() {
+        for (arg, expected) in [
+            ("next", SpaceCommand::Next { display: None }),
+            ("prev", SpaceCommand::Prev { display: None }),
+        ] {
+            let cli = Cli::try_parse_from(["rovr", "space", arg]).expect("parses");
+            let TopCommand::Space(_) = cli.command else {
+                panic!("expected space command");
+            };
+            let cli = Cli::try_parse_from(["rovr", "space", arg]).unwrap();
+            assert_eq!(map_command(cli.command), Command::Space(expected));
+        }
+
+        let cli = Cli::try_parse_from(["rovr", "space", "next", "main"]).unwrap();
+        assert_eq!(
+            map_command(cli.command),
+            Command::Space(SpaceCommand::Next {
+                display: Some("main".into())
+            })
+        );
     }
 
     /// M4b: `rovr subscribe` consumes the subscription ACK (and errors if it is
@@ -1695,6 +1790,30 @@ mod tests {
             Registered,
             "helper answering STATUS = registered"
         );
+    }
+
+    /// The bug this pins: `sudo rovr sa status` reported a healthy helper as
+    /// `installed` with "the helper does not answer", because the helper
+    /// refusing a root caller (which can never match the console session uid)
+    /// was being read as a dead service. A refusal is a response.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn helper_refusal_proves_liveness_but_transport_failure_does_not() {
+        use rovr_platform::macos::reinject::{HelperError, HelperResponse};
+        assert!(helper_is_answering(&Ok(HelperResponse {
+            status: 0,
+            dock_pid: 1
+        })));
+        assert!(
+            helper_is_answering(&Err(HelperError::Rejected { status: 4 })),
+            "UNAUTHORIZED is a real response from a live helper"
+        );
+        assert!(!helper_is_answering(&Err(HelperError::Unavailable(
+            "connect failed".into()
+        ))));
+        assert!(!helper_is_answering(&Err(HelperError::Protocol(
+            "connection closed mid-response".into()
+        ))));
     }
 
     /// SA lifecycle: uninstall removes every privileged artifact it installs —

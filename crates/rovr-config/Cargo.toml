@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 regex.workspace = true
-rovr-protocol.workspace = true
 rovr-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true

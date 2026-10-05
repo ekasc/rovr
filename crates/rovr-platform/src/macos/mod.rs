@@ -167,6 +167,7 @@ extern "C" {
     fn rovr_bridge_close_window(window_id: u32) -> i32;
     fn rovr_bridge_toggle_fullscreen(window_id: u32) -> i32;
     fn rovr_bridge_install_event_handlers(callback: Option<rovr_ax_event_trampoline_fn>);
+    fn rovr_bridge_run_event_loop();
     fn rovr_bridge_needs_refresh() -> i32;
     fn rovr_bridge_enumerate_spaces(callback: SpaceCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_move_window_to_space(window_id: u32, space_id: u64) -> i32;
@@ -184,6 +185,15 @@ extern "C" {
     fn rovr_bridge_post_state_changed(state_json: *const c_char);
     fn rovr_bridge_track_focused_window(window_id: u32);
     fn rovr_bridge_sketchybar_trigger(message: *const c_char, length: u32) -> std::ffi::c_int;
+}
+
+/// Run the platform event loop on the calling (main) thread. macOS services the
+/// run loop that AX observer and SLS/NSWorkspace notification sources attach
+/// to; the daemon must call this so those events are delivered.
+pub fn run_event_loop() {
+    unsafe {
+        rovr_bridge_run_event_loop();
+    }
 }
 
 #[derive(Clone, Copy)]

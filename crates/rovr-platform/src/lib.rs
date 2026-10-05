@@ -73,14 +73,62 @@ extern "C" {
     fn getuid() -> u32;
 }
 
-/// Per-user runtime directory shared by daemon, CLI and Dock payload. The
-/// daemon/payload create it as 0700 and refuse unsafe pre-existing entries.
-pub fn runtime_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("/tmp/rovr-{}", unix_uid()))
+/// Per-user runtime directory for the DAEMON socket, created 0700 by the
+/// daemon.
+///
+/// Deliberately not `/tmp`. `com.apple.tmp_cleaner` runs daily and deletes
+/// every `/tmp` entry whose atime, mtime AND ctime are all older than 3 days.
+/// A bound Unix socket is never touched through its path after `bind`, so all
+/// three timestamps stay frozen at creation time and the socket file is
+/// deleted out from under the still-running daemon about three days after it
+/// started. The daemon keeps serving on the open fd, but the path is gone, so
+/// every CLI call and every in-process dispatch fails with ENOENT until the
+/// daemon is restarted.
+///
+/// `$HOME` is set explicitly by the launchd plist and already backs the config
+/// and state paths, so it cannot desync the daemon from its CLI the way
+/// `$TMPDIR` or `$UID` can (see [`unix_uid`]).
+///
+/// The SA socket keeps its own `/tmp/rovr-<uid>/sa.sock` namespace on purpose:
+/// it is bound by the payload dylib running inside Dock, so relocating it would
+/// require rebuilding and reinstalling that payload.
+pub fn daemon_runtime_dir() -> std::path::PathBuf {
+    daemon_runtime_dir_for(std::env::var("HOME").ok().as_deref())
+}
+
+fn daemon_runtime_dir_for(home: Option<&str>) -> std::path::PathBuf {
+    match home {
+        Some(home) if !home.is_empty() => {
+            std::path::PathBuf::from(home).join("Library/Caches/rovr")
+        }
+        // No HOME is unusual for a launchd agent (the plist always sets it).
+        // Keep the legacy location rather than falling back to a relative
+        // path, which would let the daemon and the CLI bind different sockets.
+        _ => std::path::PathBuf::from(format!("/tmp/rovr-{}", unix_uid())),
+    }
 }
 
 pub fn daemon_socket_path() -> std::path::PathBuf {
-    runtime_dir().join("daemon.sock")
+    daemon_runtime_dir().join("daemon.sock")
+}
+
+/// Run the platform event loop on the calling (main) thread.
+///
+/// On macOS this services the run loop that AX observer and SLS/NSWorkspace
+/// notification sources are attached to; it does not return under normal
+/// operation. On other platforms there are no event sources, so it parks
+/// forever (the daemon's real work runs on its own threads).
+pub fn run_event_loop() {
+    #[cfg(target_os = "macos")]
+    {
+        macos::run_event_loop();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 pub trait Platform: Send {
@@ -155,6 +203,29 @@ fn cached_minimized(
     match observed {
         ObservedBool::Unknown => cached.unwrap_or(ObservedBool::Unknown),
         known => known,
+    }
+}
+
+#[cfg(test)]
+mod runtime_dir_tests {
+    use super::daemon_runtime_dir_for;
+
+    /// The regression this guards: a daemon socket under `/tmp` is reaped by
+    /// the system tmp cleaner after 3 days while the daemon keeps running.
+    #[test]
+    fn runtime_dir_is_outside_tmp() {
+        let dir = daemon_runtime_dir_for(Some("/Users/example"));
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/Users/example/Library/Caches/rovr")
+        );
+        assert!(!dir.starts_with("/tmp"));
+    }
+
+    #[test]
+    fn empty_home_falls_back_to_the_legacy_uid_dir() {
+        let dir = daemon_runtime_dir_for(Some(""));
+        assert!(dir.to_string_lossy().starts_with("/tmp/rovr-"));
     }
 }
 

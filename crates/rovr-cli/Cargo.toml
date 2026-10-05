@@ -9,6 +9,11 @@ rust-version.workspace = true
 name = "rovr"
 path = "src/main.rs"
 
+# Live one-line-per-change view of the daemon's notification stream.
+[[bin]]
+name = "rovr-watch"
+path = "src/bin/rovr-watch.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap_complete.workspace = true

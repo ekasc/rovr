@@ -38,12 +38,15 @@
 
 - [~] 6. Built-in hotkeys are architecturally invalid on macOS
   - Option A implemented: daemon MAIN thread creates the hotkey manager and runs the AppKit event loop (`run_appkit_event_loop`); socket accept moved to a worker thread; state loop unchanged. Compiles; hotkey firing requires manual run on macOS UI session (not verifiable headlessly).
+  - REVERSED 2026-09-29: the built-in hotkey backend is removed. Global hotkeys belong to skhd. There is no `mod hotkey`, no `global-hotkey`/`objc2` dependency, and no AppKit event loop; the daemon's main thread joins the accept thread.
 
 - [x] 7. Hotkey command syntax diverges from the real CLI
   - ONE shared parser `rovr_protocol::command_parser::parse_command` (CLI-style grammar) used by hotkey dispatch AND enforced during config validation. Flag-style binds rejected at load. Unit-tested against the exact acceptance inputs.
+  - REVERSED 2026-09-29: with the hotkey backend removed, config no longer validates binds and `rovr gen-skhd` is gone. `command_parser` remains as a protocol-level utility with its own tests but has no runtime caller.
 
 - [x] 8. Unmatched hotkey commands silently become Ping
   - Ping fallback deleted: invalid bind command at runtime logs an error and executes NOTHING; invalid binds fail config load/reload (`ConfigError::InvalidBindCommand`). Regression tests on parser + config load.
+  - REVERSED 2026-09-29: `[[bind]]` and its error variants are removed, so there is no bind command to substitute. skhd owns hotkey dispatch and shell syntax.
 
 - [x] 9. Rule-derived desired workspace state becomes sticky
   - `desired.space` is cleared and rebuilt from scratch every `apply_layout` cycle (it is exclusively rule-owned; manual moves are one-shot actions). Test: rule matches → target set; title changes → target gone.
@@ -83,6 +86,8 @@
   - All rovr-expressible binds migrated to in-process [[bind]] config (39
     registered); skhd keeps app launches, reload, chained resizes, space
     destroy. Tests: parser/engine/daemon coverage added (112 total).
+  - REVERSED 2026-09-29: every bind moved back to skhdrc; `[[bind]]` config
+    table deleted.
 
 ## Full checks
 
@@ -169,3 +174,64 @@
 - [x] TODO.md Blocker 1 contradiction resolved: SA verified live; genuinely open items
   (protocol-v2 interop rerun, reboot recovery) listed explicitly instead of stale NOT VERIFIED text.
 - Full checks: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 141 passed.
+
+## SA payload crashes Dock on macOS 27 (2026-10-02)
+
+Live inspection of the running instance (Dock 2571.0.6.402, macOS 27.0 26A428) found the scripting addition's failure root cause: not staleness, not the helper, not the daemon.
+
+- [x] Root cause: a space opcode makes the payload message a Dock object that does not answer the selector. `~/Library/Logs/DiagnosticReports/Dock-2026-10-02-164750.ips` shows `EXC_CRASH/SIGABRT`, faulting stack `librovr_sa_payload.dylib handle_connection` → `Dock +0x18c594` (resolved `move_space` +0x40) → `-[NSObject doesNotRecognizeSelector:]` → `abort()`. Dock dies → SA socket dies → daemon sees `handshake_timeout` → reinjection re-crashes Dock up to 4×/generation.
+- [x] Fix (fail-safe, bounded): wrap every opcode dispatch in `@try/@catch` (`handle_message`) so a bad resolution returns `SA_STATUS_UNSUPPORTED` instead of aborting Dock; reject `dock.spaces`/`dppm` with `respondsToSelector:` in `init_instances` so capability bits stay honest. `docs/SA.md` corrected (macOS 27 op verification was never true).
+- [~] Not restored: space ops still do not function on Dock 2571.0.6.402. Re-deriving the macOS 27 offsets/patterns against the real Dock binary and live op testing is required.
+- [x] Also confirmed: loader reports false success (its `0x79616265` magic is set on the spawning thread before the `dlopen` thread runs), which is why the helper says "injection accepted" while no socket appears. Diagnostic-only; daemon still verifies via handshake.
+- Checks: payload builds; smoke test (dlopen payload, send `space_move`) returns status 2 and host survives; `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 249 passed.
+
+## Daemon state loop dies silently → permanent zombie (2026-10-02)
+
+Live symptom of the running instance: `rovr ping`/`doctor`/`query` all return EOF; the daemon process is alive but answers nothing.
+
+- [x] Root cause of the *zombie*: `run_daemon` spawns the state loop and drops its `JoinHandle`, then the main thread joins only the accept loop. When the state loop exits — channel disconnect or panic — the process keeps the socket open, every request fails with `sending on a closed channel`, and because the process never exits, launchd `KeepAlive` cannot restart it. `sample` confirms only main (in `pthread_join`) + accept + an idle GCD worker survive; the state-loop thread is gone.
+- [x] Recurring, not new: `/tmp/rovr.log` shows 1049 `closed channel` errors on 2026-10-01 (state loop died ~08:15, daemon restarted ~09:35) and 72 on 2026-10-03 (died ~00:20). Both deaths are silent — nothing in the log and nothing in `/tmp/rovr.err.log`.
+- [x] Fix: main now joins the state-loop handle and `exit(1)`s so launchd restarts a healthy daemon; the `Disconnected` branch logs before breaking; the exit logs `panicked=`. Converts a permanent outage into a ~10 s self-heal and makes the next occurrence diagnosable.
+- [~] NOT root-caused: *why* the state loop exits. No panic reaches stderr and the channel should not disconnect while `EVENT_TX` and the accept closure hold senders, so the exit mechanism is unexplained. The added log will name it on the next death. Needs a live reproduction with debug logging.
+- Checks: `cargo build -p rovr-daemon`, `cargo fmt --check`, `cargo clippy -p rovr-daemon -D warnings`, `cargo test -p rovr-daemon` — 40 passed.
+
+## Reliability: state loop survives a panic and reports it (2026-10-02)
+
+Follow-up to the zombie fix. The exit mechanism stayed unexplained, so the daemon was made to survive the most likely cause (a panic) and to record it.
+
+- [x] Panic hook installed in `main()`: every panic in any thread is logged via `tracing` (`location`, `panic`) into `/tmp/rovr.log`. Previously panics only reached `/tmp/rovr.err.log`, which has been empty across every observed death — so if the state loop is panicking, it was invisible.
+- [x] `state_loop_with_interval` now wraps its startup warm-up, periodic observation, and request handling in `catch_unwind(AssertUnwindSafe(..))`. A panic is logged and the loop continues; a panicking request gets a `Response::error(.., "INTERNAL", ..)` instead of a dead socket. State is re-derived from fresh observation each tick, so a panic mid-tick is recoverable.
+- [x] Regression test `state_loop_survives_a_panicking_observation_and_still_serves_requests` (daemon): a platform that panics on every snapshot must not kill the loop, and a `Ping` must still be answered. **Mutation-verified**: reverting the guards makes it fail with `SendError` (loop dead); with them it passes.
+- [~] Still unproven: whether the real death is a panic or a channel disconnect. If it is a panic, this fixes the recurrence; if not, the `request channel disconnected` log plus the panic hook will finally name it. Only a real recurrence settles it.
+- Checks: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 250 passed.
+
+## SA works on macOS 27 (2026-10-02, cont.)
+
+- [x] Root cause of the "socket did not answer": a **stale payload was already mapped in Dock**. `dlopen` of an already-loaded path is a no-op, so `sudo rovr sa install` installed the new dylib but Dock kept running the old one (confirmed: mapped file 73456 B = old; installed 73904 B = new; Dock had been up since 16:47). Only a Dock restart clears it.
+- [x] Fix verified live: `killall Dock` → daemon reinjects the guarded payload into the fresh process → `rovr sa status` = `injected_compatible`, attribs `0x000007ff`, all caps true. Full Space lifecycle exercised: `create` (new Space), `move` (reordered to the intended slot — the call that previously aborted Dock), `focus`, `destroy` (empty dynamic Space reaped). Dock PID stable throughout, zero `platform.error` events.
+- [~] Reboot recovery and update-over-running-payload remain unverified (the latter is the stale-mapping case). `docs/SA.md` updated to reflect op-level verification.
+- Follow-up: `sa install` should detect the stale mapping and say "restart Dock", instead of a generic "socket did not answer".
+
+## Reliability hardening from research (2026-10-02)
+
+Research written to `docs/RELIABILITY.md` (evidence: live failures, `../yabai`, external practice). Implemented the availability + discontinuity items:
+
+- [x] **P0.1 supervision contract** — plist `KeepAlive={SuccessfulExit=false}` + `ThrottleInterval=20` in `install.sh`/`install-dev.sh`.
+- [x] **P0.2 wedged-loop watchdog** — `HEARTBEAT_MS` updated per state-loop iteration; a watchdog exits for launchd restart if it goes stale (threshold clears normal work and one reconcile interval). Predicate unit-tested; live trip not induced.
+- [x] **P1.1 sleep/wake** — `NSWorkspaceDidWake/WillSleep` observers in `bridge.m` → `ROVR_EVENT_SYSTEM_WOKE` → immediate refresh (`event_requests_immediate_refresh`). Rovr previously had **no** sleep/wake observation at all.
+- [x] **P1.2 signals** — `SIGPIPE` ignored (verified: 25 abrupt-close clients, daemon survived); `SIGTERM`/`SIGINT`/`SIGHUP` persist state and exit 0.
+- [x] **P1.3 AX re-acquire** — no change needed: `refine()` creates a fresh `AXUIElementCreateApplication(pid)` every tick, so `kAXErrorCannotComplete` self-heals; nothing cached to go stale.
+- [~] **P0.3 root-cause F1** — still open; panic hook + disconnect log + watchdog are the net.
+- [x] **P2.2 loader honest failure** — the helper now probes the SA handshake (bounded) before reporting OK, so a no-op `dlopen`/rejected payload becomes `INJECTION_FAILED`. Verified live (inject → OK when the payload answers).
+- [x] **P3 health surface** — `doctor.result.health` = `state_loop_heartbeat_age_ms`, `last_observation_age_ms`, `reconcile_failure_streak` (streak maintained in `refresh_observation`). Verified live + unit-tested.
+- [~] **P2.1** — `sa install` names (but does not perform) the Dock restart.
+- Checks: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 253 passed. Live: SIGPIPE + SIGTERM contracts verified; plist verified via `launchctl print`; `doctor.health` live.
+
+## Accessory windows pollute observation (2026-10-02)
+
+`rovr query windows` reported 20 windows, 15 of them accessory/system placeholders on no Space (`loginwindow`, `UserNotificationCenter`, `CodexBar`, `PasswordsMenuBarExtra`, `Tailscale`, `AutoFill`) — most with the same bogus `500×500+0+418` frame.
+
+- [x] Root cause: `rovr_bridge_enumerate_window_candidates` filtered by CGWindow layer and size but not by app kind, so menu-bar extras and system agents entered observed state. Yabai gates observation on `NSApplicationActivationPolicyRegular` (`workspace.m`); Rovr did not.
+- [x] Fix: skip windows whose owning `NSRunningApplication` is not Regular. Verified live: window count **20 → 9**; the six accessory/system apps are gone; the 5 real windows (WezTerm, Activity Monitor, Brave, disktree, Escape) still observed with their Spaces. An app that is momentarily Accessory during launch is picked up on a later snapshot.
+- [~] Remaining phantoms are from *regular* apps (Brave `1470×75`, Brave/disktree/Escape `500×500+0+418`, all on no Space). Not filtered — dropping space-less windows risks hiding a legitimately transient one, and the engine already excludes them from tiling.
+- Checks: `cargo build -p rovr-platform`, `cargo test -p rovr-platform` 30 passed, `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — clean.

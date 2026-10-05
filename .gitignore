@@ -1,6 +1,7 @@
 # Build output
 /target
 /apps/rovr-menu-bar/.build
+/apps/rovr-gui/.build
 
 # Local config written by rovrd when $HOME is unset (daemon fallback path)
 /rovr.toml

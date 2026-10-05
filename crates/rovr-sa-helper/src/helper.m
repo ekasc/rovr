@@ -31,6 +31,8 @@
 #import <fcntl.h>
 #import <launch.h>
 #import <spawn.h>
+#import <stdio.h>
+#import <string.h>
 
 #import "helper.h"
 
@@ -91,6 +93,46 @@ static uint32_t console_session_uid(void)
     return (uint32_t)st.st_uid;
 }
 
+// Bounded handshake probe against the payload's socket. The loader's exit
+// status is NOT sufficient: it reports success whenever the remote thread
+// starts, before its dlopen thread runs, so a no-op dlopen (a path already
+// mapped in Dock) or a silently rejected payload still exits 0. A compatible
+// payload answers `rovr-sa-2.*` on /tmp/rovr-<console-uid>/sa.sock.
+static int probe_sa_handshake(void)
+{
+    uint32_t uid = console_session_uid();
+    if (uid == UINT32_MAX) return 0;
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/rovr-%u/sa.sock", uid);
+
+    for (int attempt = 0; attempt < 20; ++attempt) { // ~2 s
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr = {0};
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                // Handshake frame: [i16 LE len = 3 + payload_len][u8 opcode 0x01].
+                char frame[3] = { 3, 0, 0x01 };
+                if (send(fd, frame, sizeof(frame), 0) == (ssize_t)sizeof(frame)) {
+                    char buf[256] = {0};
+                    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+                    if (n > 0 && strncmp(buf, "rovr-sa-2.", 10) == 0) {
+                        close(fd);
+                        return 1;
+                    }
+                }
+            }
+            close(fd);
+        }
+        usleep(100000);
+    }
+    return 0;
+}
+
 // Run the fixed loader against the fixed payload with a minimal, fixed
 // environment. No caller-controlled argv, env, or cwd.
 static int run_injection(pid_t dock_pid)
@@ -120,7 +162,13 @@ static int run_injection(pid_t dock_pid)
     for (int i = 0; i < 100; ++i) {
         pid_t got = waitpid(child, &status, WNOHANG);
         if (got == child) {
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return ROVR_SA_ST_OK;
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                // Loader exited 0, but that only means the remote thread
+                // started. Confirm the payload actually answers before
+                // claiming success, so a no-op or rejected injection is
+                // reported honestly.
+                return probe_sa_handshake() ? ROVR_SA_ST_OK : ROVR_SA_ST_INJECTION_FAILED;
+            }
             return ROVR_SA_ST_INJECTION_FAILED;
         }
         if (got < 0) return ROVR_SA_ST_INTERNAL;

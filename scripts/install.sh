@@ -138,8 +138,16 @@ cat > "$PLIST" <<PLIST
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <!-- Restart on a crash (non-zero exit), not on a deliberate clean exit
+       (SIGTERM persists state and exits 0), and throttle respawns so a crash
+       loop cannot hammer the machine. -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>20</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>

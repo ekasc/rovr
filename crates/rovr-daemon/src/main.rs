@@ -28,7 +28,6 @@ use rovr_protocol::{
 };
 use rovr_types::{Capabilities, DisplayId, PublicState, SpaceId, WindowId};
 
-mod hotkey;
 mod sketchybar;
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -36,12 +35,13 @@ use tracing_subscriber::EnvFilter;
 /// Bounded per-subscriber backlog. A subscriber that falls this far behind is
 /// evicted (its channel is full), so the state loop never blocks on it.
 const SUBSCRIBER_BACKLOG: usize = 64;
-const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const WINDOW_CREATED_EVENT_KIND: u32 = 1;
 const WINDOW_FOCUSED_EVENT_KIND: u32 = 2;
 const WINDOW_DESTROYED_EVENT_KIND: u32 = 4;
 const DRAG_ENDED_EVENT_KIND: u32 = 8;
 const WINDOW_TITLE_CHANGED_EVENT_KIND: u32 = 16;
+const SYSTEM_WOKE_EVENT_KIND: u32 = 32;
 
 fn event_requests_immediate_refresh(event_kind: u32) -> bool {
     event_kind == WINDOW_CREATED_EVENT_KIND
@@ -49,6 +49,112 @@ fn event_requests_immediate_refresh(event_kind: u32) -> bool {
         || event_kind == WINDOW_DESTROYED_EVENT_KIND
         || event_kind == DRAG_ENDED_EVENT_KIND
         || event_kind == WINDOW_TITLE_CHANGED_EVENT_KIND
+        || event_kind == SYSTEM_WOKE_EVENT_KIND
+}
+
+// ---- Process lifecycle: shutdown signals + liveness watchdog --------------
+//
+// Two availability holes this closes:
+//  * SIGPIPE was not ignored, so a client closing mid-write could terminate
+//    the daemon by default disposition.
+//  * A state loop that is ALIVE but not progressing (wedged in a blocking
+//    call) keeps the process up, so launchd's KeepAlive can never restart it.
+//    A heartbeat + watchdog turns a permanent wedge into a bounded restart.
+
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// Milliseconds (since start) of the last successful observation cycle, and
+/// the number of consecutive cycles that failed. Both surface in `doctor` so a
+/// stale observation or a failing reconcile is visible without reading logs.
+static LAST_OBSERVATION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECONCILE_FAILURE_STREAK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Milliseconds since process start. `PROCESS_START` is set in `main` before
+/// any thread that reads it starts.
+fn uptime_ms() -> u64 {
+    PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Called once per state-loop iteration; the watchdog reads it.
+fn note_state_loop_progress() {
+    HEARTBEAT_MS.store(uptime_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+const SIG_IGN: usize = 1;
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGPIPE: i32 = 13;
+const SIGTERM: i32 = 15;
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+extern "C" fn handle_shutdown_signal(_signum: i32) {
+    // Async-signal-safe: one atomic store, nothing else.
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // SIGPIPE ignored; SIGTERM/SIGINT/SIGHUP request a clean shutdown
+    // (persist state, exit 0) so launchd's KeepAlive={SuccessfulExit=false}
+    // leaves the daemon stopped instead of restarting it.
+    let handler = handle_shutdown_signal as extern "C" fn(i32) as usize;
+    unsafe {
+        signal(SIGPIPE, SIG_IGN);
+        signal(SIGTERM, handler);
+        signal(SIGINT, handler);
+        signal(SIGHUP, handler);
+    }
+}
+
+/// The slowest legitimate synchronous state-loop work is a bounded SA focus
+/// retry (~3 s) plus observation (~0.5 s); the loop also sleeps up to one
+/// reconcile interval between ticks. The watchdog threshold clears both.
+const WATCHDOG_MIN_STALE_MS: u64 = 15_000;
+const WATCHDOG_POLL_MS: u64 = 2_000;
+
+/// Staleness threshold: clear of the longest legitimate synchronous work AND
+/// of one full reconcile sleep between ticks.
+fn watchdog_stale_ms(interval: Duration) -> u64 {
+    WATCHDOG_MIN_STALE_MS.max(interval.as_millis() as u64 * 2)
+}
+
+fn heartbeat_stale(now_ms: u64, last_ms: u64, stale_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) > stale_ms
+}
+
+fn spawn_state_watchdog(interval: Duration) {
+    let stale_ms = watchdog_stale_ms(interval);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS));
+        if shutdown_requested() {
+            return;
+        }
+        let now = uptime_ms();
+        let last = HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if heartbeat_stale(now, last, stale_ms) {
+            error!(
+                stale_ms = now - last,
+                "state loop heartbeat stale; exiting so launchd restarts the daemon"
+            );
+            std::process::exit(1);
+        }
+    });
+}
+
+/// Reconcile cadence: the configured interval, floored at the recovery tick.
+fn reconcile_interval(config: &Config) -> Duration {
+    Duration::from_millis(config.general.reconcile_interval_ms.max(100)).max(MIN_RECOVERY_INTERVAL)
 }
 
 #[derive(Default)]
@@ -149,6 +255,25 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "rovr=info".into()))
         .init();
 
+    // A panic in ANY thread must land in the daemon log, not only on stderr
+    // (launchd points stderr at a file that has stayed empty across every
+    // observed death). The hook runs before unwinding; the state loop also
+    // catches its own panics so one bad tick cannot take the daemon down.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        error!(location = %location, panic = %message, "panic");
+    }));
+    install_signal_handlers();
+
     let args = Args::parse();
     let _foreground = args.foreground;
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
@@ -225,11 +350,15 @@ fn make_platform() -> Result<Box<dyn Platform>> {
     Ok(Box::new(MockPlatform::default()))
 }
 
-/// Binds the IPC socket, then splits work across threads (blocker 6):
-/// - MAIN thread: creates the global hotkey manager (Carbon event target
-///   requires the main thread) and runs the AppKit event loop so hotkeys fire.
+/// Binds the IPC socket, then splits work across threads:
+/// - MAIN thread: runs the platform event loop (services AX/SLS/NSWorkspace
+///   notification sources attached to the main run loop).
 /// - accept thread: UnixListener::incoming + per-client handler threads.
 /// - state thread: the single owner of engine/platform mutable state.
+/// - monitor thread: exits the process if the state loop dies (zombie guard).
+///
+/// Global hotkeys belong to skhd, so there is no AppKit UI loop — but the run
+/// loop is still required for the platform's event sources.
 fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(&path) {
         let ft = meta.file_type();
@@ -256,10 +385,6 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     info!(socket = %path.display(), "rovr daemon listening");
 
-    // Built-in hotkey manager MUST be created on the main thread. It is kept
-    // alive by the AppKit event loop below for the daemon's lifetime.
-    let hotkey_manager = hotkey::create_hotkey_manager(daemon.config.clone(), path.clone());
-
     let subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
     // Bounded request queue: a flood of clients applies backpressure at the
     // socket instead of growing memory without limit while the state loop is
@@ -268,16 +393,20 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
 
     // AX event trampolines push a Refresh envelope through this so the state
     // loop wakes instantly instead of waiting for the next tick. try_send
-    // only: a full queue must never block the AppKit event loop.
+    // only: a full queue must never block the event-trampoline thread.
     let _ = EVENT_TX.set(tx.clone());
 
-    // State loop on its own thread (single owner of daemon state).
+    // State loop on its own thread (single owner of daemon state). Keep the
+    // handle: the process must not outlive its state owner (see below).
+    let interval = reconcile_interval(&daemon.config);
     let subs_for_loop = subscribers.clone();
-    thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
+    let state_handle = thread::spawn(move || state_loop(daemon, rx, subs_for_loop));
+    // Trip if the state loop stops advancing (a wedge launchd cannot see).
+    spawn_state_watchdog(interval);
 
     // Socket accept loop off the main thread.
     let subs_for_accept = subscribers.clone();
-    let _accept_handle = thread::spawn(move || {
+    let accept_handle = thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -294,16 +423,23 @@ fn run_daemon(path: PathBuf, daemon: Daemon) -> Result<()> {
         }
     });
 
-    // Main thread: pump the AppKit/CFRunLoop event loop forever so global
-    // hotkeys are delivered. Never returns while the daemon lives.
-    #[cfg(target_os = "macos")]
-    hotkey::run_appkit_event_loop(hotkey_manager);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = hotkey_manager;
-        let _ = _accept_handle.join();
-    }
-    #[cfg(not(target_os = "macos"))]
+    // Main thread runs the platform event loop, NOT a join. The AX observer
+    // and SLS/NSWorkspace notification sources are attached to the main run
+    // loop (bridge.m); without running it those events never deliver and every
+    // change waits for the recovery tick — the seconds-late spawn tiling. A
+    // dedicated monitor thread keeps the zombie guarantee: when the state loop
+    // exits (channel disconnect or panic) the process must die so launchd
+    // restarts a healthy daemon.
+    let _ = accept_handle;
+    thread::spawn(move || {
+        let state_result = state_handle.join();
+        error!(
+            panicked = state_result.is_err(),
+            "state loop exited; exiting so launchd restarts the daemon"
+        );
+        std::process::exit(1);
+    });
+    rovr_platform::run_event_loop();
     Ok(())
 }
 
@@ -416,8 +552,7 @@ fn state_loop(
     rx: Receiver<Envelope>,
     subscribers: Arc<Mutex<Vec<SyncSender<Notification>>>>,
 ) {
-    let interval = Duration::from_millis(daemon.config.general.reconcile_interval_ms.max(100))
-        .max(MIN_RECOVERY_INTERVAL);
+    let interval = reconcile_interval(&daemon.config);
     state_loop_with_interval(daemon, rx, subscribers, interval);
 }
 
@@ -432,16 +567,21 @@ fn state_loop_with_interval(
     // connections while the daemon is idle, so the user's FIRST switch is as
     // fast as every other one (cold-start stall regression).
     let t_warm = std::time::Instant::now();
-    if daemon.refresh_observation() {
-        deliver_notification(&subscribers, &Notification::StateChanged);
+    let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if daemon.refresh_observation() {
+            deliver_notification(&subscribers, &Notification::StateChanged);
+        }
+        // Publish the first external snapshot for consumers that are already
+        // subscribed when ROVR starts. (Late consumers initialize through
+        // `rovr query --current`, not through this.)
+        daemon.maybe_publish_public_state();
+        // Subscribe title changes on the focused window so its edits wake the
+        // loop promptly instead of waiting for the recovery tick.
+        daemon.sync_title_tracking();
+    }));
+    if warmed.is_err() {
+        error!("state loop: panic during startup warm-up; continuing");
     }
-    // Publish the first external snapshot for consumers that are already
-    // subscribed when ROVR starts. (Late consumers initialize through
-    // `rovr query --current`, not through this.)
-    daemon.maybe_publish_public_state();
-    // Subscribe title changes on the focused window so its edits wake the
-    // loop promptly instead of waiting for the recovery tick.
-    daemon.sync_title_tracking();
     tracing::debug!(
         warmup_ms = t_warm.elapsed().as_millis() as u64,
         "startup observation warm-up complete"
@@ -449,6 +589,15 @@ fn state_loop_with_interval(
     let mut next_observation = std::time::Instant::now() + interval;
     let mut next_heartbeat = std::time::Instant::now() + interval;
     loop {
+        // A clean shutdown request (SIGTERM/SIGINT/SIGHUP) persists state and
+        // exits 0 so launchd leaves the daemon stopped.
+        if shutdown_requested() {
+            info!("shutdown signal received; persisting state and exiting");
+            daemon.persist_state();
+            std::process::exit(0);
+        }
+        // Liveness: the watchdog trips if this stops advancing.
+        note_state_loop_progress();
         // Service deadlines even when the request queue never becomes idle.
         let now = std::time::Instant::now();
         if now >= next_heartbeat {
@@ -457,16 +606,24 @@ fn state_loop_with_interval(
         }
         if now >= next_observation {
             let t_obs = std::time::Instant::now();
-            daemon.engine.abandon_pending_space_cursors();
-            if daemon.refresh_observation() {
-                deliver_notification(&subscribers, &Notification::StateChanged);
+            // A panic here must not kill the daemon: contain it, log it (the
+            // panic hook records the message), and let the next tick re-derive
+            // state from fresh observation.
+            let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                daemon.engine.abandon_pending_space_cursors();
+                if daemon.refresh_observation() {
+                    deliver_notification(&subscribers, &Notification::StateChanged);
+                }
+                // Independent of the IPC hint above: title-only changes produce
+                // no reconcile actions, yet the public snapshot DID change and
+                // must still publish. Dedup suppresses identical snapshots.
+                daemon.maybe_publish_public_state();
+                // Focus may have moved; retarget the title subscription.
+                daemon.sync_title_tracking();
+            }));
+            if observed.is_err() {
+                error!("state loop: panic during periodic observation; continuing");
             }
-            // Independent of the IPC hint above: title-only changes produce
-            // no reconcile actions, yet the public snapshot DID change and
-            // must still publish. Dedup suppresses identical snapshots.
-            daemon.maybe_publish_public_state();
-            // Focus may have moved; retarget the title subscription.
-            daemon.sync_title_tracking();
             let obs_ms = t_obs.elapsed().as_millis() as u64;
             if obs_ms > 100 {
                 tracing::info!(obs_ms, "slow periodic observation");
@@ -480,7 +637,10 @@ fn state_loop_with_interval(
         let envelope = match rx.recv_timeout(wait) {
             Ok(envelope) => envelope,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                error!("state loop: request channel disconnected");
+                break;
+            }
         };
         if envelope.event_wake {
             daemon.refresh_wake.acknowledge();
@@ -499,17 +659,23 @@ fn state_loop_with_interval(
             Command::Window(command) if window_command_defaults_to_focus(command) => true,
             _ => false,
         };
+        let request_id = envelope.request.id;
         let t_handle = std::time::Instant::now();
-        let result = daemon.handle(envelope.request);
-        // The published snapshot must equal current state at publish time.
-        // Several internal events may land during one transition (observation
-        // + verify + reconcile); dedup keeps only the net externally visible
-        // change. Runs after EVERY request so focus/space/title transitions
-        // driven by commands publish without extra polling.
-        daemon.maybe_publish_public_state();
-        // Keep the title subscription on the focused window, whatever the
-        // request just did.
-        daemon.sync_title_tracking();
+        // Contain a panic so one bad request cannot take the daemon down; the
+        // client still gets a response instead of a dead socket.
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = daemon.handle(envelope.request);
+            // The published snapshot must equal current state at publish time.
+            // Several internal events may land during one transition (observation
+            // + verify + reconcile); dedup keeps only the net externally visible
+            // change. Runs after EVERY request so focus/space/title transitions
+            // driven by commands publish without extra polling.
+            daemon.maybe_publish_public_state();
+            // Keep the title subscription on the focused window, whatever the
+            // request just did.
+            daemon.sync_title_tracking();
+            result
+        }));
         if observes_internally {
             next_observation = std::time::Instant::now() + interval;
         }
@@ -518,10 +684,22 @@ fn state_loop_with_interval(
             queue_wait_ms,
             "envelope handled"
         );
-        let _ = envelope.response.send(result.response);
-        for notif in &result.notifications {
-            deliver_notification(&subscribers, notif);
-        }
+        let response = match handled {
+            Ok(result) => {
+                for notif in &result.notifications {
+                    deliver_notification(&subscribers, notif);
+                }
+                result.response
+            }
+            Err(_) => {
+                error!(
+                    id = request_id,
+                    "state loop: panic handling request; responding with error"
+                );
+                Response::error(request_id, "INTERNAL", "internal error")
+            }
+        };
+        let _ = envelope.response.send(response);
     }
 }
 
@@ -688,6 +866,15 @@ impl Daemon {
                 let sa_reinject = None;
                 let snapshot_wedged_ms = self.platform.snapshot_wedged_ms();
                 let ax_degraded_now = ax_control_degraded(&self.platform.capabilities());
+                // Liveness/staleness: a wedged state loop or a failing reconcile
+                // must be visible here, not inferred from logs and `sample`.
+                let heartbeat_age_ms = uptime_ms()
+                    .saturating_sub(HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed));
+                let last_obs = LAST_OBSERVATION_MS.load(std::sync::atomic::Ordering::Relaxed);
+                let last_observation_age_ms =
+                    (last_obs != 0).then(|| uptime_ms().saturating_sub(last_obs));
+                let reconcile_failure_streak =
+                    RECONCILE_FAILURE_STREAK.load(std::sync::atomic::Ordering::Relaxed);
                 HandleResult::ok(
                 id,
                 json!({
@@ -710,6 +897,11 @@ impl Daemon {
                         "helper_socket": d.helper_socket,
                     })),
                     "snapshot_wedged_ms": snapshot_wedged_ms,
+                    "health": {
+                        "state_loop_heartbeat_age_ms": heartbeat_age_ms,
+                        "last_observation_age_ms": last_observation_age_ms,
+                        "reconcile_failure_streak": reconcile_failure_streak,
+                    },
                     "generation": self.engine.observed.generation,
                     "refresh_required": self.engine.observed.refresh_required,
                     "windows": self.engine.observed.windows.len(),
@@ -1219,17 +1411,6 @@ impl Daemon {
                     }
                     match Config::load(&raw) {
                         Ok(config) => {
-                            // Hotkeys must follow the reloaded config — without
-                            // this, new/changed [[bind]] entries only applied
-                            // on daemon restart (the dead-code warnings were
-                            // pointing at exactly this gap).
-                            if let Err(err) = hotkey::reload(&config) {
-                                return HandleResult::err(
-                                    id,
-                                    "CONFIG_ERROR",
-                                    format!("hotkey update failed: {err}"),
-                                );
-                            }
                             self.config = config.clone();
                             self.config_path = raw;
                             match self.reload_config_and_self_heal(config) {
@@ -1328,12 +1509,15 @@ impl Daemon {
         // bounded by one cheap cycle rather than reintroduced.
         match self.platform.snapshot() {
             Ok(snapshot) => {
+                LAST_OBSERVATION_MS.store(uptime_ms(), std::sync::atomic::Ordering::Relaxed);
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
+                let mut reconcile_ok = true;
                 if !actions.is_empty() {
                     // Tracked: a failed CreateSpace here must release its
                     // reservation (retry next cycle) rather than wedge the
                     // single-flight slot; failed destroys recompute.
                     self.execute_tracked(actions).unwrap_or_else(|err| {
+                        reconcile_ok = false;
                         self.engine
                             .flight_recorder
                             .record("platform.error", err.to_string());
@@ -1341,8 +1525,14 @@ impl Daemon {
                     });
                     changed = true;
                 }
+                if reconcile_ok {
+                    RECONCILE_FAILURE_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    RECONCILE_FAILURE_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Err(err) => {
+                RECONCILE_FAILURE_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.engine
                     .flight_recorder
                     .record("snapshot.error", err.to_string());
@@ -1717,10 +1907,6 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
 static EVENT_TX: std::sync::OnceLock<mpsc::SyncSender<Envelope>> = std::sync::OnceLock::new();
 
 fn default_socket_path() -> PathBuf {
-    // Shared helper: /tmp/rovr-<getuid()>/daemon.sock — the SAME runtime
-    // directory and uid keying as the SA socket. ($UID is not consulted:
-    // launchd environments omit it, so env-based keying would desync the
-    // daemon from its CLI.)
     rovr_platform::daemon_socket_path()
 }
 
@@ -1952,6 +2138,100 @@ mod tests {
     /// (install/reinjection) or disappearing (uninstall) while the daemon runs.
     /// Capability state and the execution log live behind shared handles so
     /// the test can flip capabilities after the platform is boxed into a Daemon.
+    /// A platform that panics on every observation. Regression harness for the
+    /// silent state-loop death: a panicking tick must be contained, not fatal.
+    struct PanicOnSnapshotPlatform {
+        observed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Platform for PanicOnSnapshotPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            self.observed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("snapshot panic (test)");
+        }
+
+        fn execute(&mut self, _action: &Action) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn state_loop_survives_a_panicking_observation_and_still_serves_requests() {
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut daemon = test_daemon();
+        daemon.platform = Box::new(PanicOnSnapshotPlatform {
+            observed: observed.clone(),
+        });
+
+        let (tx, rx) = mpsc::sync_channel::<Envelope>(8);
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let handle = thread::spawn(move || {
+            state_loop_with_interval(daemon, rx, subscribers, Duration::from_millis(10))
+        });
+
+        // The periodic path must panic at least once without killing the loop.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while observed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observation never ran"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // The loop must still be alive and answer a request.
+        let (response_tx, response_rx) = mpsc::channel();
+        tx.send(Envelope {
+            request: Request::new(7, Command::Ping),
+            response: response_tx,
+            queued_at: std::time::Instant::now(),
+            event_wake: false,
+        })
+        .expect("state loop must still accept requests after a panic");
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("state loop must still answer after a panic");
+        assert_eq!(response.id, 7);
+
+        // Dropping the last sender disconnects the channel and the loop exits.
+        drop(tx);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn reconcile_interval_honors_config_and_floors_at_one_second() {
+        let mut config = Config::default();
+        config.general.reconcile_interval_ms = 1000;
+        assert_eq!(reconcile_interval(&config), Duration::from_millis(1000));
+        // Below the floor: the watchdog never runs faster than 1 s.
+        config.general.reconcile_interval_ms = 250;
+        assert_eq!(reconcile_interval(&config), Duration::from_secs(1));
+        // Above the floor: the configured value is used verbatim.
+        config.general.reconcile_interval_ms = 4000;
+        assert_eq!(reconcile_interval(&config), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn watchdog_threshold_clears_normal_stalls_and_interval() {
+        // Normal synchronous work (~3 s) and a full reconcile sleep between
+        // ticks must not trip the watchdog.
+        assert_eq!(watchdog_stale_ms(Duration::from_secs(5)), 15_000);
+        assert_eq!(watchdog_stale_ms(Duration::from_secs(30)), 60_000);
+    }
+
+    #[test]
+    fn heartbeat_staleness_is_strictly_greater_than_threshold() {
+        assert!(!heartbeat_stale(15_000, 0, 15_000));
+        assert!(heartbeat_stale(15_001, 0, 15_000));
+        // A backwards clock (saturating subtraction) is never stale.
+        assert!(!heartbeat_stale(0, 100, 15_000));
+    }
+
     struct MutableCapPlatform {
         create_space: Arc<std::sync::atomic::AtomicBool>,
         snapshot: PlatformSnapshot,
@@ -2450,6 +2730,29 @@ mod tests {
                 .is_some_and(|r| r.get("sa_reinject").is_some()),
             "doctor must include the sa_reinject lifecycle section: {value}"
         );
+    }
+
+    /// Doctor exposes the liveness/staleness surface so a wedged state loop or
+    /// a failing reconcile is visible without reading logs and `sample`.
+    #[test]
+    fn doctor_exposes_health_surface() {
+        let mut daemon = test_daemon();
+        let result = daemon.handle(Request::new(9, Command::Doctor));
+        let value = serde_json::to_value(&result.response).expect("serialize doctor response");
+        let health = value
+            .get("result")
+            .and_then(|r| r.get("health"))
+            .unwrap_or_else(|| panic!("doctor must include the health section: {value}"));
+        for field in [
+            "state_loop_heartbeat_age_ms",
+            "last_observation_age_ms",
+            "reconcile_failure_streak",
+        ] {
+            assert!(
+                health.get(field).is_some(),
+                "health.{field} missing: {value}"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,8 @@ use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 /// A window is tileable when the WM manages it and it is not fullscreen
 /// and not minimized. `managed` and `minimized` are conservative: Unknown
 /// means not tileable (avoids tiling a minimized window when AX timed out).
+/// A fixed-size window (AX size not settable, e.g. Calculator) is reported
+/// unmanaged by the platform, so it floats here instead of being fought.
 /// `fullscreen` is permissive (Unknown treated as not fullscreen) because the
 /// Space type already excludes fullscreen spaces; the SLS fallback resolves
 /// managed for background apps.
@@ -59,6 +61,26 @@ fn matches_float_rule(
 ) -> bool {
     for rule in rules {
         let Some(true) = rule.floating else { continue };
+        if window_matches_rule(w, rule, observed, workspaces) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A window is ignored entirely when some `manage == Some(false)` rule matches.
+/// Ignored windows are neither tiled nor moved nor given cosmetic actions; they
+/// remain observable. This is checked before every other rule effect so an
+/// ignore rule wins regardless of config order or other rules that would
+/// otherwise match the same window.
+fn matches_ignore_rule(
+    w: &WindowSnapshot,
+    rules: &[CompiledRule],
+    observed: &ObservedState,
+    workspaces: &WorkspaceRegistry,
+) -> bool {
+    for rule in rules {
+        let Some(false) = rule.manage else { continue };
         if window_matches_rule(w, rule, observed, workspaces) {
             return true;
         }
@@ -131,7 +153,7 @@ fn matches_open_scratchpad(
     })
 }
 
-fn inset_area(area: Rect, padding: f64) -> Option<Rect> {
+pub(crate) fn inset_area(area: Rect, padding: f64) -> Option<Rect> {
     let w = area.width - padding * 2.0;
     let h = area.height - padding * 2.0;
     if w <= 0.0 || h <= 0.0 {
@@ -204,6 +226,15 @@ pub fn apply_layout(
 
     let mut by_space: HashMap<SpaceId, (DisplayId, Rect, Vec<WindowId>)> = HashMap::new();
     for w in observed.windows.values() {
+        // `manage = false`: leave the window completely alone — no tiling, no
+        // workspace move, no cosmetic action. Space was already cleared above;
+        // clear any stale frame so reconcile emits nothing for this window.
+        if matches_ignore_rule(w, rules, observed, workspaces) {
+            if let Some(t) = desired.windows.get_mut(&w.id) {
+                t.frame = None;
+            }
+            continue;
+        }
         // Rule-driven workspace move: evaluated every snapshot, deterministic.
         // This writes desired.space so reconcile will move the window.
         if let Some(target) = target_workspace_for_window(w, rules, observed, workspaces) {
@@ -689,6 +720,17 @@ mod tests {
                 rovr_types::ObservedBool::Unknown,
             ),
         );
+        // Fixed-size window (AX size not settable): the platform reports it
+        // unmanaged, so it must never be tiled — it floats.
+        observed.windows.insert(
+            WindowId(4),
+            mk(
+                4,
+                rovr_types::ObservedBool::No,
+                rovr_types::ObservedBool::No,
+                rovr_types::ObservedBool::No,
+            ),
+        );
 
         let mut desired = DesiredState::default();
         apply_layout(
@@ -723,6 +765,11 @@ mod tests {
             desired.windows.get(&WindowId(3)).and_then(|t| t.frame),
             None,
             "window 3 with Unknown minimized must not be tiled (conservative)"
+        );
+        assert_eq!(
+            desired.windows.get(&WindowId(4)).and_then(|t| t.frame),
+            None,
+            "window 4 with managed No (fixed-size) must not be tiled"
         );
     }
     /// M3c: a window whose bundle id matches a `float = true` rule is skipped
@@ -1157,6 +1204,94 @@ mod tests {
             desired2.windows[&WindowId(1)].space,
             None,
             "rule-derived workspace target must disappear when the rule stops matching"
+        );
+    }
+
+    /// `manage = false` ignores a matching window completely: it is neither
+    /// tiled nor moved, even when the same rule names a target workspace.
+    #[test]
+    fn manage_false_rule_ignores_window() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                app: Some(r"^com\.tinyspeck\.slackmacgap$".into()),
+                manage: Some(false),
+                target_workspace: Some("chat".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rules = config.compile_rules().unwrap();
+        let mut workspaces = crate::workspace::WorkspaceRegistry::default();
+        workspaces.0.insert(
+            "chat".into(),
+            crate::workspace::WorkspaceState {
+                name: "chat".into(),
+                persistent: true,
+                backing: Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) }),
+                desired_display: None,
+                ordinal: 0,
+                last_position: None,
+                dynamic: false,
+            },
+        );
+
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed_for_rule_tests(),
+            &mut desired,
+            &mut Layouts::new(),
+            &workspaces,
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+            false,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
+            None,
+            "ignored window must not be tiled"
+        );
+        assert_eq!(
+            desired.windows[&WindowId(1)].space,
+            None,
+            "ignored window must not be moved by a target_workspace rule"
+        );
+    }
+
+    /// `manage = true` (and an absent `manage`) leaves the window managed.
+    #[test]
+    fn manage_true_rule_leaves_window_managed() {
+        let config = Config {
+            rules: vec![RuleConfig {
+                app: Some(r"^com\.tinyspeck\.slackmacgap$".into()),
+                manage: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rules = config.compile_rules().unwrap();
+        let mut desired = DesiredState::default();
+        apply_layout(
+            &config,
+            &observed_for_rule_tests(),
+            &mut desired,
+            &mut Layouts::new(),
+            &crate::workspace::WorkspaceRegistry::default(),
+            &rovr_layout_plugin::Registry::new(),
+            &ScratchpadState::new(),
+            &rules,
+            false,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(1))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "manage = true must not ignore the window"
         );
     }
 

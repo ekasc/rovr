@@ -173,6 +173,11 @@ enum {
     // so the status snapshot updates without waiting for the periodic
     // recovery tick.
     ROVR_EVENT_WINDOW_TITLE_CHANGED = 16,
+    // The system woke from sleep. Displays, Spaces and window positions can
+    // all be stale after a wake, so this forces an immediate full refresh —
+    // the same discontinuity class as a display reconfiguration. Without it,
+    // Rovr trusts post-wake state that macOS routinely corrupts.
+    ROVR_EVENT_SYSTEM_WOKE = 32,
 };
 
 typedef void (*rovr_ax_event_trampoline_fn)(int event_kind, uint32_t window_id);
@@ -883,6 +888,18 @@ static int rovr_ax_managed_for_window(AXUIElementRef window) {
         if (role) CFRelease(role);
         return 2;
     }
+    // Fixed-size windows (Calculator, iPhone Mirroring, most "about" panels)
+    // cannot accept a tiled frame: their AXSize attribute is not settable, so
+    // no tile will ever stick. Mark them unmanaged so they float from the
+    // first observation instead of being re-targeted every reconcile cycle
+    // and only auto-floating after several wasted attempts. A failed query
+    // (timeout) does NOT unmanage — only a successful "not settable".
+    Boolean size_settable = false;
+    if (AXUIElementIsAttributeSettable(window, kAXSizeAttribute, &size_settable) ==
+            kAXErrorSuccess &&
+        !size_settable) {
+        return 0;
+    }
     CFTypeRef subrole = NULL;
     if (AXUIElementCopyAttributeValue(window, kAXSubroleAttribute, &subrole) == kAXErrorSuccess && subrole) {
         BOOL floating = NO;
@@ -1013,6 +1030,62 @@ static const char *ROVR_SKYLIGHT_PATH =
 
 static void rovr_install_mouse_tap(void);
 
+// Sleep/wake: NSWorkspace is the only signal for a system wake that does not
+// involve a display reconfiguration (e.g. a laptop lid opening on the built-in
+// display). Without it, post-wake state is trusted stale. The wake handler
+// marks the observation dirty and fires the event trampoline so the daemon
+// refreshes immediately; the sleep handler only marks dirty, so the first
+// observation after a missed wake notification is still a full refresh.
+static void rovr_install_workspace_observers(void) {
+    NSNotificationCenter *center = [[NSWorkspace sharedWorkspace] notificationCenter];
+    [center addObserverForName:NSWorkspaceDidWakeNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+        (void)note;
+        atomic_store(&g_needs_refresh, 1);
+        if (g_event_trampoline) g_event_trampoline(ROVR_EVENT_SYSTEM_WOKE, 0);
+    }];
+    [center addObserverForName:NSWorkspaceWillSleepNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+        (void)note;
+        atomic_store(&g_needs_refresh, 1);
+    }];
+    // A newly launched app has no AX observer yet — observers are installed
+    // DURING observation — so its kAXCreatedNotification cannot fire and the
+    // window would wait for the recovery tick to be tiled. Arm an observer for
+    // the app and wake the loop immediately on launch. Termination only marks
+    // dirty and wakes: the destroyed path reconciles from a fresh snapshot.
+    [center addObserverForName:NSWorkspaceDidLaunchApplicationNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+        NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
+        if (app) rovr_observe_app(app.processIdentifier);
+        atomic_store(&g_needs_refresh, 1);
+        if (g_event_trampoline) g_event_trampoline(ROVR_EVENT_WINDOW_CREATED, 0);
+    }];
+    [center addObserverForName:NSWorkspaceDidTerminateApplicationNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+        (void)note;
+        atomic_store(&g_needs_refresh, 1);
+        if (g_event_trampoline) g_event_trampoline(ROVR_EVENT_WINDOW_DESTROYED, 0);
+    }];
+}
+
+// Services the run loop that every AX observer source and the SLS / NSWorkspace
+// notification sources are attached to (CFRunLoopGetMain). The daemon calls
+// this on its main thread; without it those sources never deliver and every
+// change falls back to the recovery tick (seconds late). Never returns under
+// normal operation — shutdown is a process exit from the state loop/watchdog.
+void rovr_bridge_run_event_loop(void) {
+    CFRunLoopRun();
+}
+
 int rovr_bridge_init(void) {
     g_ax_get_window = (rovr_ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
     g_sls_main_connection = (rovr_sls_main_connection_fn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
@@ -1068,6 +1141,7 @@ int rovr_bridge_init(void) {
         ROVR_SKYLIGHT_PATH,
         "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation");
     CGDisplayRegisterReconfigurationCallback(rovr_display_reconfiguration_callback, NULL);
+    rovr_install_workspace_observers();
     rovr_install_mouse_tap();
     return 0;
 }
@@ -1243,6 +1317,15 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
                                 window.title, sizeof(window.title));
             NSRunningApplication *application =
                 [NSRunningApplication runningApplicationWithProcessIdentifier:owner_pid];
+            // Only regular apps own tileable windows. Accessory/system agents
+            // (menu-bar extras, loginwindow, Notification Centre, AutoFill)
+            // expose placeholder CGWindows that belong to no Space and can
+            // never be tiled; yabai gates observation on this same policy. An
+            // app that is momentarily Accessory while launching is picked up
+            // on a later snapshot once it becomes Regular.
+            if (application && application.activationPolicy != NSApplicationActivationPolicyRegular) {
+                continue;
+            }
             if (application.bundleIdentifier) {
                 [application.bundleIdentifier getCString:window.bundle_id
                                                maxLength:sizeof(window.bundle_id)
