@@ -4,7 +4,8 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
 
 ## Socket namespace
 
-- Rovr uses the user-owned `0700` runtime directory `/tmp/rovr-<uid>/`. The daemon socket is `daemon.sock`; the Dock payload socket is `sa.sock`. UID comes from `getuid()`, not `$USER`. Clients validate socket ownership and kernel peer credentials.
+- The Dock payload and its Rust client use the user-owned `0700` runtime directory `/tmp/rovr-<uid>/` with socket `sa.sock`. UID comes from `getuid()`, not `$USER`. Clients validate socket ownership and kernel peer credentials.
+- The DAEMON socket is not in that directory. It is `$HOME/Library/Caches/rovr/daemon.sock` (mode 0600, directory 0700), because `com.apple.tmp_cleaner` deletes `/tmp` entries whose atime, mtime and ctime are all older than 3 days, and a bound Unix socket's timestamps never advance. The SA socket keeps its `/tmp` path because relocating it means rebuilding and reinstalling the payload dylib.
 
 ## Protocol
 
@@ -117,3 +118,34 @@ The payload, loader, helper and install lifecycle compile and the protocol clien
 - macOS 27 support verified on 27.0 (26A428, M2 arm64e): the payload accepts major version 27 and resolves the Dock symbols from per-build offsets read out of the shipped Dock binary. Injecting the rebuilt payload into the live Dock moved the handshake from `0x7c0`, with create/destroy/reorder/focus Space missing, to `0x7ff` with all four present.
 
 **Still unverified:** reboot recovery (helper-driven reinjection after a cold boot) and the update-simulation path (installing a rebuilt payload over a running one). Until demonstrated, those remain `[~]`.
+
+### Resolution (2026-10-02, macOS 27.0 26A428, Dock 2571.0.6.402)
+
+Two separate faults were found and fixed:
+
+- **The payload could abort Dock.** `Dock-2026-10-02-164750.ips` recorded
+  `EXC_CRASH / SIGABRT` with the faulting stack
+  `librovr_sa_payload.dylib handle_connection` → `Dock +0x18c594` (inside the
+  resolved `move_space`) → `-[NSObject doesNotRecognizeSelector:]` →
+  `objc_exception_throw` → `std::terminate` → `abort()`. Every opcode dispatch
+  is now wrapped in `@try/@catch` (a bad call degrades to
+  `SA_STATUS_UNSUPPORTED`), and `dock.spaces` / `dppm` are rejected with
+  `respondsToSelector:` when they are not the expected objects. A bad resolution
+  can no longer kill Dock.
+- **A stale payload cannot be evicted from a running Dock.** `dlopen` of an
+  already-mapped path is a no-op, so re-injecting after replacing the installed
+  dylib silently did nothing and the daemon reported `handshake_timeout`. Only a
+  Dock restart clears the mapping.
+
+After restarting Dock and letting reinjection load the guarded payload into the
+fresh process, macOS 27 support is **op-level verified**: `rovr sa status` =
+`injected_compatible`, attribs `0x000007ff`, and the full Space lifecycle was
+exercised live — `create` (new Space appears), `move` (Space reorders to the
+intended slot, the call that previously aborted Dock), `focus` (target Space
+becomes current), `destroy` (empty dynamic Space is reaped). Dock survived every
+op with zero `platform.error` events.
+
+**Still unverified:** reboot recovery (helper-driven reinjection after a cold
+boot) and the update-simulation path (installing a rebuilt payload over a
+running one — which is exactly the stale-mapping case above). Until
+demonstrated, those remain `[~]`.

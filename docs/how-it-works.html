@@ -150,8 +150,8 @@ footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
 <tr><td>3. Workspace remap shuffles identity</td><td><span class="tag partial">logic tested</span></td><td>Stable config <code>ordinal</code>, resume by <code>last_position</code>, ordinal order assignment. 200 repetition test for code to 101 and chat to 102 never swaps. Dock restart on hardware not yet exercised.</td></tr>
 <tr><td>4. Persistent workspaces not recreated</td><td><span class="tag partial">logic tested</span></td><td>Engine emits one deterministic <code>CreateSpace</code> per cycle for the lowest ordinal missing persistent workspace. New id learned only from the next snapshot.</td></tr>
 <tr><td>5. BSP keyed by volatile SpaceId</td><td><span class="tag partial">logic tested</span></td><td>Workspaces own layout state. Remap returns <code>RemapMove</code> records and the engine carries trees across. Tree survives 11 to 101 byte identically, across save and load.</td></tr>
-<tr><td>6. Hotkeys invalid on macOS threads</td><td><span class="tag partial">logic tested</span></td><td>Daemon main thread owns the hotkey manager and runs the AppKit loop. Socket accept moved to a worker. Firing needs a manual UI session run.</td></tr>
-<tr><td>7 and 8. Hotkey syntax drift, silent Ping</td><td><span class="tag verified">verified</span></td><td>One shared parser <code>rovr_protocol::command_parser::parse_command</code>. Invalid binds fail load and reload. No fallback to Ping.</td></tr>
+<tr><td>6. Hotkeys invalid on macOS threads</td><td><span class="tag verified">resolved</span></td><td>The built in hotkey backend was removed. Global hotkeys belong to skhd. No AppKit loop, no hotkey manager.</td></tr>
+<tr><td>7 and 8. Hotkey syntax drift, silent Ping</td><td><span class="tag verified">resolved</span></td><td>Moot: rovr has no <code>[[bind]]</code> table and no bind dispatch. skhd owns hotkey syntax and invokes <code>rovr</code> as a CLI.</td></tr>
 <tr><td>9. Sticky rule desired state</td><td><span class="tag verified">verified</span></td><td><code>desired.space</code> is rebuilt from scratch every <code>apply_layout</code> cycle. Rules own it. Manual moves stay one shot actions.</td></tr>
 <tr><td>10. Regex validated but unused</td><td><span class="tag verified">verified</span></td><td><code>Config::compile_rules</code> builds <code>CompiledRule</code> once per load. Runtime matches compiled regexes in config order.</td></tr>
 <tr><td>11. WASM memory cap claimed only</td><td><span class="tag partial">logic tested</span></td><td>wasmi <code>StoreLimits</code> per call: 16 MiB linear memory, table cap, fuel budget, no host imports. Malicious plugin survival on live macOS not yet run.</td></tr>
@@ -170,7 +170,7 @@ footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
 <svg viewBox="0 0 720 430" role="img" aria-labelledby="stackT stackD">
 <title id="stackT">Rovr stack from CLI to macOS</title>
 <desc id="stackD">CLI and clients talk typed versioned IPC to the Rust daemon. The daemon holds events, observed state, desired state, reconciler, rules, layouts, config, persistence, and recovery. It calls a safe platform interface, which calls the macOS layer with Accessibility, SkyLight, Spaces, Dock, and Mach code, which drives macOS.</desc>
-<rect x="150" y="10" width="420" height="44" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="360" y="37" text-anchor="middle" fill="#e6ebf3" font-size="14" font-weight="700">CLI and clients (rovr-cli, hotkeys, subscribers)</text>
+<rect x="150" y="10" width="420" height="44" rx="10" fill="#13233a" stroke="#3b82f6"/><text x="360" y="37" text-anchor="middle" fill="#e6ebf3" font-size="14" font-weight="700">CLI and clients (rovr-cli, skhd, subscribers)</text>
 <rect x="310" y="62" width="100" height="30" rx="8" fill="#0f172a" stroke="#334155"/><text x="360" y="82" text-anchor="middle" fill="#9aa7bd" font-size="12">typed IPC v1</text>
 <rect x="110" y="100" width="500" height="150" rx="12" fill="#101724" stroke="#3b82f6"/>
 <text x="360" y="122" text-anchor="middle" fill="#e6ebf3" font-size="14" font-weight="700">Rust daemon (single owner of mutable state)</text>
@@ -223,10 +223,10 @@ footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
 <tr><td><code>rovr-core</code></td><td><code>crates/rovr-core/src/{engine,state,event,action,reconcile,workspace,bsp,layout,layout_state,persistence,flight_recorder}.rs</code></td><td>State machine, reducer, reconciler, workspaces, BSP trees, persistence, flight recorder. Almost no unsafe code.</td></tr>
 <tr><td><code>rovr-layout</code></td><td><code>crates/rovr-layout/src/lib.rs</code></td><td>Pure geometry for BSP, stack, monocle, master, columns, float. Input rect plus window order, output placements. No FFI.</td></tr>
 <tr><td><code>rovr-layout-plugin</code></td><td><code>crates/rovr-layout-plugin/src/lib.rs</code></td><td>WASM plugin registry on wasmi. Fuel budget, 16 MiB memory cap, output validation with built in fallback.</td></tr>
-<tr><td><code>rovr-config</code></td><td><code>crates/rovr-config/src/lib.rs</code></td><td>TOML model, validation, <code>compile_rules</code>, keybind checks against the shared command parser.</td></tr>
-<tr><td><code>rovr-protocol</code></td><td><code>crates/rovr-protocol/src/{lib,command_parser,hotkey}.rs</code></td><td>Versioned <code>Request</code>, <code>Command</code>, <code>Response</code>, <code>Notification</code>. One CLI style grammar used by CLI, hotkeys, and config validation.</td></tr>
+<tr><td><code>rovr-config</code></td><td><code>crates/rovr-config/src/lib.rs</code></td><td>TOML model, validation, <code>compile_rules</code>. No keybind table: hotkeys belong to skhd.</td></tr>
+<tr><td><code>rovr-protocol</code></td><td><code>crates/rovr-protocol/src/{lib,command_parser}.rs</code></td><td>Versioned <code>Request</code>, <code>Command</code>, <code>Response</code>, <code>Notification</code>. One CLI style grammar used by the CLI.</td></tr>
 <tr><td><code>rovr-platform</code></td><td><code>crates/rovr-platform/src/{lib,mock,bounded_worker,macos/mod,macos/sa,macos/reinject}.rs</code></td><td><code>Platform</code> trait, mock backend, bounded observation worker, macOS bridge, SA client, reinject state machine.</td></tr>
-<tr><td><code>rovr-daemon</code></td><td><code>crates/rovr-daemon/src/{main,hotkey}.rs</code></td><td>Single owner state loop, Unix socket server, subscribers, doctor data, hotkey manager on the main thread.</td></tr>
+<tr><td><code>rovr-daemon</code></td><td><code>crates/rovr-daemon/src/main.rs</code></td><td>Single owner state loop, Unix socket server, subscribers, doctor data. No hotkey manager and no AppKit run loop.</td></tr>
 <tr><td><code>rovr-cli</code></td><td><code>crates/rovr-cli/src/main.rs</code></td><td>Thin IPC client. Maps clap subcommands to protocol commands. Also owns <code>sa install</code>, <code>status</code>, <code>uninstall</code> flows.</td></tr>
 <tr><td><code>rovr-sa-payload</code></td><td><code>crates/rovr-sa-payload</code></td><td>ObjC dylib injected into Dock. Socket <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code>, handshake <code>rovr-sa-2.0</code>, opcodes for space lifecycle and cosmetics.</td></tr>
 <tr><td><code>rovr-sa-loader</code></td><td><code>crates/rovr-sa-loader</code></td><td>Root injector adapted from yabai loader.m with attribution. arm64e build with PAC ABI patch.</td></tr>
@@ -234,7 +234,7 @@ footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
 <tr><td>menu bar app</td><td><code>apps/rovr-menu-bar</code></td><td>Optional native Swift status and debug UI. No changes in the current pass.</td></tr>
 </tbody>
 </table>
-<p>Shared roots: <code>Cargo.toml</code> sets workspace version <code>0.1.0</code>, edition 2021, Rust 1.78. Default config lives at <code>~/.config/rovr/rovr.toml</code> with <code>config/rovr.example.toml</code> as the reference. Runtime sockets live under <code>/tmp/rovr-&lt;uid&gt;/</code> keyed by real <code>getuid</code>, never the <code>$UID</code> env var.</p>
+<p>Shared roots: <code>Cargo.toml</code> sets workspace version <code>0.1.0</code>, edition 2021, Rust 1.78. Default config lives at <code>~/.config/rovr/rovr.toml</code> with <code>config/rovr.example.toml</code> as the reference. The daemon socket lives at <code>$HOME/Library/Caches/rovr/daemon.sock</code>; the Dock payload socket keeps <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code> keyed by real <code>getuid</code>, never the <code>$UID</code> env var.</p>
 </section>
 <section class="card" id="atoms">
 <h2>4. Atom layer: ids, rects, snapshots</h2>
@@ -413,8 +413,7 @@ compute(kind, LayoutRequest { area, windows, gap, padding, split_ratio })</code>
 [animations] enabled duration_ms curve
 [[workspace]] name layout display persistent plugin
 [[rule]] app title workspace float target_workspace opacity layer
-[[scratchpad]] name app title
-[[bind]] key command   # skhd syntax key, CLI style command</code></pre>
+[[scratchpad]] name app title</code></pre>
 <figure class="diagram">
 <svg viewBox="0 0 720 150" role="img" aria-labelledby="cfgT cfgD">
 <title id="cfgT">Config pipeline</title>
@@ -429,15 +428,15 @@ compute(kind, LayoutRequest { area, windows, gap, padding, split_ratio })</code>
 </svg>
 </figure>
 <ul class="tight">
-<li>Validation rejects negative gap and padding, empty or duplicate workspace names, unknown workspaces in rules, bad opacity, bad regex, empty or duplicate binds, bad hotkey keys, and bad bind commands.</li>
+<li>Validation rejects negative gap and padding, empty or duplicate workspace names, unknown workspaces in rules, bad opacity, and bad regex.</li>
 <li><code>compile_rules</code> compiles each <code>app</code> and <code>title</code> regex once per load and keeps config order. Predicate is <code>all_of</code>: every selector must match. Empty predicate matches every window.</li>
-<li>Binds are the single source of truth for the built in listener and <code>config gen-skhd</code> output. Key syntax uses skhd chords such as <code>alt - h</code>. Command syntax must parse with the same <code>parse_command</code> the CLI uses, so <code>window --focus 1</code> fails at load instead of drifting at runtime.</li>
+<li>Hotkeys are not part of this config. They live in <code>~/.config/skhd/skhdrc</code> as <code>key : rovr &lt;command&gt;</code>. rovr has no bind table and registers no global hotkeys.</li>
 <li>Reload is transactional. Only affected state is disturbed. Ordinal identity is preserved across reorder and manual drags.</li>
 </ul>
 </section>
 <section class="card" id="protocol">
 <h2>9. Protocol: typed IPC over a socket</h2>
-<p class="sub">Crate <code>rovr-protocol</code>. Newline delimited JSON over <code>/tmp/rovr-&lt;uid&gt;/daemon.sock</code> with mode 0600 and dir 0700. Requests carry version plus id. This boring framing is deliberate: inspectable now, replaceable with binary framing as v2 later.</p>
+<p class="sub">Crate <code>rovr-protocol</code>. Newline delimited JSON over <code>$HOME/Library/Caches/rovr/daemon.sock</code> with mode 0600 and dir 0700. Requests carry version plus id. This boring framing is deliberate: inspectable now, replaceable with binary framing as v2 later.</p>
 <pre><code>Request  { version: 1, id: u64, command: Command }
 Response { version: 1, id: u64, status: ok | error, result | error{code,message} }
 Notification { type: hello | heartbeat | state_changed | layout_changed
@@ -452,7 +451,7 @@ Notification { type: hello | heartbeat | state_changed | layout_changed
 <tr><td><code>layout</code></td><td>rotate, mirror, balance, set-ratio</td><td>Each emits <code>LayoutChanged</code> even if the later platform apply fails.</td></tr>
 <tr><td><code>workspace</code></td><td>focus name, move-window to name</td><td>Unknown names spawn i3 style dynamic workspaces. Empty ones die when left.</td></tr>
 <tr><td><code>scratchpad</code></td><td>toggle name</td><td>Emits <code>ScratchpadToggled</code>. Show centers 800 by 600 on the focused space.</td></tr>
-<tr><td><code>config</code></td><td>reload, check, dump, gen-skhd</td><td>Dump and gen-skhd run locally in the CLI without IPC.</td></tr>
+<tr><td><code>config</code></td><td>reload, check, dump</td><td>Dump runs locally in the CLI without IPC.</td></tr>
 <tr><td><code>debug</code></td><td>events</td><td>Reads the flight recorder.</td></tr>
 <tr><td><code>subscribe</code></td><td>Stream with Hello first, then heartbeats and hints</td><td>Per subscriber backlog of 64. Slow readers are evicted so the state loop never blocks.</td></tr>
 </tbody>
@@ -513,13 +512,13 @@ Notification { type: hello | heartbeat | state_changed | layout_changed
 <figure class="diagram">
 <svg viewBox="0 0 720 230" role="img" aria-labelledby="thrT thrD">
 <title id="thrT">Three daemon lanes</title>
-<desc id="thrD">Main thread runs AppKit hotkeys. Accept thread reads sockets and queues bounded envelopes. State thread owns engine and platform and emits responses plus notifications.</desc>
-<rect x="20" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="120" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">main thread</text><text x="120" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">hotkey manager</text><text x="120" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">AppKit run loop</text><text x="120" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">persistent IPC</text><text x="120" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">dispatcher, FIFO</text>
+<desc id="thrD">Main thread joins the accept thread and holds no UI or hotkey work. Accept thread reads sockets and queues bounded envelopes. State thread owns engine and platform and emits responses plus notifications.</desc>
+<rect x="20" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="120" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">main thread</text><text x="120" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">no UI work</text><text x="120" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">joins accept</text><text x="120" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">hotkeys owned by skhd</text>
 <rect x="260" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#3b82f6"/><text x="360" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">accept thread</text><text x="360" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">UnixListener</text><text x="360" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">per client threads</text><text x="360" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">256 envelope cap</text><text x="360" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">version check first</text>
 <rect x="500" y="30" width="200" height="150" rx="12" fill="#101724" stroke="#22c55e"/><text x="600" y="56" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">state thread</text><text x="600" y="78" text-anchor="middle" fill="#9aa7bd" font-size="11">Engine + Platform</text><text x="600" y="96" text-anchor="middle" fill="#9aa7bd" font-size="11">handle one envelope</text><text x="600" y="114" text-anchor="middle" fill="#9aa7bd" font-size="11">execute + refresh</text><text x="600" y="132" text-anchor="middle" fill="#9aa7bd" font-size="11">notify subscribers</text>
 <text x="240" y="110" text-anchor="middle" fill="#3b82f6" font-size="18">→</text><text x="480" y="110" text-anchor="middle" fill="#3b82f6" font-size="18">→</text>
 </svg>
-<figcaption>Carbon hotkey targets require the main thread, which is why accept and state moved off it in blocker 6.</figcaption>
+<figcaption>Global hotkeys are owned by skhd, so the daemon needs no Carbon event target and no AppKit run loop.</figcaption>
 </figure>
 <h3>Envelope</h3>
 <pre><code>Envelope { request: Request, response: Sender&lt;Response&gt;,
@@ -551,8 +550,8 @@ rovr subscribe            # Hello, then Heartbeat + StateChanged stream
 rovr sa status | sa install | sa uninstall</code></pre>
 <ul class="tight">
 <li>Request ids come from an atomic counter. Responses have a 5 s deadline and a 1 MiB cap with bounded line reads.</li>
-<li><code>completions</code>, <code>config dump</code>, and <code>gen-skhd</code> run locally without IPC.</li>
-<li>39 binds expressible in Rovr now live as in process <code>[[bind]]</code> entries. skhd keeps app launches, reload, chained resizes, and space destroy.</li>
+<li><code>completions</code> and <code>config dump</code> run locally without IPC.</li>
+<li>Hotkeys live in <code>~/.config/skhd/skhdrc</code> and invoke <code>rovr</code> as a normal CLI client.</li>
 <li>Artifact discovery canonicalizes <code>current_exe</code> first so symlinked installs such as <code>~/.local/bin/rovr</code> still find payload, loader, and helper next to the real binary or under prefix lib paths.</li>
 </ul>
 </section>
@@ -591,7 +590,7 @@ rovr sa status | sa install | sa uninstall</code></pre>
 <li><code>rovr doctor</code>: protocol version, capabilities, SA socket plus version plus attribs, reinject phase plus generation plus attempts plus retry, wedge ms, generation, counts, config path, layout, gap, interval.</li>
 <li>Recovery triggers that force scoped or full re-observation: wake, Dock restart, display change, space change, suspicious mutation failure. Every OS wait has a deadline. No infinite polling.</li>
 <li>Persistence in <code>core/src/persistence.rs</code>: layouts, workspace owned trees, scratchpads, workspaces. Atomic replace with fsync on file and directory survives crash and power loss mid save.</li>
-<li>Hotkeys: main thread manager, one persistent bounded FIFO dispatcher, every IPC response read. Invalid bind command at runtime logs and runs nothing.</li>
+<li>Hotkeys: owned by skhd. The daemon registers nothing and has no AppKit run loop.</li>
 <li>Signing detail that matters: stable cert anchored requirement plus embedded plist keep TCC and Accessibility grants stable across rebuilds.</li>
 </ul>
 <div class="callout good"><strong>Mental model for debugging.</strong> Query state to see both models. Read <code>debug events</code> for the seconds before a failure. Check <code>doctor</code> for wedge, SA, and reinject state. If observed and desired differ after an action, the next reconcile already carries the retry.</div>
@@ -607,7 +606,7 @@ rovr sa status | sa install | sa uninstall</code></pre>
 <tr><td>Real AX hang reproduction</td><td>Timeout and wedge logic is tested. A dying app mid call on hardware is the proof.</td></tr>
 <tr><td>Background app refinement</td><td>macOS 26.5 returns empty window lists for background apps. Only frontmost refines. Affects tiling breadth.</td></tr>
 <tr><td>Malicious WASM survival on hardware</td><td>Limits and validation are tested. Daemon survival under hostile plugin on macOS is not yet run.</td></tr>
-<tr><td>Hotkey firing proof</td><td>Threading is correct by construction. Firing needs a UI session run, not headless CI.</td></tr>
+<tr><td>Hotkey firing proof</td><td>Not applicable: hotkey dispatch is skhd's, outside this codebase.</td></tr>
 </tbody>
 </table>
 <h3>How to run the checks behind this page</h3>

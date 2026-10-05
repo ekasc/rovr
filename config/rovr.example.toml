@@ -6,6 +6,9 @@ gap = 10
 padding = 8
 reconcile_on_wake = true
 reconcile_interval_ms = 1000
+# Window shadows. Set to false to remove shadows from every managed window
+# (scripting-addition `set_window_shadow`).
+window_shadow = true
 
 # Screen padding: reserves space along the edges of each display before ROVR
 # calculates tiled window layouts. Useful for status bars such as SketchyBar
@@ -46,20 +49,16 @@ float = true
 app = "^Slack$"
 workspace = "chat"
 
-# Optional keybinds. These are the single source of truth for skhd and for a
-# future built-in hotkey listener. key uses skhd syntax, command is the rovr
-# CLI invocation without the leading "rovr".
-# [[bind]]
-# key = "alt - h"
-# command = "window focus-direction west 1"
-# [[bind]]
-# key = "alt - l"
-# command = "window focus-direction east 1"
-# [[bind]]
-# key = "alt - r"
-# command = "layout rotate --space 1"
+# Ignore a window entirely: with `manage = false` the matching window is not
+# tiled, not moved to a workspace, and receives no opacity/layer action. It is
+# still observed (visible in `rovr query windows`). Matches on `app` (bundle id
+# or app name) and/or `title`, both regex.
+# [[rule]]
+# app = "^System Settings$"
+# manage = false
 
-# Reload config and self-heal logical workspace/Space topology.
-[[bind]]
-key = "shift + alt - r"
-command = "config reload"
+# Global hotkeys are owned by skhd, not by rovr. Define them in
+# ~/.config/skhd/skhdrc as `key : rovr <command>`, e.g.
+#   alt - h : rovr window focus-direction west
+#   shift + alt - r : rovr config reload
+# rovr has no [[bind]] table and registers no hotkeys of its own.

@@ -13,8 +13,9 @@ use anyhow::{Context, Result};
 use crate::layout_state::{Axis, Layouts, ScratchpadState};
 use crate::workspace::{WorkspaceBacking, WorkspaceRegistry};
 use crate::{
-    layout::apply_layout, reconcile::reconcile, Action, DesiredState, Event, FlightRecorder,
-    ObservedState,
+    layout::{apply_layout, inset_area},
+    reconcile::reconcile,
+    Action, DesiredState, Event, FlightRecorder, ObservedState,
 };
 use rovr_layout_plugin::Registry as PluginRegistry;
 
@@ -115,6 +116,27 @@ pub struct Engine {
     /// by a bounded amount. Updated only from complete snapshots — partial
     /// snapshots must never rewrite lifecycle memory.
     window_last_space: HashMap<WindowId, (SpaceId, std::time::Instant)>,
+    /// Consecutive complete-snapshot cycles where a window's observed frame
+    /// has not reached the frame last requested for it. Runtime-only.
+    frame_misses: HashMap<WindowId, u32>,
+    /// The frame last requested per window. A target change resets the miss
+    /// streak, so a layout change is never mistaken for non-convergence.
+    frame_targets: HashMap<WindowId, Rect>,
+    /// Windows that repeatedly refused their tiled frame (fixed-size or
+    /// aspect-locked windows). Auto-floated so reconciliation stops re-issuing
+    /// the same move forever; cleared by an explicit `toggle_float`.
+    auto_floated: std::collections::HashSet<WindowId>,
+    /// Windows whose observed frame is close enough to its tile in SIZE that
+    /// Rovr stops correcting it but keeps it in the layout (so neighbours keep
+    /// their share). Stores the observed frame at settle time; a later frame
+    /// change re-arms correction. This separates an app that sits a few pixels
+    /// off its tile (e.g. a menu-bar offset) from one that cannot occupy the
+    /// slot at all (which floats instead).
+    frame_settled: HashMap<WindowId, Rect>,
+    /// Last shadow value applied per window (global `window_shadow` policy).
+    /// Runtime-only; dedupes the scripting-addition call so it is not repeated
+    /// every reconcile cycle.
+    shadow_applied: HashMap<WindowId, bool>,
 }
 
 struct SpacePlacement {
@@ -149,6 +171,24 @@ struct PendingCreationRequest {
 /// a genuinely closed window therefore delays empty-space GC by at most
 /// this bound before its old Space becomes collectable again.
 const WINDOW_LAST_SPACE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Frame comparison tolerance for convergence (matches the reconciler's).
+const FRAME_CONVERGE_EPSILON: f64 = 0.75;
+/// How many consecutive complete snapshots a window may fail to reach its
+/// requested frame before Rovr stops trying and floats it. Tolerates the
+/// one-to-two-tick post-mutation observation lag.
+const FRAME_MISS_LIMIT: u32 = 4;
+
+/// True when the observed SIZE is close enough to the target that the window
+/// effectively occupies its tile — a small offset (e.g. a menu-bar constraint)
+/// rather than a window that cannot be resized into the slot. Such a window
+/// settles in place instead of floating.
+fn frame_size_close(observed: Rect, target: Rect) -> bool {
+    let width_tol = (target.width * 0.1).max(8.0);
+    let height_tol = (target.height * 0.1).max(8.0);
+    (observed.width - target.width).abs() <= width_tol
+        && (observed.height - target.height).abs() <= height_tol
+}
 
 fn load_plugins_from_disk(registry: &mut PluginRegistry) {
     let dir = match std::env::var("HOME") {
@@ -1623,8 +1663,27 @@ impl Engine {
             self.pending_close.clear();
         }
 
+        // Convergence check runs only on fresh observation: detect windows
+        // that never accept their tiled frame and float them before reconcile
+        // can re-issue the same doomed SetWindowFrame.
+        if is_snapshot {
+            self.note_frame_convergence();
+        }
+
         let mut actions = reconcile(&self.observed, &self.desired);
+        // A window settled a few pixels off its tile keeps its BSP slot (so a
+        // neighbour does not take the whole display) but is not re-targeted
+        // every cycle — this stops the churn WITHOUT floating it.
+        actions.retain(|action| match action {
+            Action::SetWindowFrame { window, .. } => !self.frame_settled.contains_key(window),
+            _ => true,
+        });
         actions.extend(lifecycle_action);
+        // Global shadow policy applies to every observed window; deduped so it
+        // is not re-sent each cycle.
+        if is_snapshot {
+            actions.extend(self.shadow_actions());
+        }
         for action in &actions {
             self.flight_recorder
                 .record("reconcile.action", format!("{action:?}"));
@@ -2005,12 +2064,37 @@ impl Engine {
     /// among those (or as fallback) pick the most recent (largest WindowId)
     /// deterministically so `query focused` and `resolve_window` agree.
     pub fn focused_window(&self) -> Option<WindowId> {
-        let focused_space = self
+        // Every display keeps its own focused Space, so a bare
+        // `spaces.values().find(|s| s.focused)` is HashMap-order arbitrary and
+        // can anchor on the NON-active display — making every default-to-focus
+        // command (close, float, resize, swap/warp, move) act on the monitor
+        // the user is not looking at. Anchor on the active display first (the
+        // one with the menu bar, which follows keyboard focus), then that
+        // display's focused Space; fall back deterministically when the active
+        // display is unknown.
+        let active_display = self
             .observed
-            .spaces
+            .displays
             .values()
-            .find(|s| s.focused)
-            .map(|s| s.id);
+            .find(|display| display.focused)
+            .map(|display| display.id);
+        let focused_space = active_display
+            .and_then(|display| {
+                self.observed
+                    .spaces
+                    .values()
+                    .filter(|space| space.focused && space.display_id == display)
+                    .min_by_key(|space| (space.position, space.id))
+                    .map(|space| space.id)
+            })
+            .or_else(|| {
+                self.observed
+                    .spaces
+                    .values()
+                    .filter(|space| space.focused)
+                    .min_by_key(|space| (space.display_id, space.position, space.id))
+                    .map(|space| space.id)
+            });
         let mut candidates: Vec<&WindowSnapshot> = self
             .observed
             .windows
@@ -2056,6 +2140,127 @@ impl Engine {
         Ok(vec![Action::ToggleNativeFullscreen { window }])
     }
 
+    /// Detect windows that never accept their requested frame. On each complete
+    /// snapshot: if the frame we last asked for is still the one we want and the
+    /// window has not moved to it, count a miss; after [`FRAME_MISS_LIMIT`]
+    /// consecutive misses, auto-float the window so reconciliation stops
+    /// re-issuing the same move every cycle. This is the fixed-size /
+    /// aspect-locked window case (e.g. iPhone Mirroring), which reports success
+    /// but never resizes — previously an unbounded SetWindowFrame loop that also
+    /// emitted `StateChanged` on every idle tick.
+    /// Actions that reconcile the global `window_shadow` policy. Emitted only
+    /// when a window's applied shadow differs from the desired value, so the
+    /// scripting-addition call is not repeated every cycle. Assumes macOS's
+    /// default (shadowed) for a window whose policy is also "on", avoiding a
+    /// pointless call for every window on startup.
+    fn shadow_actions(&mut self) -> Vec<Action> {
+        if !self.capabilities.set_window_shadow {
+            return Vec::new();
+        }
+        let desired = self.config.general.window_shadow;
+        let ids: Vec<WindowId> = self.observed.windows.keys().copied().collect();
+        self.shadow_applied
+            .retain(|id, _| self.observed.windows.contains_key(id));
+        let mut actions = Vec::new();
+        for id in ids {
+            match self.shadow_applied.get(&id).copied() {
+                Some(applied) if applied == desired => {}
+                None if desired => {
+                    self.shadow_applied.insert(id, true);
+                }
+                _ => {
+                    self.shadow_applied.insert(id, desired);
+                    actions.push(Action::SetWindowShadow {
+                        window: id,
+                        shadow: desired,
+                    });
+                }
+            }
+        }
+        actions
+    }
+
+    fn note_frame_convergence(&mut self) {
+        let observed: Vec<(WindowId, Rect)> = self
+            .observed
+            .windows
+            .iter()
+            .map(|(id, window)| (*id, window.frame))
+            .collect();
+        let alive: std::collections::HashSet<WindowId> =
+            observed.iter().map(|(id, _)| *id).collect();
+        self.frame_misses.retain(|id, _| alive.contains(id));
+        self.frame_targets.retain(|id, _| alive.contains(id));
+        self.auto_floated.retain(|id| alive.contains(id));
+        self.frame_settled.retain(|id, _| alive.contains(id));
+
+        for (id, observed_frame) in observed {
+            // A settled window that moved (user drag, app relayout) is re-armed
+            // so Rovr corrects it again.
+            if let Some(settled) = self.frame_settled.get(&id).copied() {
+                if settled.approx_eq(observed_frame, FRAME_CONVERGE_EPSILON) {
+                    continue;
+                }
+                self.frame_settled.remove(&id);
+            }
+            let Some(target) = self.desired.windows.get(&id).and_then(|t| t.frame) else {
+                // Floating, unresponsive, or not tileable: nothing to converge.
+                self.frame_targets.remove(&id);
+                self.frame_misses.remove(&id);
+                continue;
+            };
+            let previous = self.frame_targets.get(&id).copied();
+            match previous {
+                Some(previous) if previous.approx_eq(target, FRAME_CONVERGE_EPSILON) => {
+                    if observed_frame.approx_eq(target, FRAME_CONVERGE_EPSILON) {
+                        self.frame_misses.remove(&id);
+                    } else {
+                        let misses = self.frame_misses.get(&id).copied().unwrap_or(0) + 1;
+                        if misses >= FRAME_MISS_LIMIT {
+                            if frame_size_close(observed_frame, target) {
+                                // Occupies its tile closely enough (a small
+                                // offset, e.g. a menu-bar constraint). Stop
+                                // correcting but KEEP the BSP slot, so
+                                // neighbours do not lose their share.
+                                self.frame_settled.insert(id, observed_frame);
+                                self.flight_recorder.record(
+                                    "window.frame_settled",
+                                    format!(
+                                        "window {id:?} settled {FRAME_MISS_LIMIT} attempts off-tile"
+                                    ),
+                                );
+                            } else {
+                                // Cannot occupy the slot at all: float so
+                                // neighbours reclaim the space.
+                                if let Some(window_target) = self.desired.windows.get_mut(&id) {
+                                    window_target.floating = true;
+                                    window_target.frame = None;
+                                }
+                                self.auto_floated.insert(id);
+                                self.flight_recorder.record(
+                                    "window.unresponsive",
+                                    format!(
+                                        "window {id:?} refused {FRAME_MISS_LIMIT} frame attempts; floating"
+                                    ),
+                                );
+                            }
+                            self.frame_misses.remove(&id);
+                            self.frame_targets.remove(&id);
+                        } else {
+                            self.frame_misses.insert(id, misses);
+                        }
+                    }
+                }
+                _ => {
+                    // First request, or the target changed: a fresh attempt,
+                    // not a failure.
+                    self.frame_targets.insert(id, target);
+                    self.frame_misses.remove(&id);
+                }
+            }
+        }
+    }
+
     /// Pull a managed window out of the tiling layout, or tile it again. The
     /// flag lives in desired state so it survives restarts and flows through
     /// reconciliation like every other desired property.
@@ -2071,6 +2276,13 @@ impl Engine {
             // current frame for floating windows.
             target.frame = None;
         }
+        // A deliberate toggle is a fresh decision: drop any auto-float history
+        // so re-tiling a stubborn window retries instead of being immediately
+        // re-floated by a stale miss streak.
+        self.frame_misses.remove(&window);
+        self.frame_targets.remove(&window);
+        self.auto_floated.remove(&window);
+        self.frame_settled.remove(&window);
         Ok(())
     }
 
@@ -2099,6 +2311,39 @@ impl Engine {
     /// Move one window edge outward by `delta` points (None = focused).
     /// Absolute-frame composition over the observed frame; BSP ratios are
     /// re-derived from observed geometry on the next layout pass.
+    /// Session gap (zero while insets are collapsed), matching `apply_layout`.
+    fn layout_gap(&self) -> f64 {
+        if self.insets_off {
+            0.0
+        } else {
+            self.config.general.gap as f64
+        }
+    }
+
+    /// Session inner padding (zero while insets are collapsed).
+    fn layout_padding(&self) -> f64 {
+        if self.insets_off {
+            0.0
+        } else {
+            self.config.general.padding as f64
+        }
+    }
+
+    /// The exact inset area `apply_layout` feeds to `BspTree::placements` for a
+    /// space (screen padding applied to the display, then inner padding). Used
+    /// so a resize edits the same geometry a relayout will use.
+    fn bsp_layout_area(&self, space_id: SpaceId) -> Option<Rect> {
+        let space = self.observed.spaces.get(&space_id)?;
+        let display = self.observed.displays.get(&space.display_id)?;
+        let screen_padding = if self.insets_off {
+            rovr_config::ScreenPadding::default()
+        } else {
+            self.config.layout.padding
+        };
+        let usable = screen_padding.apply_to(display.frame)?;
+        inset_area(usable, self.layout_padding())
+    }
+
     pub fn resize_window_edge(
         &mut self,
         window: Option<WindowId>,
@@ -2106,12 +2351,44 @@ impl Engine {
         delta: i32,
     ) -> Result<Vec<Action>, EngineError> {
         let window = self.resolve_window(window)?;
-        let snapshot = self
-            .observed
+        let (space_id, observed_frame) = {
+            let snapshot = self
+                .observed
+                .windows
+                .get(&window)
+                .ok_or(EngineError::WindowNotFound(window))?;
+            (snapshot.space_id, snapshot.frame)
+        };
+        let floating = self
+            .desired
             .windows
             .get(&window)
-            .ok_or(EngineError::WindowNotFound(window))?;
-        let mut frame = snapshot.frame;
+            .is_some_and(|target| target.floating);
+
+        // A TILED window resizes the BSP split, so the new ratio survives the
+        // next relayout. Resizing only the observed frame (the old behavior)
+        // snapped back to the default 50/50 on the following reconcile.
+        // Floating and non-BSP windows keep the one-shot frame move below.
+        if !floating {
+            if let Some(space) = space_id {
+                if let Some(area) = self.bsp_layout_area(space) {
+                    let gap = self.layout_gap();
+                    let state = self.layouts.entry(space).or_default();
+                    if state.bsp.contains(window)
+                        && state.bsp.resize_edge(window, edge, delta as f64, area, gap)
+                    {
+                        return Ok(state
+                            .bsp
+                            .placements(area, gap)
+                            .into_iter()
+                            .map(|(window, frame)| Action::SetWindowFrame { window, frame })
+                            .collect());
+                    }
+                }
+            }
+        }
+
+        let mut frame = observed_frame;
         let d = delta as f64;
         match edge {
             Direction::North => {
@@ -3724,6 +4001,364 @@ mod tests {
         // Shrinking below minimum errors without emitting actions.
         let result = engine.resize_window_edge(Some(WindowId(3)), Direction::North, -10_000);
         assert!(matches!(result, Err(EngineError::ResizeTooSmall)));
+    }
+
+    /// Regression: resizing a tiled window edits the BSP split ratio, so the
+    /// new size survives the next relayout instead of snapping back to 50/50.
+    #[test]
+    fn edge_resize_updates_bsp_ratio_and_survives_relayout() {
+        let mut engine = two_window_engine();
+        engine.apply_event(Event::Snapshot(snapshot_with_state(&engine)));
+        let before = engine.desired.windows[&WindowId(1)]
+            .frame
+            .expect("window 1 is tiled");
+        let total = engine.observed.displays[&DisplayId(1)].frame.width;
+
+        // Widen the left window by dragging the shared edge east.
+        let actions = engine
+            .resize_window_edge(Some(WindowId(1)), Direction::East, 200)
+            .unwrap();
+        let applied = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::SetWindowFrame {
+                    window: WindowId(1),
+                    frame,
+                } => Some(*frame),
+                _ => None,
+            })
+            .expect("resize must emit a frame for the resized window");
+        assert!(
+            applied.width > before.width + 100.0,
+            "resize should widen the left window: before={before:?} applied={applied:?}"
+        );
+        assert!(applied.width < total, "must stay within the display");
+
+        // A fresh relayout re-derives from the edited tree — not 50/50 again.
+        engine.apply_event(Event::Snapshot(snapshot_with_state(&engine)));
+        let after = engine.desired.windows[&WindowId(1)]
+            .frame
+            .expect("window 1 still tiled");
+        assert!(
+            after.width > before.width + 100.0,
+            "ratio must survive relayout: before={before:?} after={after:?}"
+        );
+    }
+
+    /// Regression: two displays each keep a focused Space. Default-to-focus
+    /// commands must resolve the focused window on the ACTIVE display, never an
+    /// arbitrary HashMap-order Space (which made commands hit the wrong
+    /// monitor). The decoy window sits on the non-active display with a larger
+    /// id, so the old `find(|s| s.focused)` anchor resolved to it whenever the
+    /// decoy Space was visited first.
+    #[test]
+    fn focused_window_prefers_the_active_display() {
+        let mut engine = Engine::default();
+
+        let mut active = window(10, 0.0, 0.0);
+        active.space_id = Some(SpaceId(102));
+        active.display_id = Some(DisplayId(2));
+        active.focused = true;
+
+        let mut decoy = window(99, 0.0, 0.0);
+        decoy.space_id = Some(SpaceId(101));
+        decoy.display_id = Some(DisplayId(1));
+        decoy.focused = true;
+
+        let mut snap = snapshot(vec![decoy, active]);
+        snap.spaces = vec![
+            SpaceSnapshot {
+                id: SpaceId(101),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            },
+            SpaceSnapshot {
+                id: SpaceId(102),
+                display_id: DisplayId(2),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 1,
+                is_fullscreen: false,
+                is_system: false,
+            },
+        ];
+        snap.displays = vec![
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                label: None,
+                focused: false,
+                is_main: false,
+                generation: 0,
+            },
+            DisplaySnapshot {
+                id: DisplayId(2),
+                frame: Rect {
+                    x: 100.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 0,
+            },
+        ];
+        engine.apply_event(Event::Snapshot(snap));
+
+        assert_eq!(
+            engine.focused_window(),
+            Some(WindowId(10)),
+            "focused window must come from the active display's Space"
+        );
+
+        // Fallback determinism: with no active display, the lowest
+        // (display, position, id) focused Space wins — display 1's 101.
+        for display in engine.observed.displays.values_mut() {
+            display.focused = false;
+        }
+        assert_eq!(engine.focused_window(), Some(WindowId(99)));
+    }
+
+    /// Regression: a window that never accepts its tiled frame (fixed-size or
+    /// aspect-locked, e.g. iPhone Mirroring) must not be re-targeted forever.
+    /// After FRAME_MISS_LIMIT consecutive failed frames it is auto-floated and
+    /// reconciliation stops emitting SetWindowFrame for it.
+    #[test]
+    fn non_converging_window_is_auto_floated() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.displays = vec![DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: true,
+            is_main: true,
+            generation: 0,
+        }];
+        snap.spaces = vec![SpaceSnapshot {
+            id: SpaceId(1),
+            display_id: DisplayId(1),
+            label: None,
+            focused: true,
+            generation: 0,
+            position: 0,
+            is_fullscreen: false,
+            is_system: false,
+        }];
+        let mut stubborn = window(1, 0.0, 0.0);
+        stubborn.space_id = Some(SpaceId(1));
+        stubborn.display_id = Some(DisplayId(1));
+        stubborn.frame = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        snap.windows = vec![stubborn];
+
+        // Observed frame never moves, so every cycle re-requests the tiled one.
+        for _ in 0..(FRAME_MISS_LIMIT + 2) {
+            engine.apply_event(Event::Snapshot(snap.clone()));
+        }
+
+        let actions = engine.apply_event(Event::Snapshot(snap.clone()));
+        assert!(
+            actions.iter().all(|a| !matches!(
+                a,
+                Action::SetWindowFrame {
+                    window: WindowId(1),
+                    ..
+                }
+            )),
+            "stubborn window must stop being re-targeted: {actions:?}"
+        );
+        assert!(
+            engine.desired.windows[&WindowId(1)].floating,
+            "non-converging window must be auto-floated"
+        );
+    }
+
+    /// A responsive window is never auto-floated: feeding the requested frame
+    /// back as observed keeps the miss streak at zero.
+    #[test]
+    fn converging_window_is_not_auto_floated() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.displays = vec![DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: true,
+            is_main: true,
+            generation: 0,
+        }];
+        snap.spaces = vec![SpaceSnapshot {
+            id: SpaceId(1),
+            display_id: DisplayId(1),
+            label: None,
+            focused: true,
+            generation: 0,
+            position: 0,
+            is_fullscreen: false,
+            is_system: false,
+        }];
+        let mut normal = window(1, 0.0, 0.0);
+        normal.space_id = Some(SpaceId(1));
+        normal.display_id = Some(DisplayId(1));
+        normal.frame = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        snap.windows = vec![normal];
+
+        for _ in 0..(FRAME_MISS_LIMIT + 2) {
+            let actions = engine.apply_event(Event::Snapshot(snap.clone()));
+            if let Some(Action::SetWindowFrame { frame, .. }) = actions
+                .iter()
+                .find(|a| matches!(a, Action::SetWindowFrame { .. }))
+            {
+                snap.windows[0].frame = *frame;
+            }
+        }
+        assert!(
+            !engine.desired.windows[&WindowId(1)].floating,
+            "a window that accepts its frame must stay tiled"
+        );
+    }
+
+    /// Regression: a window that sits a small, constant offset off its tile
+    /// (e.g. Activity Monitor, constrained by the menu bar) must keep its BSP
+    /// slot — not float — so it does not hand the whole display to a
+    /// neighbour. It settles: no more SetWindowFrame, still tiled.
+    #[test]
+    fn off_tile_sized_window_settles_instead_of_floating() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.displays = vec![DisplaySnapshot {
+            id: DisplayId(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: true,
+            is_main: true,
+            generation: 0,
+        }];
+        snap.spaces = vec![SpaceSnapshot {
+            id: SpaceId(1),
+            display_id: DisplayId(1),
+            label: None,
+            focused: true,
+            generation: 0,
+            position: 0,
+            is_fullscreen: false,
+            is_system: false,
+        }];
+        let mut stubborn = window(1, 0.0, 0.0);
+        stubborn.space_id = Some(SpaceId(1));
+        stubborn.display_id = Some(DisplayId(1));
+        // Full width, 32px short — the app refuses the exact tile but is sized
+        // close enough to occupy the slot.
+        stubborn.frame = Rect {
+            x: 0.0,
+            y: 32.0,
+            width: 1000.0,
+            height: 768.0,
+        };
+        snap.windows = vec![stubborn];
+
+        for _ in 0..(FRAME_MISS_LIMIT + 2) {
+            engine.apply_event(Event::Snapshot(snap.clone()));
+        }
+        assert!(
+            !engine.desired.windows[&WindowId(1)].floating,
+            "an off-tile window must not float"
+        );
+        assert!(
+            engine.desired.windows[&WindowId(1)].frame.is_some(),
+            "it must keep its tile slot"
+        );
+
+        let actions = engine.apply_event(Event::Snapshot(snap.clone()));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, Action::SetWindowFrame { .. })),
+            "settled window must not be re-targeted: {actions:?}"
+        );
+    }
+
+    /// The global `window_shadow = false` policy issues one shadow-off call per
+    /// window and then dedupes (no per-cycle scripting-addition churn).
+    #[test]
+    fn window_shadow_off_is_applied_once_per_window() {
+        let mut engine = Engine::default();
+        engine.capabilities.set_window_shadow = true;
+        engine.config.general.window_shadow = false;
+        let snap = snapshot(vec![window(1, 0.0, 0.0)]);
+
+        let actions = engine.apply_event(Event::Snapshot(snap.clone()));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetWindowShadow {
+                    window: WindowId(1),
+                    shadow: false
+                }
+            )),
+            "shadows off must emit a shadow action: {actions:?}"
+        );
+
+        let actions = engine.apply_event(Event::Snapshot(snap.clone()));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, Action::SetWindowShadow { .. })),
+            "the same policy must not be re-sent: {actions:?}"
+        );
+    }
+
+    /// Default policy leaves shadows alone (no calls at all).
+    #[test]
+    fn window_shadow_default_emits_nothing() {
+        let mut engine = Engine::default();
+        engine.capabilities.set_window_shadow = true;
+        let snap = snapshot(vec![window(1, 0.0, 0.0)]);
+        let actions = engine.apply_event(Event::Snapshot(snap));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, Action::SetWindowShadow { .. })),
+            "default shadow policy must emit nothing: {actions:?}"
+        );
     }
 
     /// focus_space_step: alt+arrow navigation across a display's spaces,

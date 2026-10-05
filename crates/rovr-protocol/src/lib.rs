@@ -1,6 +1,5 @@
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
 pub mod command_parser;
-pub mod hotkey;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

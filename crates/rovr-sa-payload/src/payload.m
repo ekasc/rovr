@@ -274,6 +274,14 @@ static void init_instances()
 #endif
     }
 
+    // A pattern can match a decoy site. If the resolved object is not Dock's
+    // spaces model, every later message to it raises inside Dock; reject it
+    // here so the capability bit is honestly reported absent.
+    if (dock_spaces != nil && ![dock_spaces respondsToSelector:@selector(spacesForDisplay:)]) {
+        NSLog(@"[rovr-sa] dock.spaces resolved to an unexpected object; spaces ops disabled");
+        dock_spaces = nil;
+    }
+
     uint64_t dppm_addr = hex_find_seq(scan_address_for_offset(get_dppm_offset(os_version)), get_dppm_pattern(os_version));
     if (dppm_addr == 0) {
         dp_desktop_picture_manager = nil;
@@ -300,6 +308,14 @@ static void init_instances()
             dp_desktop_picture_manager = [(*(id *)(baseaddr + dppm_offset - 0x8)) retain];
         }
 #endif
+    }
+
+    // Same decoy guard as dock.spaces: a wrong object here makes the
+    // moveSpace:toDisplay:displayUUID: call raise and abort Dock.
+    if (dp_desktop_picture_manager != nil &&
+        ![dp_desktop_picture_manager respondsToSelector:@selector(moveSpace:toDisplay:displayUUID:)]) {
+        NSLog(@"[rovr-sa] dppm resolved to an unexpected object; move op disabled");
+        dp_desktop_picture_manager = nil;
     }
 
     uint64_t add_space_addr = hex_find_seq(scan_address_for_offset(get_add_space_offset(os_version)), get_add_space_pattern(os_version));
@@ -814,29 +830,40 @@ static uint8_t handle_message(int sockfd, char *message, size_t length)
                op == SA_OPCODE_SPACE_DESTROY ? sizeof(uint64_t) : sizeof(uint32_t));
         if (identifier == 0) return SA_STATUS_INVALID;
     }
-    switch (op) {
-    case SA_OPCODE_HANDSHAKE: do_handshake(sockfd); return SA_STATUS_OK;
-    case SA_OPCODE_SPACE_FOCUS:
-        if (dock_spaces == nil) return SA_STATUS_UNSUPPORTED;
-        if (!do_space_focus(message)) return SA_STATUS_INVALID;
-        break;
-    case SA_OPCODE_SPACE_CREATE:
-        if (dock_spaces == nil || add_space_fp == 0) return SA_STATUS_UNSUPPORTED;
-        do_space_create(message); break;
-    case SA_OPCODE_SPACE_DESTROY:
-        if (dock_spaces == nil || remove_space_fp == 0) return SA_STATUS_UNSUPPORTED;
-        do_space_destroy(message); break;
-    case SA_OPCODE_SPACE_MOVE:
-        if (dock_spaces == nil || dp_desktop_picture_manager == nil || move_space_fp == 0)
-            return SA_STATUS_UNSUPPORTED;
-        do_space_move(message); break;
-    case SA_OPCODE_WINDOW_OPACITY: do_window_opacity(message); break;
-    case SA_OPCODE_WINDOW_OPACITY_FADE: do_window_opacity_fade(message); break;
-    case SA_OPCODE_WINDOW_LAYER: do_window_layer(message); break;
-    case SA_OPCODE_WINDOW_STICKY: do_window_sticky(message); break;
-    case SA_OPCODE_WINDOW_SHADOW: do_window_shadow(message); break;
-    case SA_OPCODE_WINDOW_SCALE: do_window_scale(message); break;
-    default: return SA_STATUS_UNSUPPORTED;
+    // Dock-internal entry points are located by byte-pattern scanning. If a
+    // pattern resolves to a decoy, the call lands on an object that does not
+    // answer the selector and raises an Objective-C exception; uncaught, that
+    // unwinds through Dock and aborts the whole process. Contain every op:
+    // a bad resolution must degrade to a refused operation, never kill Dock.
+    @try {
+        switch (op) {
+        case SA_OPCODE_HANDSHAKE: do_handshake(sockfd); return SA_STATUS_OK;
+        case SA_OPCODE_SPACE_FOCUS:
+            if (dock_spaces == nil) return SA_STATUS_UNSUPPORTED;
+            if (!do_space_focus(message)) return SA_STATUS_INVALID;
+            break;
+        case SA_OPCODE_SPACE_CREATE:
+            if (dock_spaces == nil || add_space_fp == 0) return SA_STATUS_UNSUPPORTED;
+            do_space_create(message); break;
+        case SA_OPCODE_SPACE_DESTROY:
+            if (dock_spaces == nil || remove_space_fp == 0) return SA_STATUS_UNSUPPORTED;
+            do_space_destroy(message); break;
+        case SA_OPCODE_SPACE_MOVE:
+            if (dock_spaces == nil || dp_desktop_picture_manager == nil || move_space_fp == 0)
+                return SA_STATUS_UNSUPPORTED;
+            do_space_move(message); break;
+        case SA_OPCODE_WINDOW_OPACITY: do_window_opacity(message); break;
+        case SA_OPCODE_WINDOW_OPACITY_FADE: do_window_opacity_fade(message); break;
+        case SA_OPCODE_WINDOW_LAYER: do_window_layer(message); break;
+        case SA_OPCODE_WINDOW_STICKY: do_window_sticky(message); break;
+        case SA_OPCODE_WINDOW_SHADOW: do_window_shadow(message); break;
+        case SA_OPCODE_WINDOW_SCALE: do_window_scale(message); break;
+        default: return SA_STATUS_UNSUPPORTED;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[rovr-sa] opcode 0x%02x raised %@; refusing operation",
+              (unsigned) op, exception);
+        return SA_STATUS_UNSUPPORTED;
     }
     return SA_STATUS_OK;
 }

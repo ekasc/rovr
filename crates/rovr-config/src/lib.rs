@@ -25,8 +25,6 @@ pub struct Config {
     pub rules: Vec<RuleConfig>,
     #[serde(default, rename = "scratchpad")]
     pub scratchpads: Vec<ScratchpadConfig>,
-    #[serde(default, rename = "bind")]
-    pub binds: Vec<KeybindConfig>,
 }
 
 impl Default for Config {
@@ -40,7 +38,6 @@ impl Default for Config {
             workspaces: Vec::new(),
             rules: Vec::new(),
             scratchpads: Vec::new(),
-            binds: Vec::new(),
         }
     }
 }
@@ -50,12 +47,18 @@ fn default_config_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GeneralConfig {
     pub layout: LayoutKind,
     pub gap: i32,
     pub padding: i32,
     pub reconcile_on_wake: bool,
     pub reconcile_interval_ms: u64,
+    /// Whether macOS window shadows are left on. `false` removes shadows from
+    /// every managed window (scripting-addition `set_window_shadow`) and from
+    /// windows observed later. Defaults to on.
+    #[serde(default = "default_window_shadow")]
+    pub window_shadow: bool,
     /// Optional WASM layout plugin name (e.g. "my_plugin"). If Some and plugin loads,
     /// it is used instead of built-in `layout` for tiling. Falls back to built-in on error.
     #[serde(default)]
@@ -70,9 +73,14 @@ impl Default for GeneralConfig {
             padding: 0,
             reconcile_on_wake: true,
             reconcile_interval_ms: 1000,
+            window_shadow: default_window_shadow(),
             plugin: None,
         }
     }
+}
+
+fn default_window_shadow() -> bool {
+    true
 }
 
 /// Layout-area configuration (`[layout]` table).
@@ -180,6 +188,12 @@ pub struct RuleConfig {
     pub workspace: Option<String>,
     #[serde(rename = "float")]
     pub floating: Option<bool>,
+    /// When `false`, Rovr ignores the matching window entirely: it is not
+    /// tiled, not moved to a workspace, and receives no opacity/layer action.
+    /// The window is still observed (it appears in `query windows`). `None`
+    /// and `true` leave the window managed. Analogous to yabai's `manage` rule.
+    #[serde(default)]
+    pub manage: Option<bool>,
     /// Action: move matching window to named workspace (logical)
     #[serde(default, rename = "target_workspace")]
     pub target_workspace: Option<String>,
@@ -197,18 +211,6 @@ pub struct ScratchpadConfig {
     pub app: Option<String>,
     pub title: Option<String>,
 }
-/// A keybind maps a macOS hotkey string to a typed Rovr command. This table is
-/// the single source of truth for the built-in listener and `gen-skhd` migration
-/// output. `key` uses skhd syntax
-/// like "cmd - h" or "alt + shift - r". `command` is the rovr CLI invocation
-/// without the leading "rovr", e.g. "window focus 1" or
-/// "layout rotate --space 1".
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct KeybindConfig {
-    pub key: String,
-    pub command: String,
-}
-
 /// One typed, compiled window-selection condition. Runtime rule evaluation is
 /// exhaustive over this enum rather than coupling behavior to parallel
 /// optional fields.
@@ -233,6 +235,8 @@ pub struct CompiledRule {
     pub predicate: Predicate,
     #[allow(dead_code)]
     pub floating: Option<bool>,
+    /// `Some(false)` marks matching windows as ignored (see `RuleConfig`).
+    pub manage: Option<bool>,
     pub target_workspace: Option<String>,
     pub opacity: Option<f64>,
     pub layer: Option<i32>,
@@ -266,16 +270,6 @@ pub enum ConfigError {
         #[source]
         source: regex::Error,
     },
-    #[error("keybind key cannot be empty")]
-    EmptyBindKey,
-    #[error("keybind command cannot be empty")]
-    EmptyBindCommand,
-    #[error("duplicate keybind key: {0}")]
-    DuplicateBind(String),
-    #[error("invalid bind key {key:?}: {reason}")]
-    InvalidBindKey { key: String, reason: String },
-    #[error("invalid bind command for key {key:?}: {reason}")]
-    InvalidBindCommand { key: String, reason: String },
     #[error("opacity must be between 0.0 and 1.0")]
     InvalidOpacity,
     #[error(
@@ -354,35 +348,6 @@ impl Config {
             }
         }
 
-        let mut bind_keys = HashSet::new();
-        for bind in &self.binds {
-            if bind.key.trim().is_empty() {
-                return Err(ConfigError::EmptyBindKey);
-            }
-            if bind.command.trim().is_empty() {
-                return Err(ConfigError::EmptyBindCommand);
-            }
-            let chord = rovr_protocol::hotkey::parse_hotkey(&bind.key).map_err(|parse_err| {
-                ConfigError::InvalidBindKey {
-                    key: bind.key.clone(),
-                    reason: parse_err.to_string(),
-                }
-            })?;
-            // Blocker 8: an invalid bind command fails config load/reload —
-            // it can never silently become a different command at runtime.
-            // Blocker 7: validation uses the ONE shared parser (same grammar
-            // as the CLI and hotkey dispatch), so syntax cannot drift.
-            if let Err(parse_err) = rovr_protocol::command_parser::parse_command(&bind.command) {
-                return Err(ConfigError::InvalidBindCommand {
-                    key: bind.key.clone(),
-                    reason: parse_err.message,
-                });
-            }
-            if !bind_keys.insert(chord) {
-                return Err(ConfigError::DuplicateBind(bind.key.clone()));
-            }
-        }
-
         Ok(())
     }
 
@@ -417,6 +382,7 @@ impl Config {
                 Ok(CompiledRule {
                     predicate: Predicate { all_of },
                     floating: rule.floating,
+                    manage: rule.manage,
                     target_workspace: rule.target_workspace.clone(),
                     opacity: rule.opacity,
                     layer: rule.layer,
@@ -453,179 +419,6 @@ mod tests {
                 supported: 1
             }
         ));
-    }
-
-    #[test]
-    fn accepts_valid_binds() {
-        let cfg = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "window focus-direction west 1"
-            [[bind]]
-            key = "alt - l"
-            command = "window focus-direction east 1"
-            [[bind]]
-            key = "alt - tab"
-            command = "query windows"
-            [[bind]]
-            key = "alt + shift - tab"
-            command = "query spaces"
-            "#,
-        )
-        .expect("valid binds");
-        assert_eq!(cfg.binds.len(), 4);
-    }
-
-    #[test]
-    fn rejects_unknown_bind_modifier_at_load() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "hyper - h"
-            command = "query --windows"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidBindKey { ref key, ref reason }
-                if key == "hyper - h" && reason.contains("unknown modifier")
-        ));
-    }
-
-    #[test]
-    fn rejects_unknown_bind_key_at_load() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - banana"
-            command = "query --windows"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidBindKey { ref key, ref reason }
-                if key == "alt - banana" && reason.contains("unknown key")
-        ));
-    }
-
-    #[test]
-    fn rejects_empty_bind_key() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = ""
-            command = "query --windows"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::EmptyBindKey));
-    }
-
-    #[test]
-    fn rejects_duplicate_bind_keys() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "query windows"
-            [[bind]]
-            key = "alt - h"
-            command = "query spaces"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "alt - h"));
-    }
-
-    #[test]
-    fn rejects_modifier_alias_duplicate_bind_keys() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "query windows"
-            [[bind]]
-            key = "option - h"
-            command = "query spaces"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "option - h"));
-    }
-
-    #[test]
-    fn rejects_case_duplicate_bind_keys() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "query windows"
-            [[bind]]
-            key = "ALT - H"
-            command = "query spaces"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "ALT - H"));
-    }
-
-    #[test]
-    fn rejects_modifier_order_duplicate_bind_keys() {
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt + shift - h"
-            command = "query windows"
-            [[bind]]
-            key = "shift + option - h"
-            command = "query spaces"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateBind(k) if k == "shift + option - h"));
-    }
-
-    #[test]
-    fn accepts_distinct_normalized_bind_keys() {
-        Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "query windows"
-            [[bind]]
-            key = "shift - h"
-            command = "query spaces"
-            "#,
-        )
-        .expect("distinct binds are valid");
-    }
-
-    #[test]
-    fn blocker8_invalid_bind_command_fails_config_load() {
-        // Flag-style syntax diverging from the real CLI must be rejected at
-        // load time — never silently accepted and never substituted.
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - h"
-            command = "window --focus 1"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidBindCommand { ref key, .. } if key == "alt - h"));
-
-        let err = Config::parse(
-            r#"
-            [[bind]]
-            key = "alt - x"
-            command = "definitely not a command"
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidBindCommand { .. }));
     }
 
     #[test]
@@ -704,6 +497,38 @@ mod tests {
         };
         assert!(title.is_match("Settings"));
         assert_eq!(rules[1].target_workspace.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn partial_general_table_uses_defaults() {
+        // A `[general]` table that sets only one key must not fail parsing.
+        let cfg = Config::parse("[general]\nwindow_shadow = false").unwrap();
+        assert!(!cfg.general.window_shadow);
+        assert_eq!(cfg.general.layout, LayoutKind::Bsp);
+        assert_eq!(cfg.general.reconcile_interval_ms, 1000);
+        assert!(cfg.general.reconcile_on_wake);
+    }
+
+    #[test]
+    fn manage_rule_flag_parses_and_compiles() {
+        let cfg = Config::parse(
+            r#"
+            [[rule]]
+            app = "^System Settings$"
+            manage = false
+            "#,
+        )
+        .unwrap();
+        let rules = cfg.compile_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].manage, Some(false));
+
+        // Absent `manage` leaves the window managed.
+        let default_rules = Config::parse("[[rule]]\napp = \"^Finder$\"")
+            .unwrap()
+            .compile_rules()
+            .unwrap();
+        assert_eq!(default_rules[0].manage, None);
     }
 
     // ---- Screen padding ([layout.padding]) ----

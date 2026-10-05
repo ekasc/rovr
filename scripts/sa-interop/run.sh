@@ -16,7 +16,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PAYLOAD="$ROOT/target/release/build/rovr-sa-payload-86f7435e93f9ff6f/out/librovr_sa_payload.dylib"
+# Cargo's build-dir hash changes whenever the payload crate's inputs change, so
+# discovering the newest artifact beats pinning a hash that silently goes stale.
+PAYLOAD="$(ls -t "$ROOT"/target/release/build/rovr-sa-payload-*/out/librovr_sa_payload.dylib 2>/dev/null | head -n 1)"
 HOST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rovr-sa-interop.XXXXXX")"
 HOST_BIN="$HOST_DIR/host"
 LOG="$HOST_DIR/host.log"
@@ -26,7 +28,7 @@ fail() { echo "FAIL: $*" >&2; kill "$HOST_PID" 2>/dev/null; rm -rf "$HOST_DIR"; 
 echo "== building scratch host =="
 clang -O2 -arch arm64e -o "$HOST_BIN" "$ROOT/scripts/sa-interop/host.c" || fail "clang failed"
 
-[ -f "$PAYLOAD" ] || fail "payload dylib missing at $PAYLOAD — cargo build -p rovr-sa-payload"
+[ -f "$PAYLOAD" ] || fail "payload dylib missing (looked for the newest $ROOT/target/release/build/rovr-sa-payload-*/out/ artifact) — cargo build --release -p rovr-sa-payload"
 codesign -dv "$PAYLOAD" >/dev/null 2>&1 || fail "payload not signed"
 
 UID_N="$(id -u)"
