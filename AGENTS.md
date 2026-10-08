@@ -85,6 +85,29 @@ If something could not be verified, state exactly what was not verified and why.
 - No meta-commentary, no instructions to the operator, no first/second-person
   notes about deployment process or review flow.
 
+## Live Session Testing (critical)
+
+The user's running desktop is a production environment, not a test harness. It
+is the machine they are sitting at, with their windows, Spaces, focus, and open
+documents.
+
+- Never test against the live session without explicit permission. Do not move,
+  resize, focus, close, or open the user's real windows; do not switch their
+  Spaces or displays; do not launch or activate applications; do not touch
+  their clipboard, selected text, or files. `rovr window set-frame`,
+  `rovr space focus`, `osascript … activate`, `open -a …`, and `qlmanage -p`
+  all mutate the session the person is using.
+- Ask first, every time, for the specific action. Approval of one test is not
+  approval of the next. Name exactly what will move or change, then wait for a
+  yes.
+- Prefer an isolated path. A mock platform, a committed fixture, a headless
+  harness, or a throwaway environment. Reach for the live session only when
+  nothing else can answer the question, and say why first.
+- A window manager is the worst case: the thing under test *is* the user's
+  desktop, so a verification step and an interruption are the same action.
+- Read-only is the only free path. Anything that can move focus, raise a
+  window, or animate a Space is a mutation, even if it looks like a query.
+
 ## Rovr-Specific
 
 - `../yabai/` is read-only.

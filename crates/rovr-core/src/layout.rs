@@ -10,17 +10,19 @@ use crate::{DesiredState, ObservedState};
 use rovr_layout_plugin::{PluginRequest, Registry as PluginRegistry};
 
 /// A window is tileable when the WM manages it and it is not fullscreen
-/// and not minimized. `managed` and `minimized` are conservative: Unknown
-/// means not tileable (avoids tiling a minimized window when AX timed out).
+/// and not minimized. `managed` is conservative: Unknown means not tileable
+/// (avoids claiming a window AX could not classify). `minimized` and
+/// `fullscreen` are PERMISSIVE: Unknown means tileable, because macOS returns
+/// empty AX attributes for background windows (e.g. on the inactive display)
+/// and refusing to tile those would leave whole displays untiled; setting a
+/// frame on a genuinely minimized window is harmless and self-corrects.
 /// A fixed-size window (AX size not settable, e.g. Calculator) is reported
 /// unmanaged by the platform, so it floats here instead of being fought.
-/// `fullscreen` is permissive (Unknown treated as not fullscreen) because the
-/// Space type already excludes fullscreen spaces; the SLS fallback resolves
-/// managed for background apps.
+/// The SLS fallback resolves managed for background apps.
 fn is_tileable(w: &WindowSnapshot) -> bool {
     w.managed == rovr_types::ObservedBool::Yes
         && w.fullscreen != rovr_types::ObservedBool::Yes
-        && w.minimized == rovr_types::ObservedBool::No
+        && w.minimized != rovr_types::ObservedBool::Yes
 }
 /// Blocker 10: rule matching uses the COMPILED regexes from config load —
 /// never equality/substring checks that would diverge from validation.
@@ -638,7 +640,7 @@ mod tests {
     /// Blocker 13: an eligibility-critical property reported as Unknown must
     /// NOT be tiled — the policy is conservative and never invents certainty.
     #[test]
-    fn blocker13_unknown_state_is_not_tiled() {
+    fn blocker13_managed_unknown_not_tiled_while_screen_state_unknown_tiles() {
         let config = Config::default();
         let mut observed = ObservedState::default();
         observed.displays.insert(
@@ -746,8 +748,9 @@ mod tests {
             &std::collections::HashSet::new(),
         );
 
-        // Managed and minimized Unknown stay not tiled (conservative). Fullscreen Unknown is
-        // permissive because Space type already excludes fullscreen spaces.
+        // `managed` Unknown stays not-tiled (conservative). `fullscreen` and
+        // `minimized` Unknown are permissive: macOS returns empty AX for
+        // background windows, and refusing those would leave displays untiled.
         assert_eq!(
             desired.windows.get(&WindowId(1)).and_then(|t| t.frame),
             None,
@@ -761,10 +764,13 @@ mod tests {
                 .is_some(),
             "window 2 with Unknown fullscreen must be tiled (permissive)"
         );
-        assert_eq!(
-            desired.windows.get(&WindowId(3)).and_then(|t| t.frame),
-            None,
-            "window 3 with Unknown minimized must not be tiled (conservative)"
+        assert!(
+            desired
+                .windows
+                .get(&WindowId(3))
+                .and_then(|t| t.frame)
+                .is_some(),
+            "window 3 with Unknown minimized must be tiled (permissive)"
         );
         assert_eq!(
             desired.windows.get(&WindowId(4)).and_then(|t| t.frame),

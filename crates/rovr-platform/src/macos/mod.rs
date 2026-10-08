@@ -180,6 +180,7 @@ extern "C" {
     fn rovr_bridge_space_is_fullscreen(space_id: u64) -> i32;
     fn rovr_bridge_space_is_system(space_id: u64) -> i32;
     fn rovr_bridge_is_display_animating(display_id: u32) -> i32;
+    fn rovr_bridge_any_display_animating() -> i32;
     fn rovr_bridge_sls_managed_for_window(window_id: u32) -> i32;
     fn rovr_bridge_dock_pid() -> i32;
     fn rovr_bridge_post_state_changed(state_json: *const c_char);
@@ -1080,6 +1081,10 @@ impl Platform for MacPlatform {
 
     fn needs_refresh(&self) -> bool {
         self.needs_refresh_inner()
+    }
+
+    fn is_animating(&self) -> bool {
+        unsafe { rovr_bridge_any_display_animating() != 0 }
     }
 
     fn snapshot_wedged_ms(&self) -> Option<u64> {

@@ -138,6 +138,13 @@ pub trait Platform: Send {
     fn needs_refresh(&self) -> bool {
         false
     }
+    /// True while a display is mid-transition (Mission Control, Space swipe,
+    /// display reconfiguration). The daemon suspends observation then, because
+    /// macOS reports windows at scaled/transient frames that must not be judged
+    /// as a failed tile. Default false (mock / non-macOS).
+    fn is_animating(&self) -> bool {
+        false
+    }
     /// Publish the canonical public snapshot to external consumers.
     ///
     /// On macOS this posts `com.rovr.state.changed` to

@@ -23,6 +23,13 @@
 typedef AXError (*rovr_ax_get_window_fn)(AXUIElementRef element, CGWindowID *window_id);
 static rovr_ax_get_window_fn g_ax_get_window = NULL;
 
+// _AXUIElementCreateWithRemoteToken is private. It lets us rebuild an
+// AXUIElementRef for a window on an INACTIVE space, where the public
+// kAXWindowsAttribute returns empty. Technique from yabai (window_manager.c),
+// which credits decodism / alt-tab-macos.
+typedef AXUIElementRef (*rovr_ax_create_remote_token_fn)(CFDataRef token);
+static rovr_ax_create_remote_token_fn g_ax_create_remote_token = NULL;
+
 // Accessibility messaging is IPC to another process and may otherwise wait
 // indefinitely when that process stops servicing its AX port.
 static const float ROVR_AX_MESSAGING_TIMEOUT_SECONDS = 0.5f;
@@ -86,6 +93,11 @@ static rovr_sls_window_iter_advance_fn g_sls_window_iter_advance = NULL;
 static rovr_sls_window_iter_parent_fn g_sls_window_iter_parent = NULL;
 static rovr_sls_window_iter_level_fn g_sls_window_iter_level = NULL;
 static rovr_sls_get_menu_autohide_fn g_sls_get_menu_autohide = NULL;
+// Menu-bar autohide SETTING, read once at init (-1 = unknown). Held because
+// reading it live after a display reconfiguration returns stale/wrong values
+// in this process (the phantom "gap above windows" that appears only after
+// unplugging a monitor and clears on restart).
+static int g_menu_bar_autohide = -1;
 static rovr_sls_get_revealed_menu_bounds_fn g_sls_get_revealed_menu = NULL;
 static rovr_sls_get_display_menubar_height_fn g_sls_get_menubar_height = NULL;
 static rovr_sls_get_dock_rect_fn g_sls_get_dock_rect = NULL;
@@ -187,6 +199,10 @@ static rovr_ax_event_trampoline_fn g_event_trampoline = NULL;
 // Resolves a window id to its AX element (+1, caller releases) and owning
 // pid. Defined below; needed by the focused-window title tracker.
 static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_pid);
+static void rovr_ax_cache_put(uint32_t wid, pid_t pid, AXUIElementRef element);
+static AXUIElementRef rovr_ax_cache_get(uint32_t wid, pid_t *pid_out);
+static void rovr_ax_cache_remove(uint32_t wid);
+static void rovr_ax_cache_drop_pid(pid_t pid);
 // Removes the title subscription; caller holds g_title_lock. Defined below.
 static void rovr_untrack_title_locked(void);
 
@@ -332,6 +348,7 @@ static void rovr_prune_observers(void) {
         AXObserverRemoveNotification(removed[i].observer, removed[i].app, kAXUIElementDestroyedNotification);
         CFRelease(removed[i].observer);
         CFRelease(removed[i].app);
+        rovr_ax_cache_drop_pid(removed[i].pid);
     }
 }
 
@@ -462,7 +479,145 @@ static void rovr_ax_enable_manual_accessibility(AXUIElementRef app) {
     }
 }
 
+// ---- AX element cache -----------------------------------------------------
+// macOS returns an empty kAXWindowsAttribute for apps that are not frontmost,
+// so a background window's AX element cannot be resolved (the "background apps
+// return EMPTY AX windows" gap recorded in TODO.md). Yabai keeps its own AX
+// element per window for the same reason. Cache the element by CGWindowID
+// whenever it IS resolvable (the app is frontmost), then consult the cache
+// first so frame/focus/close keep working after the app goes to the
+// background. A stale entry (dead window) fails its role read and is dropped.
+#define ROVR_AX_CACHE_MAX 512
+typedef struct {
+    uint32_t wid;
+    pid_t pid;
+    AXUIElementRef element;
+} rovr_ax_cache_entry;
+static pthread_mutex_t g_ax_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static rovr_ax_cache_entry g_ax_cache[ROVR_AX_CACHE_MAX];
+static int g_ax_cache_count = 0;
+
+static void rovr_ax_cache_put(uint32_t wid, pid_t pid, AXUIElementRef element) {
+    if (!element || wid == 0) return;
+    pthread_mutex_lock(&g_ax_cache_lock);
+    for (int i = 0; i < g_ax_cache_count; i++) {
+        if (g_ax_cache[i].wid == wid) {
+            CFRelease(g_ax_cache[i].element);
+            g_ax_cache[i].pid = pid;
+            g_ax_cache[i].element = (AXUIElementRef)CFRetain(element);
+            pthread_mutex_unlock(&g_ax_cache_lock);
+            return;
+        }
+    }
+    int slot = (g_ax_cache_count < ROVR_AX_CACHE_MAX) ? g_ax_cache_count++ : 0;
+    if (g_ax_cache[slot].element) CFRelease(g_ax_cache[slot].element);
+    g_ax_cache[slot].wid = wid;
+    g_ax_cache[slot].pid = pid;
+    g_ax_cache[slot].element = (AXUIElementRef)CFRetain(element);
+    pthread_mutex_unlock(&g_ax_cache_lock);
+}
+
+static AXUIElementRef rovr_ax_cache_get(uint32_t wid, pid_t *pid_out) {
+    AXUIElementRef result = NULL;
+    pthread_mutex_lock(&g_ax_cache_lock);
+    for (int i = 0; i < g_ax_cache_count; i++) {
+        if (g_ax_cache[i].wid == wid) {
+            result = (AXUIElementRef)CFRetain(g_ax_cache[i].element);
+            if (pid_out) *pid_out = g_ax_cache[i].pid;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_ax_cache_lock);
+    return result;
+}
+
+static void rovr_ax_cache_remove(uint32_t wid) {
+    pthread_mutex_lock(&g_ax_cache_lock);
+    for (int i = 0; i < g_ax_cache_count; i++) {
+        if (g_ax_cache[i].wid == wid) {
+            CFRelease(g_ax_cache[i].element);
+            g_ax_cache[i] = g_ax_cache[g_ax_cache_count - 1];
+            g_ax_cache_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_ax_cache_lock);
+}
+
+static void rovr_ax_cache_drop_pid(pid_t pid) {
+    pthread_mutex_lock(&g_ax_cache_lock);
+    for (int i = g_ax_cache_count - 1; i >= 0; i--) {
+        if (g_ax_cache[i].pid == pid) {
+            CFRelease(g_ax_cache[i].element);
+            g_ax_cache[i] = g_ax_cache[g_ax_cache_count - 1];
+            g_ax_cache_count--;
+        }
+    }
+    pthread_mutex_unlock(&g_ax_cache_lock);
+}
+
+// Rebuild a window's AX element from a remote token when the public AX API
+// returns nothing (window on an inactive space / app in the background). Token
+// layout: {pid, 0, 'coco', element_id}; element_id is brute-forced. On a match
+// the element is returned (+1, caller releases) and the caller caches it, so
+// the scan happens at most once per window. Technique from yabai.
+static AXUIElementRef rovr_ax_window_via_token(uint32_t target_id, pid_t pid) {
+    if (!g_ax_create_remote_token || !g_ax_get_window || pid <= 0) return NULL;
+    CFMutableDataRef token = CFDataCreateMutable(NULL, 0);
+    if (!token) return NULL;
+    CFDataIncreaseLength(token, 0x14);
+    uint8_t *data = CFDataGetMutableBytePtr(token);
+    if (!data) {
+        CFRelease(token);
+        return NULL;
+    }
+    *(uint32_t *)(data + 0x0) = (uint32_t)pid;
+    *(uint32_t *)(data + 0x8) = 0x636f636f;
+    AXUIElementRef found = NULL;
+    for (uint64_t element_id = 0; element_id < 0x7fff; ++element_id) {
+        memcpy(data + 0xc, &element_id, sizeof(uint64_t));
+        AXUIElementRef element = g_ax_create_remote_token((CFDataRef)token);
+        if (!element) continue;
+        CFTypeRef role = NULL;
+        bool matched = false;
+        if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &role) == kAXErrorSuccess &&
+            role && CFGetTypeID(role) == CFStringGetTypeID() && CFEqual(role, kAXWindowRole)) {
+            CGWindowID wid = 0;
+            if (g_ax_get_window(element, &wid) == kAXErrorSuccess && wid == target_id) {
+                matched = true;
+            }
+        }
+        if (role) CFRelease(role);
+        if (matched) {
+            rovr_ax_apply_timeout(element);
+            found = element; // +1 for the caller
+            break;
+        }
+        CFRelease(element);
+    }
+    CFRelease(token);
+    return found;
+}
+
 static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_pid) {
+    // Fast path: a previously cached element. The owning app may be in the
+    // background now, where kAXWindowsAttribute is empty and enumeration below
+    // would fail.
+    pid_t cached_pid = 0;
+    AXUIElementRef cached = rovr_ax_cache_get(target_id, &cached_pid);
+    if (cached) {
+        CFTypeRef role = NULL;
+        AXError role_err = AXUIElementCopyAttributeValue(cached, kAXRoleAttribute, &role);
+        if (role) CFRelease(role);
+        if (role_err == kAXErrorSuccess) {
+            rovr_ax_apply_timeout(cached);
+            if (resolved_pid) *resolved_pid = cached_pid;
+            return cached;
+        }
+        CFRelease(cached);
+        rovr_ax_cache_remove(target_id);
+    }
+
     CFArrayRef window_info = CGWindowListCopyWindowInfo(
         kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
@@ -647,7 +802,15 @@ static AXUIElementRef rovr_ax_window_for_id(uint32_t target_id, pid_t *resolved_
     }
     if (value) CFRelease(value);
 
+    // Still nothing? The window is on an inactive space / the app is in the
+    // background, where kAXWindowsAttribute is empty. Rebuild the element from
+    // a remote token (yabai technique) instead of giving up.
+    if (!result && target_pid > 0) {
+        result = rovr_ax_window_via_token(target_id, target_pid);
+    }
+
     CFRelease(app);
+    if (result) rovr_ax_cache_put(target_id, target_pid, result);
     return result;
 }
 
@@ -1088,6 +1251,12 @@ void rovr_bridge_run_event_loop(void) {
 
 int rovr_bridge_init(void) {
     g_ax_get_window = (rovr_ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
+    g_ax_create_remote_token = (rovr_ax_create_remote_token_fn)dlsym(
+        RTLD_DEFAULT, "_AXUIElementCreateWithRemoteToken");
+    if (!g_ax_create_remote_token) {
+        g_ax_create_remote_token = (rovr_ax_create_remote_token_fn)dlsym(
+            RTLD_DEFAULT, "AXUIElementCreateWithRemoteToken");
+    }
     g_sls_main_connection = (rovr_sls_main_connection_fn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
     g_sls_copy_managed_display_spaces =
         (rovr_sls_copy_managed_display_spaces_fn)dlsym(RTLD_DEFAULT, "SLSCopyManagedDisplaySpaces");
@@ -1126,6 +1295,12 @@ int rovr_bridge_init(void) {
     g_sls_get_dock_rect = (rovr_sls_get_dock_rect_fn)dlsym(RTLD_DEFAULT, "SLSGetDockRectWithReason");
     g_core_dock_autohide = (rovr_core_dock_autohide_fn)dlsym(RTLD_DEFAULT, "CoreDockGetAutoHideEnabled");
     g_core_dock_orient = (rovr_core_dock_orient_fn)dlsym(RTLD_DEFAULT, "CoreDockGetOrientationAndPinning");
+    if (g_sls_get_menu_autohide && g_sls_main_connection) {
+        int v = 0;
+        if (g_sls_get_menu_autohide(g_sls_main_connection(), &v) == kCGErrorSuccess) {
+            g_menu_bar_autohide = (v != 0) ? 1 : 0;
+        }
+    }
     g_sls_request_notifications = (rovr_sls_request_notifications_fn)dlsym(RTLD_DEFAULT, "SLSRequestNotificationsForWindows");
     g_sls_register_notify =
         (rovr_sls_register_notify_fn)dlsym(RTLD_DEFAULT, "SLSRegisterConnectionNotifyProc");
@@ -1442,6 +1617,7 @@ int rovr_bridge_refine_windows_for_pid(
                     elements[i], CFSTR("AXFullScreen")),
                 .managed = (uint8_t)rovr_ax_managed_for_window(elements[i]),
             };
+            rovr_ax_cache_put(ids[i], pid, elements[i]);
             callback(&refinement, context);
             CFRelease(elements[i]);
         }
@@ -1466,12 +1642,30 @@ static int rovr_display_notch_height(uint32_t did) {
     return 0;
 }
 
-static bool rovr_menu_bar_hidden(void) {
-    if (g_sls_get_menu_autohide && g_sls_main_connection) {
-        int enabled = 0;
-        if (g_sls_get_menu_autohide(g_sls_main_connection(), &enabled) == kCGErrorSuccess) return enabled != 0;
+// Whether this display's menu bar takes permanent space. The autohide SETTING
+// is authoritative for intent: an auto-hidden bar never takes permanent space.
+// NSScreen.visibleFrame is only a fallback, because inside a background agent
+// it can report the reserved strip even when the bar is auto-hidden (the exact
+// cause of a spurious "gap above every window"). If neither signal can be
+// read, do NOT reserve — a stray strip is worse than a window that may sit
+// under a visible menu bar.
+static bool rovr_menu_bar_hidden_for_display(CGDirectDisplayID did) {
+    // The cached autohide setting is authoritative: an auto-hidden bar never
+    // takes permanent space, and the live query is unreliable after a display
+    // reconfiguration. See g_menu_bar_autohide.
+    if (g_menu_bar_autohide == 1) return true;
+    // Otherwise use NSScreen's reserved top area.
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+        if (num && [num unsignedIntValue] == did) {
+            CGRect sf = screen.frame;
+            CGRect vf = screen.visibleFrame;
+            CGFloat top_reserved = (sf.origin.y + sf.size.height) - (vf.origin.y + vf.size.height);
+            return top_reserved <= 0.5;
+        }
     }
-    return false;
+    // Neither signal readable: do not reserve.
+    return true;
 }
 
 static bool rovr_dock_hidden(void) {
@@ -1484,13 +1678,38 @@ static CGRect rovr_display_constrained_bounds(CGDirectDisplayID did) {
     bool canUseSLS = g_sls_main_connection && g_sls_get_dock_rect;
     if (canUseSLS) {
         int cid = g_sls_main_connection();
-        if (rovr_menu_bar_hidden()) {
+        if (rovr_menu_bar_hidden_for_display(did)) {
             int notch = rovr_display_notch_height(did);
             if (notch > 0) {
                 frame.origin.y += notch;
                 frame.size.height -= notch;
             }
         } else {
+            // Diagnostic: the daemon entered the "menu bar visible" branch.
+            // Logs both inputs so a disconnect-triggered spurious reservation
+            // can be attributed to SLS autohide vs NSScreen. Remove once fixed.
+            {
+                int en = -1;
+                int ee = -1;
+                if (g_sls_get_menu_autohide && g_sls_main_connection) {
+                    int v = 0;
+                    ee = (int)g_sls_get_menu_autohide(g_sls_main_connection(), &v);
+                    en = v;
+                }
+                CGFloat ns_top = -1;
+                for (NSScreen *s in [NSScreen screens]) {
+                    NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+                    if (n && [n unsignedIntValue] == did) {
+                        CGRect sf = s.frame;
+                        CGRect vf = s.visibleFrame;
+                        ns_top = (sf.origin.y + sf.size.height) - (vf.origin.y + vf.size.height);
+                        break;
+                    }
+                }
+                fprintf(stderr,
+                        "[rovr-gap] did=%u reserving menu bar: autohide_err=%d val=%d ns_top=%.0f\n",
+                        did, ee, en, ns_top);
+            }
             uint64_t sid = 0;
             if (g_sls_copy_managed_display_spaces) {
                 CFArrayRef spaces = g_sls_copy_managed_display_spaces(cid);
@@ -1792,6 +2011,20 @@ int rovr_bridge_toggle_fullscreen(uint32_t window_id) {
 
 int rovr_bridge_is_display_animating(uint32_t display_id) {
     return rovr_display_is_animating(display_id) ? 1 : 0;
+}
+
+// True while ANY active display is mid-transition (Mission Control, Space
+// swipe, display reconfiguration). Observation is suspended during animation
+// because macOS reports windows at scaled/transient frames then; judging those
+// as a failed tile would auto-float perfectly tileable windows.
+int rovr_bridge_any_display_animating(void) {
+    CGDirectDisplayID displays[32] = {0};
+    uint32_t count = 0;
+    if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (rovr_display_is_animating(displays[i])) return 1;
+    }
+    return 0;
 }
 
 int32_t rovr_bridge_dock_pid(void) {
