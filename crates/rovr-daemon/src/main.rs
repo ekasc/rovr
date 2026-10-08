@@ -1466,6 +1466,13 @@ impl Daemon {
     }
 
     fn refresh_observation(&mut self) -> bool {
+        // Never observe mid-transition: Mission Control and Space swipes report
+        // windows at scaled, transient frames, and judging those as a failed
+        // tile would auto-float perfectly tileable windows. The next tick after
+        // the animation observes normally.
+        if self.platform.is_animating() {
+            return false;
+        }
         let mut changed = false;
         // Capabilities are probed live by the platform (SA attribs follow
         // install/uninstall/reinjection). Re-sync the engine's copy every
