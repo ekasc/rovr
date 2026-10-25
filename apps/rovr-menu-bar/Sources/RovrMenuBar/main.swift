@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func runDoctor() {
-        let out = shell("rovr", ["doctor"])
+        let out = shell("rovr", ["doctor", "--json"])
         doctorCache = out
         showAlert(title: "rovr doctor", message: prettyJSON(out) ?? String(out.prefix(6000)))
     }
@@ -68,8 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func refresh() {
-        // Use doctor via public IPC (CLI) — no layout logic in Swift
-        let out = shell("rovr", ["doctor"])
+        // Use doctor via public IPC (CLI) — no layout logic in Swift.
+        // `--json` keeps the machine payload; the readable report is for humans.
+        let out = shell("rovr", ["doctor", "--json"])
         doctorCache = out
         // Parse minimal JSON for status without layout logic
         let ok = isDoctorOk(out)

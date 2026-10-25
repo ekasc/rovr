@@ -4,8 +4,9 @@ Rovr ships its own privileged payload. It is **not** yabai's payload. Rovr never
 
 ## Socket namespace
 
-- The Dock payload and its Rust client use the user-owned `0700` runtime directory `/tmp/rovr-<uid>/` with socket `sa.sock`. UID comes from `getuid()`, not `$USER`. Clients validate socket ownership and kernel peer credentials.
-- The DAEMON socket is not in that directory. It is `$HOME/Library/Caches/rovr/daemon.sock` (mode 0600, directory 0700), because `com.apple.tmp_cleaner` deletes `/tmp` entries whose atime, mtime and ctime are all older than 3 days, and a bound Unix socket's timestamps never advance. The SA socket keeps its `/tmp` path because relocating it means rebuilding and reinstalling the payload dylib.
+- The Dock payload and its Rust client use `$HOME/Library/Caches/rovr/sa.sock` in the user-owned `0700` runtime directory (the same directory as the daemon socket). The payload resolves the home directory of the console user it runs as. Clients validate socket ownership and kernel peer credentials.
+- **Why not `/tmp`:** `com.apple.tmp_cleaner` runs daily and deletes `/tmp` entries whose atime, mtime and ctime are all older than 3 days. A bound Unix socket never touches its path again, so its timestamps freeze at bind time: a `/tmp` SA socket was deleted about three days after every injection, leaving the still-running payload unreachable and the SA dead until Dock restarted. Both sockets now share the durable cache directory.
+- Upgrades do not need a Dock restart: the loader injects a content-addressed copy (`librovr_sa_payload.<sha16>.dylib`). `dlopen` of a path Dock already has mapped is a no-op, which is why replacing the canonical dylib never reached a running Dock; a new build hashes to a new path, so dyld loads it.
 
 ## Protocol
 
@@ -84,7 +85,7 @@ Division of responsibility:
 
 - The request frame is exactly `{magic, proto, opcode, uid}` — there is structurally NO field for a pid, path, command or environment (unit-tested).
 - Payload/loader/helper paths are compile-time constants pointing at the root-owned installed artifacts; the helper resolves Dock itself via `NSRunningApplication` and never trusts a caller-supplied PID.
-- Callers are authenticated with `getpeereid()`: kernel peer uid must equal BOTH the uid in the request AND the owner of `/dev/console` (the GUI session user). Sockets live in the UID-specific `0700` runtime directory (`/tmp/rovr-<uid>/`), so an injection is always bound to the requesting console session; other users' processes are refused.
+- Callers are authenticated with `getpeereid()`: kernel peer uid must equal BOTH the uid in the request AND the owner of `/dev/console` (the GUI session user). Sockets live in the console user's `0700` runtime directory (`$HOME/Library/Caches/rovr/`), so an injection is always bound to the requesting console session; other users' processes are refused.
 - Artifacts are re-validated before every use: regular files only (`lstat` + `O_NOFOLLOW` — symlinks refused), root-owned, expected modes, install directory not group/other-writable.
 - The helper runs the loader via `posix_spawn` with a FIXED argv and a fixed minimal environment — nothing inherited from the request or daemon.
 - Event-driven only: launchd starts the helper when a client connects; no root process polls anything.
@@ -95,12 +96,18 @@ Apple's current API, `SMAppService.daemon(plistName:)` (macOS 13+), registers a 
 
 ## Doctor integration
 
-- `rovr doctor` includes `sa: { socket, present, version, compatible, attribs, expected_prefix }` plus `snapshot_wedged_ms` for observation-worker health. Incompatible or missing payload is reported cleanly, not silently degraded.
+- `rovr doctor` prints a grouped human-readable report; the raw payload described below (and everything the GUI and menu bar parse) is available with `rovr doctor --json`. It includes `sa: { socket, present, version, compatible, attribs, expected_prefix }` plus `snapshot_wedged_ms` for observation-worker health. Incompatible or missing payload is reported cleanly, not silently degraded.
 - It also includes `sa_reinject`: the daemon's live reinjection lifecycle — `phase` (healthy/injecting/verifying/failed), `generation` and `dock_pid` (every attempt is keyed to the Dock generation), `attempts_this_generation`, `retry_in_secs` (active backoff), `pending`, `last_result`, `last_error` and the fixed `helper_socket`. No secrets or privileged internals are exposed.
 
 ## Update behavior
 
 Replacing the installed payload dylib does NOT update code already mapped into Dock. `payload.installed.json` records the installed sha256 and the handshake version observed after installation, but Dock does not expose the hash of mapped payload code. `rovr sa status` therefore reports that limitation instead of claiming an injected hash. Reinjection into the running Dock happens only through the explicit install command or the daemon's bounded automatic path for a new Dock generation.
+
+### Which payload `sa install` picks
+
+`sa install` installs, in order: (1) a complete build tree next to the `rovr` you invoked (`cargo build -p rovr-sa-payload -p rovr-sa-loader -p rovr-sa-helper` outputs, under `target/<profile>/build/<crate>-<hash>/out`), then (2) the permanent-install locations (`$PREFIX/lib/rovr`, `~/.local/lib/rovr`). A build tree always wins, so reinstalling from the repo refreshes the SA payload instead of silently re-copying whatever a previous install left in `/usr/local/lib/rovr` — the failure that left macOS 27.2 running the Oct 9 payload with `create_space`/`destroy_space`/`reorder_space` reported missing.
+
+A build tree with only some of the three artifacts is an error, not a fallback: pairing a fresh payload with a stale loader or helper is a silent version mismatch. If the chosen payload is byte-identical to the one already installed, `sa install` prints a warning naming the rebuild to run.
 
 ## Versioning
 
@@ -116,6 +123,24 @@ The payload, loader, helper and install lifecycle compile and the protocol clien
 - Cosmetics verified live: opacity, sticky, shadow (user-confirmed visually), layer transitions, PiP/scale toggle — all ACKed and reverted.
 - Automatic reinjection verified across a real Dock restart: `killall Dock` → new Dock generation → helper reinjected → handshake recovered in ~6 s → full attribs (`0x7ff`) re-resolved by the fresh injection (the long-running original Dock had not resolved `add_space`; the fresh process did).
 - macOS 27 support verified on 27.0 (26A428, M2 arm64e): the payload accepts major version 27 and resolves the Dock symbols from per-build offsets read out of the shipped Dock binary. Injecting the rebuilt payload into the live Dock moved the handshake from `0x7c0`, with create/destroy/reorder/focus Space missing, to `0x7ff` with all four present.
+
+### Per-build offset gating (macOS 27.2, 26B5101f)
+
+Dock's private code shifts **between builds of the same major version**, so `majorVersion` alone is not a sufficient key. Offsets and patterns are now gated on the OS build string, parsed from `operatingSystemVersionString` at payload init (no new API or entitlement needed); an unparseable string leaves every build-gated branch falling through to the major-version default, so an unknown build degrades to the previous behaviour rather than mis-scanning.
+
+Recorded for 26B5101f (arm64, verified against the shipped Dock binary):
+
+| symbol | offset | note |
+|---|---|---|
+| `dock_spaces` | `0x2f000` | resolves at `0x2f930` (window previously started at `0x30000`, past it) |
+| `add_space` | `0x180000` | resolves at `0x18560c` |
+| `remove_space` | `0x120000` | resolves at `0x12cbac` |
+| `move_space` | `0xe0000` | resolves at `0xf0f8c`; function gained a stack frame (`sub sp, sp, #0x20`) so the pattern tail changed from `... F6 03 14 AA` to `... FF 03 01 D1 FA 03 02 AA FC 03 01 AA F6 03 00 AA` |
+| `dppm` | `0x50000` | **unresolved**: its adrp/add/ldr + mov/mov access shape no longer exists, and the `moveSpace:toDisplay:displayUUID:` selector is absent from the binary |
+
+**Known gap, reported honestly:** `reorder_space` stays `false` on 26B5101f. `do_space_move` early-returns unless `dppm` resolved, so the payload no longer sets `OSAX_ATTRIB_MOV_SPACE` on `move_space_fp` alone; claiming it would promise an operation that silently does nothing. Deriving a new `dppm` pattern needs a disassembler pass. `create_space`, `destroy_space`, `focus_space` and `move_window_to_space` all work, yielding `attribs = 0x7ed`.
+
+`python3 scripts/verify-sa-patterns.py` replays `hex_find_seq`'s semantics (byte-granular wildcards, whole-byte wildcard when a token's first character is `?`, `0x1286a0` scan cap) against the local Dock and fails if any required symbol stops resolving. Run it after touching `crates/rovr-sa-payload/vendor/`.
 
 **Still unverified:** reboot recovery (helper-driven reinjection after a cold boot) and the update-simulation path (installing a rebuilt payload over a running one). Until demonstrated, those remain `[~]`.
 

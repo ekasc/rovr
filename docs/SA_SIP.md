@@ -24,7 +24,7 @@ Rovr will **not** ask for `csrutil disable` (full SIP off). `rovr sa install` ch
 
 ## Why not weaker?
 
-- The SA exists solely to expose primitive SkyLight / window-level ops that have no public API and require Dock context. The Rust daemon never runs with Dock privileges itself; it talks to Dock only over the private Unix socket `/tmp/rovr-<uid>/sa.sock` in a user-owned `0700` runtime directory, with peer-credential checks and a 2 s deadline and versioned handshake. The payload has no layout policy, no config, no desired-state — compromise of the SA cannot directly reconfigure tiling policy.
+- The SA exists solely to expose primitive SkyLight / window-level ops that have no public API and require Dock context. The Rust daemon never runs with Dock privileges itself; it talks to Dock only over the private Unix socket `$HOME/Library/Caches/rovr/sa.sock` in a user-owned `0700` runtime directory, with peer-credential checks and a 2 s deadline and versioned handshake. The payload has no layout policy, no config, no desired-state — compromise of the SA cannot directly reconfigure tiling policy.
 - The installed loader is mode 744 (root-only execute), the dylib 644; both live in a root-owned directory. Normal Rovr operation never escalates.
 
 ## Operationally

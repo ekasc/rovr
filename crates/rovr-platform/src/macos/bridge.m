@@ -16,6 +16,19 @@
 #import <signal.h>
 #import <errno.h>
 #import <pthread.h>
+#include <pwd.h>
+
+// Resolve a user's home directory by uid (see bridge.h). The SA socket lives in
+// <home>/Library/Caches/rovr, so a privileged caller (`sudo rovr sa ...`) must
+// address the console user's home rather than root's $HOME.
+int rovr_bridge_home_dir_for_uid(uint32_t uid, char *buffer, size_t size) {
+    if (!buffer || size == 0) return 0;
+    struct passwd *pw = getpwuid((uid_t)uid);
+    if (!pw || !pw->pw_dir || !pw->pw_dir[0]) return 0;
+    if (strlen(pw->pw_dir) >= size) return 0;
+    strcpy(buffer, pw->pw_dir);
+    return 1;
+}
 
 // _AXUIElementGetWindow is private. Resolve it dynamically so the bridge still
 // links if the symbol disappears. The private capability layer will eventually
@@ -499,22 +512,30 @@ static int g_ax_cache_count = 0;
 
 static void rovr_ax_cache_put(uint32_t wid, pid_t pid, AXUIElementRef element) {
     if (!element || wid == 0) return;
+    // Take ownership BEFORE releasing any slot. The incoming element can be
+    // the very object a slot already holds (window elements are recycled by
+    // AX), and release-then-retain would deallocate it under us. The two
+    // crashes this caused were CFRetain/CFRelease PAC traps in this function.
+    AXUIElementRef retained = (AXUIElementRef)CFRetain(element);
+    AXUIElementRef evicted = NULL;
     pthread_mutex_lock(&g_ax_cache_lock);
     for (int i = 0; i < g_ax_cache_count; i++) {
         if (g_ax_cache[i].wid == wid) {
-            CFRelease(g_ax_cache[i].element);
+            evicted = g_ax_cache[i].element;
             g_ax_cache[i].pid = pid;
-            g_ax_cache[i].element = (AXUIElementRef)CFRetain(element);
+            g_ax_cache[i].element = retained;
             pthread_mutex_unlock(&g_ax_cache_lock);
+            if (evicted) CFRelease(evicted);
             return;
         }
     }
     int slot = (g_ax_cache_count < ROVR_AX_CACHE_MAX) ? g_ax_cache_count++ : 0;
-    if (g_ax_cache[slot].element) CFRelease(g_ax_cache[slot].element);
+    evicted = g_ax_cache[slot].element;
     g_ax_cache[slot].wid = wid;
     g_ax_cache[slot].pid = pid;
-    g_ax_cache[slot].element = (AXUIElementRef)CFRetain(element);
+    g_ax_cache[slot].element = retained;
     pthread_mutex_unlock(&g_ax_cache_lock);
+    if (evicted) CFRelease(evicted);
 }
 
 static AXUIElementRef rovr_ax_cache_get(uint32_t wid, pid_t *pid_out) {
@@ -535,10 +556,18 @@ static void rovr_ax_cache_remove(uint32_t wid) {
     pthread_mutex_lock(&g_ax_cache_lock);
     for (int i = 0; i < g_ax_cache_count; i++) {
         if (g_ax_cache[i].wid == wid) {
-            CFRelease(g_ax_cache[i].element);
-            g_ax_cache[i] = g_ax_cache[g_ax_cache_count - 1];
-            g_ax_cache_count--;
-            break;
+            AXUIElementRef released = g_ax_cache[i].element;
+            int last = g_ax_cache_count - 1;
+            g_ax_cache[i] = g_ax_cache[last];
+            // Clear the vacated tail slot. Without this it keeps a pointer to
+            // an element that was just released, and the next put() reuses
+            // that index and releases it a second time — a use-after-free the
+            // crash reports showed as PAC traps in CFRelease/CFRetain.
+            g_ax_cache[last] = (rovr_ax_cache_entry){0};
+            g_ax_cache_count = last;
+            pthread_mutex_unlock(&g_ax_cache_lock);
+            if (released) CFRelease(released);
+            return;
         }
     }
     pthread_mutex_unlock(&g_ax_cache_lock);
@@ -547,11 +576,16 @@ static void rovr_ax_cache_remove(uint32_t wid) {
 static void rovr_ax_cache_drop_pid(pid_t pid) {
     pthread_mutex_lock(&g_ax_cache_lock);
     for (int i = g_ax_cache_count - 1; i >= 0; i--) {
-        if (g_ax_cache[i].pid == pid) {
-            CFRelease(g_ax_cache[i].element);
-            g_ax_cache[i] = g_ax_cache[g_ax_cache_count - 1];
-            g_ax_cache_count--;
-        }
+        if (g_ax_cache[i].pid != pid) continue;
+        AXUIElementRef released = g_ax_cache[i].element;
+        int last = g_ax_cache_count - 1;
+        g_ax_cache[i] = g_ax_cache[last];
+        // Same vacated-tail invariant as rovr_ax_cache_remove. Dropping an
+        // app is the common path here, so a leaked slot pointer would be
+        // reused (and double-released) almost immediately.
+        g_ax_cache[last] = (rovr_ax_cache_entry){0};
+        g_ax_cache_count = last;
+        if (released) CFRelease(released);
     }
     pthread_mutex_unlock(&g_ax_cache_lock);
 }
@@ -1469,6 +1503,9 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
             // space-bound on hover and would make BSP see 2 windows on the
             // Space. Filter by size here; the AX-managed check in refinement
             // handles the rest (e.g. AXDialog) but can't catch these.
+            // Surfaces taller than this filter (e.g. 1470×68) still pass it;
+            // they are caught structurally instead, as candidates absent from
+            // the app's own AX window list (demote_ax_absent_candidates).
             if (bounds.size.height < 60.0 || bounds.size.width < 80.0) continue;
 
             rovr_bridge_window window = {0};
@@ -1526,7 +1563,9 @@ int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void 
 int rovr_bridge_refine_windows_for_pid(
     int32_t pid,
     rovr_ax_window_callback callback,
-    void *context) {
+    void *context,
+    uint8_t *ax_list_authoritative) {
+    if (ax_list_authoritative) *ax_list_authoritative = 0;
     if (pid <= 0 || !callback || !g_ax_get_window) return 1;
 
     #define ROVR_AX_MAX_WINDOWS 512
@@ -1561,6 +1600,13 @@ int rovr_bridge_refine_windows_for_pid(
                     ids[ax_count] = (uint32_t)gid;
                     elements[ax_count++] = (AXUIElementRef)CFRetain(window);
                 }
+            }
+            // A readable, non-empty list that mapped at least one element to a
+            // window id is authoritative. Computed before the main/focused
+            // fallback below: that path is permissive for apps exposing no
+            // window list at all, and must not make them authoritative.
+            if (ax_list_authoritative && ax_count > 0 && CFArrayGetCount(windows) > 0) {
+                *ax_list_authoritative = 1;
             }
             CFRelease(value);
         } else {

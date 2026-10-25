@@ -13,6 +13,7 @@ use rovr_protocol::{
     Response, ResponseOutcome, ScratchpadCommand, SpaceCommand, WindowCommand, WorkspaceCommand,
 };
 use rovr_types::{Direction, Rect, SpaceId, WindowId};
+use serde_json::Value;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -32,8 +33,9 @@ enum TopCommand {
     Ping,
     #[command(about = "Run one observation pass now (internal)")]
     Refresh,
-    Doctor,
+    Doctor(DoctorArgs),
     Sa(SaArgs),
+    Service(ServiceArgs),
     Query(QueryArgs),
     Window(WindowArgs),
     Space(SpaceArgs),
@@ -47,6 +49,15 @@ enum TopCommand {
     Completions {
         shell: Shell,
     },
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Print the raw doctor payload as JSON instead of the readable report.
+    /// Machine consumers (menu bar, GUI, scripts) should pass this so their
+    /// parsing never depends on the report's layout.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +115,22 @@ enum WindowSubcommand {
     )]
     MoveToWorkspace {
         workspace: String,
+        window: Option<u32>,
+    },
+    #[command(
+        name = "move-to-display",
+        about = "Send window to the adjacent display (left/right/up/down) by physical arrangement; defaults to the focused window"
+    )]
+    MoveToDisplay {
+        direction: DirectionArg,
+        window: Option<u32>,
+    },
+    #[command(
+        name = "move-to-new-space",
+        about = "Create a fresh Space on the adjacent display (left/right/up/down) and send the window there with focus; defaults to the focused window"
+    )]
+    MoveToNewSpace {
+        direction: DirectionArg,
         window: Option<u32>,
     },
     SetLayer {
@@ -228,7 +255,9 @@ enum SpaceSubcommand {
 enum DirectionArg {
     North,
     South,
+    #[value(alias = "right")]
     East,
+    #[value(alias = "left")]
     West,
 }
 
@@ -350,6 +379,27 @@ enum SaSubcommand {
     Uninstall,
 }
 
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+/// Daemon process lifecycle. The daemon is a launchd LaunchAgent; these
+/// commands drive `launchctl` so a crashed or stopped daemon can be brought
+/// back without re-running the installer.
+#[derive(Debug, Subcommand)]
+enum ServiceSubcommand {
+    /// Show whether launchd has the daemon loaded and whether its socket answers.
+    Status,
+    /// Load and start the daemon LaunchAgent.
+    Start,
+    /// Stop and unload the daemon LaunchAgent.
+    Stop,
+    /// Restart the running daemon in place.
+    Restart,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let TopCommand::Completions { shell } = cli.command {
@@ -364,6 +414,13 @@ fn main() -> Result<()> {
     }
     if let TopCommand::Sa(args) = &cli.command {
         return run_sa(args);
+    }
+    if let TopCommand::Service(args) = &cli.command {
+        return run_service(args);
+    }
+    if let TopCommand::Doctor(args) = &cli.command {
+        let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+        return run_doctor(&socket, args.json);
     }
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     if matches!(cli.command, TopCommand::Subscribe) {
@@ -419,6 +476,380 @@ fn print_current_response(response: &Response) -> Result<()> {
     }
 }
 
+/// `rovr doctor`: one human-readable diagnostics report. `--json` keeps the raw
+/// payload for machine consumers, which must never parse the report's layout.
+fn run_doctor(socket: &Path, json: bool) -> Result<()> {
+    let request = Request::new(
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        Command::Doctor,
+    );
+    let response = send(socket, &request)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    match render_doctor(&response) {
+        Ok(report) => {
+            print!("{report}");
+            Ok(())
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print an already-fetched doctor response as the readable report (best
+/// effort: an error outcome goes to stderr, never into the report).
+fn print_doctor(response: &Response) {
+    match render_doctor(response) {
+        Ok(report) => print!("{report}"),
+        Err(message) => eprintln!("{message}"),
+    }
+}
+
+/// One titled group of aligned `key  value` rows. The report reads as a set of
+/// small tables without pulling in a table/color dependency.
+struct Section {
+    title: &'static str,
+    rows: Vec<(String, String)>,
+}
+
+impl Section {
+    fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            rows: Vec::new(),
+        }
+    }
+
+    fn row(mut self, key: impl Into<String>, value: impl std::fmt::Display) -> Self {
+        self.rows.push((key.into(), value.to_string()));
+        self
+    }
+
+    fn render(&self) -> String {
+        let width = self
+            .rows
+            .iter()
+            .map(|(key, _)| key.len())
+            .max()
+            .unwrap_or_default();
+        let mut out = format!("{}\n", self.title);
+        for (key, value) in &self.rows {
+            out.push_str(&format!("  {key:<width$}  {value}\n"));
+        }
+        out
+    }
+}
+
+fn doctor_str(field: &Value, key: &str) -> Option<String> {
+    field.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn doctor_u64(field: &Value, key: &str) -> Option<u64> {
+    field.get(key).and_then(Value::as_u64)
+}
+
+fn doctor_bool(field: &Value, key: &str) -> Option<bool> {
+    field.get(key).and_then(Value::as_bool)
+}
+
+/// Render the daemon's doctor response. Ok = the report text; Err = a stderr
+/// message for an error outcome (the daemon could not produce diagnostics).
+fn render_doctor(response: &Response) -> Result<String, String> {
+    match &response.outcome {
+        ResponseOutcome::Ok { result } => Ok(render_doctor_report(result)),
+        ResponseOutcome::Error { error } => {
+            Err(format!("doctor failed ({}): {}", error.code, error.message))
+        }
+    }
+}
+
+/// Render the doctor payload as a readable report.
+///
+/// Pure and defensive: every field is read as optional because older daemons
+/// omit sections, so a missing field renders as `unknown` instead of failing.
+/// Problems discovered while rendering are also echoed in a trailing summary,
+/// which is the part of the report a human actually reads.
+fn render_doctor_report(result: &Value) -> String {
+    if !result.is_object() {
+        return "rovr doctor\n\ndoctor payload is not an object; use `rovr doctor --json`\n"
+            .to_string();
+    }
+
+    let mut issues: Vec<String> = Vec::new();
+    let accessibility = result.get("accessibility");
+    let health = result.get("health");
+    let sa = result.get("sa");
+    let sa_reinject = result.get("sa_reinject").filter(|value| !value.is_null());
+    let capabilities = result.get("capabilities");
+    let reconcile_interval_ms = doctor_u64(result, "reconcile_interval_ms").unwrap_or(1000);
+    if [health, accessibility, sa, capabilities]
+        .iter()
+        .all(|section| section.is_none())
+    {
+        // Nothing recognisable came back: say so instead of claiming health.
+        issues.push(
+            "doctor payload has no diagnostics sections; the CLI and daemon may be different versions"
+                .to_owned(),
+        );
+    }
+
+    // A state loop that is alive but not progressing shows up as a stale
+    // heartbeat. Three ticks of slack keeps a slow machine from crying wolf.
+    let stale_heartbeat_ms = (reconcile_interval_ms * 3).max(3000);
+
+    let daemon = Section::new("daemon")
+        .row(
+            "protocol",
+            doctor_u64(result, "protocol").unwrap_or_default(),
+        )
+        .row(
+            "generation",
+            doctor_u64(result, "generation").unwrap_or_default(),
+        )
+        .row("windows", doctor_u64(result, "windows").unwrap_or_default())
+        .row("spaces", doctor_u64(result, "spaces").unwrap_or_default())
+        .row(
+            "displays",
+            doctor_u64(result, "displays").unwrap_or_default(),
+        )
+        .row(
+            "refresh",
+            if doctor_bool(result, "refresh_required").unwrap_or(false) {
+                "required"
+            } else {
+                "not required"
+            },
+        );
+
+    let mut config = Section::new("config").row(
+        "path",
+        doctor_str(result, "config").unwrap_or_else(|| "unknown".to_owned()),
+    );
+    config = config.row(
+        "layout",
+        doctor_str(result, "layout").unwrap_or_else(|| "unknown".to_owned()),
+    );
+    if let Some(gap) = doctor_u64(result, "gap") {
+        config = config.row("gap", format!("{gap} px"));
+    }
+    if doctor_u64(result, "reconcile_interval_ms").is_some() {
+        config = config.row("reconcile", format!("every {reconcile_interval_ms} ms"));
+    }
+
+    let mut health_section = Section::new("health");
+    match health.and_then(|h| doctor_u64(h, "state_loop_heartbeat_age_ms")) {
+        Some(age) => {
+            health_section
+                .rows
+                .push(("state loop".to_owned(), format!("heartbeat {age} ms ago")));
+            if age > stale_heartbeat_ms {
+                issues.push(format!(
+                    "state loop heartbeat is {age} ms old (expected at most {stale_heartbeat_ms} ms): the daemon may be wedged"
+                ));
+            }
+        }
+        None => health_section
+            .rows
+            .push(("state loop".to_owned(), "unknown".to_owned())),
+    }
+    match health.and_then(|h| h.get("last_observation_age_ms")) {
+        Some(age) if !age.is_null() => health_section.rows.push((
+            "observation".to_owned(),
+            format!("last pass {} ms ago", age.as_u64().unwrap_or_default()),
+        )),
+        Some(_) => {
+            health_section
+                .rows
+                .push(("observation".to_owned(), "no pass yet".to_owned()));
+            issues.push("no observation pass has completed yet".to_owned());
+        }
+        None => health_section
+            .rows
+            .push(("observation".to_owned(), "unknown".to_owned())),
+    }
+    match health.and_then(|h| doctor_u64(h, "reconcile_failure_streak")) {
+        Some(streak) => {
+            health_section.rows.push((
+                "reconcile".to_owned(),
+                format!("{streak} consecutive failures"),
+            ));
+            if streak > 0 {
+                issues.push(format!("reconcile has failed {streak} times in a row"));
+            }
+        }
+        None => health_section
+            .rows
+            .push(("reconcile".to_owned(), "unknown".to_owned())),
+    }
+    match result.get("snapshot_wedged_ms").and_then(Value::as_u64) {
+        Some(ms) => {
+            health_section
+                .rows
+                .push(("worker".to_owned(), format!("wedged {ms} ms")));
+            issues.push(format!("observation worker has been wedged for {ms} ms"));
+        }
+        None => health_section
+            .rows
+            .push(("worker".to_owned(), "idle".to_owned())),
+    }
+
+    let mut platform = Section::new("platform");
+    match accessibility.and_then(|a| doctor_bool(a, "control_available")) {
+        Some(true) => platform
+            .rows
+            .push(("accessibility".to_owned(), "control available".to_owned())),
+        Some(false) => {
+            platform
+                .rows
+                .push(("accessibility".to_owned(), "unavailable".to_owned()));
+            let message = accessibility
+                .and_then(|a| doctor_str(a, "degraded_message"))
+                .unwrap_or_else(|| "accessibility control is unavailable".to_owned());
+            issues.push(message);
+        }
+        None => platform
+            .rows
+            .push(("accessibility".to_owned(), "unknown".to_owned())),
+    }
+    match sa {
+        // Non-macOS daemons report the scripting addition as unavailable.
+        Some(sa) if doctor_bool(sa, "available") == Some(false) => platform.rows.push((
+            "scripting addition".to_owned(),
+            "unavailable on this platform".to_owned(),
+        )),
+        Some(sa) => {
+            let present = doctor_bool(sa, "present").unwrap_or(false);
+            let version = doctor_str(sa, "version");
+            if !present {
+                platform.rows.push((
+                    "scripting addition".to_owned(),
+                    "not injected in Dock".to_owned(),
+                ));
+                issues.push(
+                    "scripting addition is not injected into Dock: run `sudo rovr sa install` (see docs/SA_SIP.md)"
+                        .to_owned(),
+                );
+            } else {
+                let mut parts = vec!["injected".to_owned()];
+                if let Some(version) = version.clone() {
+                    parts.push(version);
+                }
+                let prefix = doctor_str(sa, "expected_prefix");
+                match doctor_bool(sa, "compatible") {
+                    Some(true) => parts.push("compatible".to_owned()),
+                    Some(false) => {
+                        parts.push("incompatible".to_owned());
+                        issues.push(format!(
+                            "scripting addition is incompatible (answering version {}, expected {}): reinstall with `sudo rovr sa install`",
+                            version.unwrap_or_else(|| "unknown".to_owned()),
+                            prefix.unwrap_or_else(|| "a rovr-sa- prefix".to_owned())
+                        ));
+                    }
+                    None => {}
+                }
+                if let Some(attribs) = doctor_u64(sa, "attribs") {
+                    parts.push(format!("attribs 0x{attribs:08x}"));
+                }
+                platform
+                    .rows
+                    .push(("scripting addition".to_owned(), parts.join(" · ")));
+            }
+        }
+        None => platform
+            .rows
+            .push(("scripting addition".to_owned(), "unknown".to_owned())),
+    }
+    match sa_reinject {
+        Some(reinject) => {
+            let phase = doctor_str(reinject, "phase").unwrap_or_else(|| "unknown".to_owned());
+            let mut parts = vec![phase.clone()];
+            if let Some(pid) = doctor_u64(reinject, "dock_pid") {
+                parts.push(format!("dock pid {pid}"));
+            }
+            if let Some(generation) = doctor_u64(reinject, "generation") {
+                parts.push(format!("generation {generation}"));
+            }
+            if doctor_bool(reinject, "pending").unwrap_or(false) {
+                parts.push("in flight".to_owned());
+            }
+            if let Some(secs) = doctor_u64(reinject, "retry_in_secs") {
+                parts.push(format!("retry in {secs} s"));
+            }
+            let last_error = doctor_str(reinject, "last_error");
+            platform
+                .rows
+                .push(("reinjection".to_owned(), parts.join(" · ")));
+            if phase == "failed" {
+                issues.push(format!(
+                    "automatic SA reinjection failed{}: run `sudo rovr sa install`",
+                    last_error
+                        .map(|error| format!(" ({error})"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        None => platform
+            .rows
+            .push(("reinjection".to_owned(), "not tracked".to_owned())),
+    }
+
+    let mut capabilities_section = Section::new("capabilities");
+    if let Some(capabilities) = capabilities.and_then(Value::as_object) {
+        let mut missing: Vec<&str> = capabilities
+            .iter()
+            .filter(|(_, value)| !value.as_bool().unwrap_or(false))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        missing.sort_unstable();
+        let available = capabilities.len() - missing.len();
+        capabilities_section.rows.push((
+            "available".to_owned(),
+            format!("{available} of {}", capabilities.len()),
+        ));
+        if !missing.is_empty() {
+            capabilities_section
+                .rows
+                .push(("missing".to_owned(), missing.join(", ")));
+            if missing.contains(&"observe_windows") {
+                issues.push("window observation is unavailable: nothing can be tiled".to_owned());
+            } else {
+                issues.push(format!("capabilities unavailable: {}", missing.join(", ")));
+            }
+        }
+    } else {
+        capabilities_section
+            .rows
+            .push(("available".to_owned(), "unknown".to_owned()));
+    }
+
+    let mut report = format!(
+        "rovr doctor\n\n{}\n{}\n{}\n{}\n{}\n",
+        daemon.render(),
+        config.render(),
+        health_section.render(),
+        platform.render(),
+        capabilities_section.render(),
+    );
+
+    if issues.is_empty() {
+        report.push_str("\nall checks passed\n");
+    } else {
+        report.push_str(&format!(
+            "\n{} issue{}\n",
+            issues.len(),
+            if issues.len() == 1 { "" } else { "s" }
+        ));
+        for issue in &issues {
+            report.push_str(&format!("  - {issue}\n"));
+        }
+    }
+    report
+}
+
 fn generate_completions(shell: Shell) {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
@@ -426,8 +857,7 @@ fn generate_completions(shell: Shell) {
 }
 
 fn run_subscribe(socket: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("connect to rovr daemon at {}", socket.display()))?;
+    let mut stream = connect_daemon(socket)?;
     stream.set_read_timeout(Some(RESPONSE_DEADLINE))?;
     stream.set_write_timeout(Some(RESPONSE_DEADLINE))?;
     let request = Request::new(
@@ -516,7 +946,7 @@ fn map_command(command: TopCommand) -> Command {
     match command {
         TopCommand::Ping => Command::Ping,
         TopCommand::Refresh => Command::Refresh,
-        TopCommand::Doctor => Command::Doctor,
+        TopCommand::Doctor(_) => Command::Doctor,
         TopCommand::Query(args) => Command::Query(if args.current {
             QueryCommand::Current
         } else {
@@ -589,6 +1019,16 @@ fn map_command(command: TopCommand) -> Command {
                 WindowCommand::MoveToWorkspace {
                     window: window.map(WindowId),
                     workspace,
+                }
+            }
+            WindowSubcommand::MoveToDisplay { window, direction } => WindowCommand::MoveToDisplay {
+                window: window.map(WindowId),
+                direction: direction.into(),
+            },
+            WindowSubcommand::MoveToNewSpace { window, direction } => {
+                WindowCommand::MoveToNewSpace {
+                    window: window.map(WindowId),
+                    direction: direction.into(),
                 }
             }
             WindowSubcommand::SetLayer { window, layer } => WindowCommand::SetLayer {
@@ -679,6 +1119,9 @@ fn map_command(command: TopCommand) -> Command {
             },
         }),
         TopCommand::Sa(_) => unreachable!("sa is handled in main() before map_command"),
+        TopCommand::Service(_) => {
+            unreachable!("service is handled in main() before map_command")
+        }
         TopCommand::Completions { .. } => {
             unreachable!("completions are handled in main() before map_command is called")
         }
@@ -795,10 +1238,7 @@ fn run_sa_status() -> Result<()> {
         ),
     ) {
         println!("-- daemon doctor --");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
+        print_doctor(&resp);
     }
     Ok(())
 }
@@ -890,8 +1330,55 @@ fn sa_state(client: &rovr_platform::macos::sa::SaClient) -> SaState {
     }
 }
 
-/// Locate build artifacts: env overrides, then cargo target build dirs
-/// relative to this executable, then permanent-install locations.
+/// Which artifact set `sa install` should use.
+///
+/// A build produced by THIS source tree always wins over a previously
+/// installed set. The permanent-install locations hold whatever an earlier
+/// install put there, so preferring them makes `sa install` silently reinstall
+/// the stale payload already on disk and report success. Only fall back to the
+/// installed set for a globally installed CLI that has no local build tree.
+#[cfg(target_os = "macos")]
+fn choose_sa_artifacts(
+    built: (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>),
+    installed: (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>),
+) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    match built {
+        (Some(dylib), Some(loader), Some(helper)) => Some((dylib, loader, helper)),
+        _ => match installed {
+            (Some(dylib), Some(loader), Some(helper)) => Some((dylib, loader, helper)),
+            _ => None,
+        },
+    }
+}
+
+/// Members missing from a build tree, but only when the tree is genuinely
+/// partial. A tree with nothing in it means "no build tree here" and is a
+/// legitimate reason to fall back to the installed set; a tree with one or two
+/// pieces is a broken `cargo build` that must be completed by building, not
+/// papered over with a stale loader or helper from the installed set.
+#[cfg(target_os = "macos")]
+fn incomplete_build_members(
+    built: &(Option<PathBuf>, Option<PathBuf>, Option<PathBuf>),
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if built.0.is_none() {
+        missing.push("rovr-sa-payload");
+    }
+    if built.1.is_none() {
+        missing.push("rovr-sa-loader");
+    }
+    if built.2.is_none() {
+        missing.push("rovr-sa-helper");
+    }
+    if missing.len() == 3 {
+        // Nothing built here: a fallback candidate, not an error.
+        return Vec::new();
+    }
+    missing
+}
+
+/// Locate build artifacts: env overrides, then a build tree next to this
+/// executable, then permanent-install locations.
 #[cfg(target_os = "macos")]
 fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
     if let (Ok(dylib), Ok(loader), Ok(helper)) = (
@@ -907,54 +1394,18 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
     }
     let exe = std::env::current_exe().context("locate rovr executable")?;
     let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
-    // 1) Permanent install: SA artifacts installed alongside rovr
-    //    ($PREFIX/bin -> $PREFIX/lib/rovr or $PREFIX/share/rovr).
-    //    scripts/install.sh copies them there.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(bin_dir) = exe_canon.parent() {
-        candidates.push(bin_dir.join("librovr_sa_payload.dylib"));
-        candidates.push(bin_dir.join("rovr-sa-loader"));
-        candidates.push(bin_dir.join("rovr-sa-helper"));
-        if let Some(prefix) = bin_dir.parent() {
-            candidates.push(prefix.join("lib/rovr/librovr_sa_payload.dylib"));
-            candidates.push(prefix.join("lib/rovr/rovr-sa-loader"));
-            candidates.push(prefix.join("lib/rovr/rovr-sa-helper"));
-            candidates.push(prefix.join("share/rovr/librovr_sa_payload.dylib"));
-            candidates.push(prefix.join("share/rovr/rovr-sa-loader"));
-            candidates.push(prefix.join("share/rovr/rovr-sa-helper"));
-        }
-    }
-    // Also check XDG-ish permanent locations directly.
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        candidates.push(home.join(".local/lib/rovr/librovr_sa_payload.dylib"));
-        candidates.push(home.join(".local/lib/rovr/rovr-sa-loader"));
-        candidates.push(home.join(".local/lib/rovr/rovr-sa-helper"));
-        candidates.push(home.join(".local/share/rovr/librovr_sa_payload.dylib"));
-    }
-    let dylib_perm = candidates
-        .iter()
-        .find(|p| p.ends_with("librovr_sa_payload.dylib") && p.exists())
-        .cloned();
-    let loader_perm = candidates
-        .iter()
-        .find(|p| p.ends_with("rovr-sa-loader") && p.exists())
-        .cloned();
-    let helper_perm = candidates
-        .iter()
-        .find(|p| p.ends_with("rovr-sa-helper") && p.exists())
-        .cloned();
-    if let (Some(d), Some(l), Some(h)) = (dylib_perm, loader_perm, helper_perm) {
-        return Ok((d, l, h));
-    }
-    // 2) Dev install: cargo target dir relative to the (canonical) exe.
-    //    exe is <target>/<profile>/rovr; ancestors()[1] is the profile dir
-    //    where cargo puts build-script output (<target>/<profile>/build/<crate>-<hash>/out).
+
+    // 1) Build tree next to this executable: the artifacts this source tree
+    //    just produced. This is the set that ships with this rovr, so it comes
+    //    first. `cargo build -p rovr-sa-*` puts the clang outputs under
+    //    <target>/<profile>/build/<crate>-<hash>/out.
     let target_root = exe_canon
         .ancestors()
         .nth(1)
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    // A copied permanent binary has no build tree of its own, so also look next
+    // to the non-canonical path (covers symlinked installs).
     let find = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
         let base = target_root.join("build");
         if !base.is_dir() {
@@ -976,8 +1427,6 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         hits.sort();
         hits.pop()
     };
-    // 3) Fallback: also check non-canonical exe's build dir (covers copied
-    //    permanent binary where canonical == ~/.local/bin/rovr and has no build).
     let find_fallback = |crate_prefix: &str, artifact: &str| -> Option<PathBuf> {
         let alt_root = exe
             .ancestors()
@@ -1007,16 +1456,73 @@ fn find_sa_artifacts() -> Result<(PathBuf, PathBuf, PathBuf)> {
         hits.sort();
         hits.pop()
     };
-    let dylib = find("rovr-sa-payload", "librovr_sa_payload.dylib")
-        .or_else(|| find_fallback("rovr-sa-payload", "librovr_sa_payload.dylib"))
-        .context("payload dylib not built — run `cargo build -p rovr-sa-payload` first")?;
-    let loader = find("rovr-sa-loader", "rovr-sa-loader")
-        .or_else(|| find_fallback("rovr-sa-loader", "rovr-sa-loader"))
-        .context("loader binary not built — run `cargo build -p rovr-sa-loader` first")?;
-    let helper = find("rovr-sa-helper", "rovr-sa-helper")
-        .or_else(|| find_fallback("rovr-sa-helper", "rovr-sa-helper"))
-        .context("helper binary not built — run `cargo build -p rovr-sa-helper` first")?;
-    Ok((dylib, loader, helper))
+    let built = (
+        find("rovr-sa-payload", "librovr_sa_payload.dylib")
+            .or_else(|| find_fallback("rovr-sa-payload", "librovr_sa_payload.dylib")),
+        find("rovr-sa-loader", "rovr-sa-loader")
+            .or_else(|| find_fallback("rovr-sa-loader", "rovr-sa-loader")),
+        find("rovr-sa-helper", "rovr-sa-helper")
+            .or_else(|| find_fallback("rovr-sa-helper", "rovr-sa-helper")),
+    );
+
+    // 2) Permanent install locations, for a globally installed CLI with no
+    //    local build tree. These hold whatever a previous install wrote, so
+    //    they only answer when there is nothing newer to install.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(bin_dir) = exe_canon.parent() {
+        candidates.push(bin_dir.join("librovr_sa_payload.dylib"));
+        candidates.push(bin_dir.join("rovr-sa-loader"));
+        candidates.push(bin_dir.join("rovr-sa-helper"));
+        if let Some(prefix) = bin_dir.parent() {
+            candidates.push(prefix.join("lib/rovr/librovr_sa_payload.dylib"));
+            candidates.push(prefix.join("lib/rovr/rovr-sa-loader"));
+            candidates.push(prefix.join("lib/rovr/rovr-sa-helper"));
+            candidates.push(prefix.join("share/rovr/librovr_sa_payload.dylib"));
+            candidates.push(prefix.join("share/rovr/rovr-sa-loader"));
+            candidates.push(prefix.join("share/rovr/rovr-sa-helper"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/lib/rovr/librovr_sa_payload.dylib"));
+        candidates.push(home.join(".local/lib/rovr/rovr-sa-loader"));
+        candidates.push(home.join(".local/lib/rovr/rovr-sa-helper"));
+        candidates.push(home.join(".local/share/rovr/librovr_sa_payload.dylib"));
+    }
+    let installed = (
+        candidates
+            .iter()
+            .find(|p| p.ends_with("librovr_sa_payload.dylib") && p.exists())
+            .cloned(),
+        candidates
+            .iter()
+            .find(|p| p.ends_with("rovr-sa-loader") && p.exists())
+            .cloned(),
+        candidates
+            .iter()
+            .find(|p| p.ends_with("rovr-sa-helper") && p.exists())
+            .cloned(),
+    );
+
+    let incomplete = incomplete_build_members(&built);
+    if !incomplete.is_empty() {
+        anyhow::bail!(
+            "SA build tree next to {} is incomplete: missing {}. \
+             Run `cargo build -p rovr-sa-payload -p rovr-sa-loader -p rovr-sa-helper` \
+             so a fresh payload is not paired with a stale loader or helper",
+            exe.display(),
+            incomplete.join(", ")
+        );
+    }
+
+    choose_sa_artifacts(built, installed).with_context(|| {
+        format!(
+            "SA install artifacts not found: no build tree next to {} and no installed set \
+             in the usual locations. Run `cargo build -p rovr-sa-payload -p rovr-sa-loader \
+             -p rovr-sa-helper` first, or set ROVR_SA_PAYLOAD/ROVR_SA_LOADER/ROVR_SA_HELPER",
+            exe.display()
+        )
+    })
 }
 
 /// UID of the console user (the uid Dock runs as). Under `sudo`, $UID is 0,
@@ -1033,20 +1539,18 @@ fn console_uid() -> Option<u32> {
 
 /// An SA client for the GUI session's user, not for whoever is asking.
 ///
-/// The payload binds `/tmp/rovr-<uid>/sa.sock` with the uid of the Dock process
-/// that loaded it, which is the console session user. A client keyed on
-/// `getuid()` therefore probes `/tmp/rovr-0/sa.sock` under `sudo` and reports a
-/// live payload as `present: false`. Since `sa install` must run as root, every
-/// CLI path that talks to the payload has to key on the console uid.
+/// The payload binds `<console user home>/Library/Caches/rovr/sa.sock` with the
+/// identity of the Dock process that loaded it, which is the console session
+/// user. A client keyed on `$HOME` therefore probes root's cache directory
+/// under `sudo` and reports a live payload as `present: false`. Since
+/// `sa install` must run as root, every CLI path that talks to the payload has
+/// to resolve the console user's home.
 #[cfg(target_os = "macos")]
 fn sa_console_client() -> Result<rovr_platform::macos::sa::SaClient> {
     let uid = console_uid().context("determine console uid from /dev/console")?;
-    Ok(
-        rovr_platform::macos::sa::SaClient::with_socket_path_for_uid(
-            rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string()),
-            uid,
-        ),
-    )
+    let path = rovr_platform::macos::sa::SaClient::socket_path_for_uid(uid)
+        .context("resolve console user home directory")?;
+    Ok(rovr_platform::macos::sa::SaClient::with_socket_path_for_uid(path, uid))
 }
 
 #[cfg(target_os = "macos")]
@@ -1083,6 +1587,24 @@ fn run_sa_install() -> Result<()> {
         println!("payload: {}", dylib.display());
         println!("loader:  {}", loader.display());
         println!("helper:  {}", helper.display());
+
+        // The failure mode that looks like success: the source payload is
+        // byte-identical to the one already installed, so nothing changes while
+        // the command reports "installed". Say so before anything is written.
+        let source = dylib.to_str().and_then(|p| sha256_file(p).ok());
+        let already = sha256_file(SA_INSTALLED_DYLIB).ok();
+        if let (Some(source), Some(already)) = (source, already) {
+            if source == already {
+                eprintln!(
+                    "warning: {} is byte-identical to the installed payload;",
+                    dylib.display()
+                );
+                eprintln!("         installing it will not change any capability. Rebuild first:");
+                eprintln!(
+                    "         cargo build --release -p rovr-sa-payload -p rovr-sa-loader -p rovr-sa-helper"
+                );
+            }
+        }
 
         if unsafe { libc_getuid() } != 0 {
             eprintln!(
@@ -1167,7 +1689,7 @@ fn run_sa_install() -> Result<()> {
 
         // ---- 4. Verify the SA handshake ------------------------------------
         // Keyed on the console uid, not ours: `sudo` would otherwise probe
-        // /tmp/rovr-0/sa.sock and report a live payload as missing.
+        // root's cache directory and report a live payload as missing.
         let client = sa_console_client()?;
         let mut handshake_version = None;
         for _ in 0..20 {
@@ -1183,11 +1705,11 @@ fn run_sa_install() -> Result<()> {
         }
         let Some(version) = handshake_version else {
             anyhow::bail!(
-                "sa install: injection ran but the payload socket did not answer. \
-                 If a previous payload is already loaded in Dock, dlopen is a no-op — \
-                 restart Dock (`killall Dock`), wait a few seconds, then run \
-                 `sudo rovr sa install` again. Otherwise check `rovr sa status` and \
-                 Console.app for [rovr-sa] logs."
+                "sa install: injection ran but the payload socket did not answer at {}. \
+                 The loader injects a content-addressed copy, so an already-mapped \
+                 payload is not the cause; check Console.app for [rovr-sa] logs and \
+                 `rovr sa status`. The daemon keeps retrying through the helper.",
+                client.socket_path().display()
             )
         };
 
@@ -1377,17 +1899,34 @@ fn run_sa_uninstall() -> Result<()> {
                 removed = true;
             }
         }
+        // Content-addressed payload copies created by the loader at injection
+        // time (one per build). Only touch files matching that exact pattern in
+        // the install directory.
+        if let Ok(entries) = std::fs::read_dir(SA_INSTALL_DIR) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("librovr_sa_payload.") && name.ends_with(".dylib") {
+                    let path = entry.path();
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                    println!("removed {}", path.display());
+                    removed = true;
+                }
+            }
+        }
 
         // 3. Remove stale Rovr SA socket for the console user.
         if let Some(uid) = console_uid() {
-            let sock = rovr_platform::macos::sa::SaClient::socket_path_for_uid(&uid.to_string());
-            if sock.exists() {
-                // Only remove real sockets, never arbitrary paths.
-                if let Ok(meta) = std::fs::symlink_metadata(&sock) {
-                    use std::os::unix::fs::FileTypeExt;
-                    if meta.file_type().is_socket() {
-                        let _ = std::fs::remove_file(&sock);
-                        println!("removed stale socket {}", sock.display());
+            if let Some(sock) = rovr_platform::macos::sa::SaClient::socket_path_for_uid(uid) {
+                if sock.exists() {
+                    // Only remove real sockets, never arbitrary paths.
+                    if let Ok(meta) = std::fs::symlink_metadata(&sock) {
+                        use std::os::unix::fs::FileTypeExt;
+                        if meta.file_type().is_socket() {
+                            let _ = std::fs::remove_file(&sock);
+                            println!("removed stale socket {}", sock.display());
+                        }
                     }
                 }
             }
@@ -1545,8 +2084,7 @@ unsafe fn libc_getuid() -> u32 {
 }
 
 fn send(path: &Path, request: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(path)
-        .with_context(|| format!("connect to rovr daemon at {}", path.display()))?;
+    let mut stream = connect_daemon(path)?;
     stream.set_read_timeout(Some(RESPONSE_DEADLINE))?;
     stream.set_write_timeout(Some(RESPONSE_DEADLINE))?;
     serde_json::to_writer(&mut stream, request)?;
@@ -1565,6 +2103,207 @@ fn send(path: &Path, request: &Request) -> Result<Response> {
 
 fn default_socket_path() -> PathBuf {
     rovr_platform::daemon_socket_path()
+}
+
+/// LaunchAgent label for the daemon (kept in sync with scripts/install.sh).
+const DAEMON_LABEL: &str = "com.rovr.daemon";
+
+/// `~/Library/LaunchAgents/com.rovr.daemon.plist`, or an error if HOME is unset.
+#[cfg(target_os = "macos")]
+fn daemon_plist_path() -> Result<PathBuf> {
+    let home =
+        std::env::var("HOME").context("HOME is not set; cannot locate the daemon LaunchAgent")?;
+    Ok(PathBuf::from(home).join("Library/LaunchAgents/com.rovr.daemon.plist"))
+}
+
+/// launchctl arguments (after the program name) for a lifecycle operation.
+/// `loaded` is whether launchd already knows the label. Returns `None` when
+/// there is nothing to do (stopping an unloaded service, or `status`, which
+/// only inspects). Pure so the mapping is unit-tested without running launchd.
+fn lifecycle_launchctl_args(
+    sub: &ServiceSubcommand,
+    uid: u32,
+    label: &str,
+    plist: &Path,
+    loaded: bool,
+) -> Option<Vec<String>> {
+    let domain = format!("gui/{uid}");
+    let target = format!("gui/{uid}/{label}");
+    match sub {
+        ServiceSubcommand::Status => None,
+        ServiceSubcommand::Start if loaded => Some(vec!["kickstart".into(), target]),
+        ServiceSubcommand::Start => Some(vec![
+            "bootstrap".into(),
+            domain,
+            plist.display().to_string(),
+        ]),
+        ServiceSubcommand::Restart if loaded => Some(vec!["kickstart".into(), "-k".into(), target]),
+        ServiceSubcommand::Restart => Some(vec![
+            "bootstrap".into(),
+            domain,
+            plist.display().to_string(),
+        ]),
+        ServiceSubcommand::Stop if loaded => Some(vec!["bootout".into(), target]),
+        ServiceSubcommand::Stop => None,
+    }
+}
+
+/// Whether a connect error means "no daemon is listening": a stale socket file
+/// (ConnectionRefused) or no socket file at all (NotFound).
+fn daemon_missing(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
+}
+
+/// Connect to the daemon socket, turning the "daemon is not running" errno
+/// cases into an actionable message instead of a bare connection error.
+fn connect_daemon(path: &Path) -> Result<UnixStream> {
+    UnixStream::connect(path).map_err(|err| {
+        if daemon_missing(&err) {
+            anyhow::anyhow!(
+                "rovr daemon is not running ({}: {}).\n\
+                 Start it with `rovr service start`, or restart it with `rovr service restart`.",
+                path.display(),
+                err
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("connect to rovr daemon at {}", path.display()))
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn socket_answers(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// Poll until the socket matches `want_answers`, bounded by `timeout`. No
+/// infinite polling (PRODUCT.md: every OS wait has a deadline).
+#[cfg(target_os = "macos")]
+fn wait_for_socket(path: &Path, want_answers: bool, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if socket_answers(path) == want_answers {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_service_loaded(uid: u32) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{DAEMON_LABEL}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn print_service_status(uid: u32, socket: &Path, plist: &Path) -> Result<()> {
+    let loaded = daemon_service_loaded(uid);
+    let listening = socket_answers(socket);
+    println!("service: {DAEMON_LABEL}");
+    println!(
+        "plist:   {} ({})",
+        plist.display(),
+        if plist.exists() { "present" } else { "missing" }
+    );
+    println!("launchd: {}", if loaded { "loaded" } else { "not loaded" });
+    println!(
+        "socket:  {} ({})",
+        socket.display(),
+        if listening {
+            "listening"
+        } else {
+            "no listener"
+        }
+    );
+    if !plist.exists() && !loaded {
+        println!("hint: the daemon is not installed — run scripts/install.sh");
+    } else if !loaded {
+        println!("hint: start it with `rovr service start`");
+    } else if !listening {
+        println!("hint: loaded but not answering — `rovr service restart`");
+    }
+    Ok(())
+}
+
+fn run_service(args: &ServiceArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        anyhow::bail!("service management is only available on macOS");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let uid = rovr_platform::unix_uid();
+        let socket = default_socket_path();
+        let plist = daemon_plist_path()?;
+
+        if matches!(&args.command, ServiceSubcommand::Status) {
+            return print_service_status(uid, &socket, &plist);
+        }
+
+        let loaded = daemon_service_loaded(uid);
+        let Some(argv) = lifecycle_launchctl_args(&args.command, uid, DAEMON_LABEL, &plist, loaded)
+        else {
+            println!("service {DAEMON_LABEL}: already stopped");
+            return Ok(());
+        };
+
+        if argv.first().map(String::as_str) == Some("bootstrap") && !plist.exists() {
+            anyhow::bail!(
+                "LaunchAgent plist not found at {} — run scripts/install.sh to install the daemon",
+                plist.display()
+            );
+        }
+
+        let output = std::process::Command::new("launchctl")
+            .args(&argv)
+            .output()
+            .with_context(|| format!("run `launchctl {}`", argv.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "`launchctl {}` failed ({}): {}",
+                argv.join(" "),
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        let want_up = !matches!(&args.command, ServiceSubcommand::Stop);
+        let reached = wait_for_socket(&socket, want_up, std::time::Duration::from_secs(3));
+        let listening = socket_answers(&socket);
+        println!(
+            "service {DAEMON_LABEL}: {}",
+            if want_up { "started" } else { "stopped" }
+        );
+        println!(
+            "socket:  {} ({})",
+            socket.display(),
+            if listening {
+                "listening"
+            } else {
+                "no listener"
+            }
+        );
+        if want_up && !reached {
+            println!(
+                "hint: not answering yet — run `rovr service status`, or check /tmp/rovr.err.log"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1595,6 +2334,182 @@ mod tests {
             );
         }
     }
+
+    /// A build next to this executable wins over the permanent-install
+    /// locations. Those hold whatever a PREVIOUS install wrote, so preferring
+    /// them made `sa install` silently reinstall a stale payload and report
+    /// success: the exact failure that left macOS 27.2 running the Oct 9 SA
+    /// payload with space ops disabled.
+    #[test]
+    fn sa_install_prefers_a_fresh_build_over_the_installed_set() {
+        let built = (
+            Some(PathBuf::from(
+                "/repo/target/release/build/out/librovr_sa_payload.dylib",
+            )),
+            Some(PathBuf::from(
+                "/repo/target/release/build/out/rovr-sa-loader",
+            )),
+            Some(PathBuf::from(
+                "/repo/target/release/build/out/rovr-sa-helper",
+            )),
+        );
+        let installed = (
+            Some(PathBuf::from(
+                "/usr/local/lib/rovr/librovr_sa_payload.dylib",
+            )),
+            Some(PathBuf::from("/usr/local/lib/rovr/rovr-sa-loader")),
+            Some(PathBuf::from("/usr/local/lib/rovr/rovr-sa-helper")),
+        );
+        let chosen = choose_sa_artifacts(built, installed).expect("a complete build set wins");
+        assert_eq!(
+            chosen.0,
+            PathBuf::from("/repo/target/release/build/out/librovr_sa_payload.dylib")
+        );
+        assert_eq!(
+            chosen.1,
+            PathBuf::from("/repo/target/release/build/out/rovr-sa-loader")
+        );
+        assert_eq!(
+            chosen.2,
+            PathBuf::from("/repo/target/release/build/out/rovr-sa-helper")
+        );
+    }
+
+    /// A globally installed CLI has no build tree next to it, so the installed
+    /// set is the only answer. Reinstalling the current files must still work.
+    #[test]
+    fn sa_install_falls_back_to_the_installed_set_without_a_build() {
+        let chosen = choose_sa_artifacts(
+            (None, None, None),
+            (
+                Some(PathBuf::from(
+                    "/usr/local/lib/rovr/librovr_sa_payload.dylib",
+                )),
+                Some(PathBuf::from("/usr/local/lib/rovr/rovr-sa-loader")),
+                Some(PathBuf::from("/usr/local/lib/rovr/rovr-sa-helper")),
+            ),
+        )
+        .expect("the installed set is the fallback");
+        assert_eq!(
+            chosen.0,
+            PathBuf::from("/usr/local/lib/rovr/librovr_sa_payload.dylib")
+        );
+    }
+
+    /// A partial build tree is a broken build, not a licence to complete the
+    /// set from the installed one. Pairing a fresh payload with a stale helper
+    /// is exactly the kind of silent mismatch this ordering fix exists to stop.
+    #[test]
+    fn sa_install_refuses_a_partial_build_tree() {
+        let some = || Some(PathBuf::from("/repo/out/x"));
+        assert_eq!(
+            incomplete_build_members(&(some(), None, None)),
+            vec!["rovr-sa-loader", "rovr-sa-helper"],
+            "payload-only build names the missing binaries"
+        );
+        assert_eq!(
+            incomplete_build_members(&(some(), some(), None)),
+            vec!["rovr-sa-helper"],
+            "loader present but helper missing is still incomplete"
+        );
+        assert!(
+            incomplete_build_members(&(None, None, None)).is_empty(),
+            "an absent build tree is a fallback candidate, not an error"
+        );
+        assert!(
+            incomplete_build_members(&(some(), some(), some())).is_empty(),
+            "a complete build tree has nothing missing"
+        );
+    }
+
+    /// `rovr service` exposes the daemon lifecycle as subcommands.
+    #[test]
+    fn service_subcommands_parse() {
+        for sub in ["status", "start", "stop", "restart"] {
+            let cli = Cli::try_parse_from(["rovr", "service", sub])
+                .unwrap_or_else(|e| panic!("`service {sub}` must parse: {e}"));
+            assert!(
+                matches!(cli.command, TopCommand::Service(_)),
+                "`service {sub}` must map to TopCommand::Service"
+            );
+        }
+        let TopCommand::Service(args) = Cli::try_parse_from(["rovr", "service", "status"])
+            .expect("parses")
+            .command
+        else {
+            panic!("expected a service command");
+        };
+        assert!(matches!(args.command, ServiceSubcommand::Status));
+    }
+
+    /// The mutation each lifecycle subcommand performs is a pure launchctl argv
+    /// mapping, verifiable without running launchd.
+    #[test]
+    fn service_lifecycle_maps_to_launchctl() {
+        let plist = Path::new("/Users/me/Library/LaunchAgents/com.rovr.daemon.plist");
+        let boot = || {
+            Some(vec![
+                "bootstrap".to_string(),
+                "gui/501".to_string(),
+                plist.display().to_string(),
+            ])
+        };
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Start, 501, DAEMON_LABEL, plist, false),
+            boot(),
+            "start on an unloaded service must bootstrap the LaunchAgent"
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Restart, 501, DAEMON_LABEL, plist, false),
+            boot(),
+            "restart on an unloaded service must bootstrap too"
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Start, 501, DAEMON_LABEL, plist, true),
+            Some(vec![
+                "kickstart".to_string(),
+                "gui/501/com.rovr.daemon".to_string()
+            ])
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Restart, 501, DAEMON_LABEL, plist, true),
+            Some(vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                "gui/501/com.rovr.daemon".to_string()
+            ])
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Stop, 501, DAEMON_LABEL, plist, true),
+            Some(vec![
+                "bootout".to_string(),
+                "gui/501/com.rovr.daemon".to_string()
+            ])
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Stop, 501, DAEMON_LABEL, plist, false),
+            None,
+            "stopping an unloaded service is a no-op"
+        );
+        assert_eq!(
+            lifecycle_launchctl_args(&ServiceSubcommand::Status, 501, DAEMON_LABEL, plist, true),
+            None,
+            "status never mutates the service"
+        );
+    }
+
+    /// Only the two "no daemon" errnos get the actionable diagnostic; a live
+    /// daemon that resets a connection must not be misreported as down.
+    #[test]
+    fn daemon_missing_classifies_only_absence() {
+        use std::io::{Error, ErrorKind};
+        assert!(daemon_missing(&Error::from(ErrorKind::ConnectionRefused)));
+        assert!(daemon_missing(&Error::from(ErrorKind::NotFound)));
+        assert!(!daemon_missing(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!daemon_missing(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(!daemon_missing(&Error::from(ErrorKind::TimedOut)));
+    }
+
     #[test]
     fn space_focus_recent_maps_to_protocol_command() {
         let command = map_command(TopCommand::Space(SpaceArgs {
@@ -1899,5 +2814,208 @@ mod tests {
             message.contains("SNAPSHOT_ERROR"),
             "stderr names the code: {message}"
         );
+    }
+
+    /// A doctor payload with everything healthy, mirroring the daemon's shape.
+    fn healthy_doctor_result() -> Value {
+        serde_json::json!({
+            "protocol": rovr_protocol::PROTOCOL_VERSION,
+            "capabilities": {
+                "observe_windows": true,
+                "set_window_frame": true,
+                "focus_window": true,
+                "move_window_to_space": true,
+                "create_space": true,
+                "destroy_space": true,
+                "focus_space": true,
+                "reorder_space": true,
+                "set_window_layer": true,
+                "set_window_sticky": true,
+                "set_window_shadow": true,
+                "set_window_opacity": true,
+                "set_window_scale": true,
+                "scripting_addition": true,
+            },
+            "accessibility": {"control_available": true, "degraded_message": null},
+            "sa": {
+                "socket": "/tmp/rovr-501/sa.sock",
+                "present": true,
+                "version": "rovr-sa-2.1",
+                "compatible": true,
+                "attribs": 2047,
+                "expected_prefix": "rovr-sa-2."
+            },
+            "sa_reinject": {
+                "phase": "healthy",
+                "generation": 3,
+                "dock_pid": 812,
+                "attempts_this_generation": 1,
+                "retry_in_secs": null,
+                "pending": false,
+                "last_result": "injected",
+                "last_error": null,
+                "helper_socket": "/tmp/rovr-501/sa-helper.sock"
+            },
+            "snapshot_wedged_ms": null,
+            "health": {
+                "state_loop_heartbeat_age_ms": 12,
+                "last_observation_age_ms": 20,
+                "reconcile_failure_streak": 0
+            },
+            "generation": 41,
+            "refresh_required": false,
+            "windows": 7,
+            "spaces": 2,
+            "displays": 1,
+            "config": "/Users/me/.config/rovr/rovr.toml",
+            "layout": "bsp",
+            "gap": 8,
+            "reconcile_interval_ms": 1000
+        })
+    }
+
+    /// Section values align, so the report reads as a set of small tables.
+    #[test]
+    fn doctor_sections_align_their_values() {
+        let section = Section::new("demo").row("a", 1).row("longest", "value");
+        assert_eq!(section.render(), "demo\n  a        1\n  longest  value\n");
+    }
+
+    /// The whole point of the change: `rovr doctor` prints grouped prose with
+    /// every surface represented, and says so when nothing is wrong.
+    #[test]
+    fn doctor_renders_a_readable_report_when_everything_is_healthy() {
+        let report =
+            render_doctor(&Response::ok(1, healthy_doctor_result())).expect("ok outcome renders");
+        for section in ["daemon", "config", "health", "platform", "capabilities"] {
+            assert!(
+                report.contains(section),
+                "report must contain a {section} section:\n{report}"
+            );
+        }
+        for expected in [
+            "protocol",
+            "generation",
+            "bsp",
+            "8 px",
+            "every 1000 ms",
+            "control available",
+            "injected",
+            "compatible",
+            "healthy",
+            "14 of 14",
+        ] {
+            assert!(
+                report.contains(expected),
+                "report must mention `{expected}`:\n{report}"
+            );
+        }
+        assert!(
+            report.ends_with("all checks passed\n"),
+            "a healthy payload must end with a clear verdict:\n{report}"
+        );
+        assert!(
+            !report.contains("\"windows\""),
+            "the report is prose, not echoed JSON:\n{report}"
+        );
+    }
+
+    /// A missing scripting addition must name the fix and reduce the
+    /// capability count, so the report is actionable instead of a flag dump.
+    #[test]
+    fn doctor_report_names_the_fix_for_a_missing_scripting_addition() {
+        let mut payload = healthy_doctor_result();
+        payload["sa"]["present"] = serde_json::json!(false);
+        payload["sa"]["version"] = serde_json::json!(null);
+        payload["capabilities"]["scripting_addition"] = serde_json::json!(false);
+        let report = render_doctor(&Response::ok(2, payload)).expect("renders");
+        assert!(report.contains("not injected in Dock"), "{report}");
+        assert!(
+            report.contains("sudo rovr sa install"),
+            "the fix must be in the report: {report}"
+        );
+        assert!(
+            report.contains("13 of 14"),
+            "capability count must reflect the loss: {report}"
+        );
+        assert!(
+            report.contains("2 issues"),
+            "the summary must count the sa and capability losses: {report}"
+        );
+    }
+
+    /// Every degraded surface doctor knows about must show up both as a row
+    /// state and in the trailing issue summary.
+    #[test]
+    fn doctor_report_surfaces_degraded_accessibility_and_stale_health() {
+        let mut payload = healthy_doctor_result();
+        payload["accessibility"]["control_available"] = serde_json::json!(false);
+        payload["accessibility"]["degraded_message"] =
+            serde_json::json!("accessibility permission unavailable");
+        payload["health"]["reconcile_failure_streak"] = serde_json::json!(3);
+        payload["health"]["state_loop_heartbeat_age_ms"] = serde_json::json!(9000);
+        payload["health"]["last_observation_age_ms"] = serde_json::json!(null);
+        payload["snapshot_wedged_ms"] = serde_json::json!(4200);
+        let report = render_doctor(&Response::ok(3, payload)).expect("renders");
+        for expected in [
+            "accessibility permission unavailable",
+            "reconcile has failed 3 times in a row",
+            "heartbeat is 9000 ms old",
+            "wedged 4200 ms",
+            "no pass yet",
+        ] {
+            assert!(
+                report.contains(expected),
+                "report must surface `{expected}`:\n{report}"
+            );
+        }
+        assert!(
+            !report.contains("all checks passed"),
+            "a degraded payload must not claim success:\n{report}"
+        );
+        assert!(
+            report.contains("5 issues"),
+            "summary must count them: {report}"
+        );
+    }
+
+    /// An unrecognised or older payload degrades to `unknown` rows instead of
+    /// panicking: doctor is diagnostics, it must render even when odd.
+    #[test]
+    fn doctor_report_tolerates_an_empty_payload() {
+        let report = render_doctor(&Response::ok(4, serde_json::json!({}))).expect("renders");
+        assert!(report.contains("rovr doctor"), "{report}");
+        assert!(report.contains("unknown"), "{report}");
+        assert!(
+            report.contains("1 issue\n"),
+            "a payload with no sections must not claim health:\n{report}"
+        );
+    }
+
+    /// An error outcome is a stderr message, never a report: the daemon could
+    /// not produce diagnostics, so there is nothing to print as one.
+    #[test]
+    fn doctor_error_outcome_becomes_a_stderr_message() {
+        let err = Response::error(5, "DAEMON_STARTING", "no observation yet");
+        let message = render_doctor(&err).expect_err("error must not render a report");
+        assert!(message.contains("DAEMON_STARTING"), "{message}");
+        assert!(message.contains("no observation yet"), "{message}");
+    }
+
+    /// `--json` is the machine contract; the readable report is the human one.
+    /// Both must keep mapping to the same typed command.
+    #[test]
+    fn doctor_json_flag_opts_out_of_the_readable_report() {
+        let plain = Cli::try_parse_from(["rovr", "doctor"]).expect("doctor parses");
+        assert!(
+            matches!(plain.command, TopCommand::Doctor(ref args) if !args.json),
+            "the report is the default output"
+        );
+        let json = Cli::try_parse_from(["rovr", "doctor", "--json"]).expect("--json parses");
+        assert!(
+            matches!(json.command, TopCommand::Doctor(ref args) if args.json),
+            "--json keeps the raw payload for scripts"
+        );
+        assert_eq!(map_command(json.command), Command::Doctor);
     }
 }

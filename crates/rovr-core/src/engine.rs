@@ -36,6 +36,13 @@ pub enum EngineError {
     },
     #[error("window {0:?} is not on an observed display")]
     WindowNotOnDisplay(WindowId),
+    #[error("no display in direction {direction:?} from display {from:?}")]
+    NoDisplayInDirection {
+        from: DisplayId,
+        direction: Direction,
+    },
+    #[error("display {0:?} has no user Space to receive the window")]
+    NoSpaceOnDisplay(DisplayId),
     #[error("workspace {0} not found")]
     WorkspaceNotFound(String),
     #[error("workspace {0} has no backing space")]
@@ -82,6 +89,13 @@ pub struct Engine {
     /// Window waiting to be moved once `move-to-workspace`'s target Space
     /// materializes (same dynamic spawn flow as above). Queue for FIFO.
     pending_workspace_move: VecDeque<(WindowId, String)>,
+    /// Windows waiting to be moved onto a freshly created Space from
+    /// `move-to-new-space`: the Space id is assigned by macOS, so each entry
+    /// holds the target display plus the SpaceIds observed when the
+    /// CreateSpace was requested, and binds to the NEW Space on that display
+    /// once observation shows it. Entries expire so a lost creation cannot
+    /// wedge empty-Space GC (gated on this queue) forever.
+    pending_new_space_moves: VecDeque<PendingNewSpaceMove>,
     /// Dynamic spawns awaiting their created Space. `before` snapshots the
     /// SpaceIds observed when the CreateSpace was requested, so the binding
     /// step can identify the NEW Space and never adopt a pre-existing one.
@@ -147,6 +161,19 @@ enum CreationObservation {
 struct PendingCreationRequest {
     name: String,
 }
+
+/// One `move-to-new-space` intent: `window` rides to the first Space macOS
+/// creates on `display` that was not observed (`before`) when requested.
+struct PendingNewSpaceMove {
+    window: WindowId,
+    display: DisplayId,
+    before: Vec<SpaceId>,
+    deadline: std::time::Instant,
+}
+
+/// How long a `move-to-new-space` intent waits for its Space to materialize
+/// before it is dropped (mirrors the dynamic workspace creation deadline).
+const NEW_SPACE_MOVE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a window's last observed Space stays authoritative after the
 /// window stops being observed there. Covers a small number of missed
@@ -1048,6 +1075,7 @@ impl Engine {
         if !self.capabilities.destroy_space
             || self.placement.is_some()
             || !self.awaited_creations.is_empty()
+            || !self.pending_new_space_moves.is_empty()
             || !self.pending_destroy.is_empty()
             || self.topology_destroy.is_some()
         {
@@ -1218,6 +1246,82 @@ impl Engine {
             }
         }
     }
+
+    /// Fire queued `move-to-new-space` intents whose Space has materialized:
+    /// the first Space on the target display that is unclaimed by any
+    /// workspace and was NOT observed when the CreateSpace was requested.
+    /// Pre-existing Spaces are never adopted. The window moves there and
+    /// focus follows (one-shot). Expired intents and intents whose window is
+    /// gone are dropped; an entry with no candidate yet waits for the next
+    /// snapshot. Runs after `bind_awaited_dynamic_spaces` so a racing
+    /// workspace spawn keeps its Space.
+    fn fulfill_pending_new_space_moves(&mut self, out: &mut Vec<Action>) {
+        if self.pending_new_space_moves.is_empty() || self.placement.is_some() {
+            return;
+        }
+        let claimed: std::collections::HashSet<SpaceId> = self
+            .workspaces
+            .0
+            .values()
+            .filter_map(|w| w.active_space())
+            .collect();
+        let mut consumed: std::collections::HashSet<SpaceId> = std::collections::HashSet::new();
+        let mut still_pending: VecDeque<PendingNewSpaceMove> =
+            VecDeque::with_capacity(self.pending_new_space_moves.len());
+        for pending in std::mem::take(&mut self.pending_new_space_moves) {
+            if std::time::Instant::now() >= pending.deadline {
+                self.flight_recorder.record(
+                    "display.new_space_expired",
+                    format!(
+                        "window {:?}: created Space never materialized; intent dropped",
+                        pending.window
+                    ),
+                );
+                continue;
+            }
+            if !self.observed.windows.contains_key(&pending.window) {
+                self.flight_recorder.record(
+                    "display.new_space_window_gone",
+                    format!(
+                        "window {:?}: closed before its Space materialized; intent dropped",
+                        pending.window
+                    ),
+                );
+                continue;
+            }
+            let mut candidates: Vec<&SpaceSnapshot> = self
+                .observed
+                .spaces
+                .values()
+                .filter(|s| {
+                    s.display_id == pending.display
+                        && !s.is_fullscreen
+                        && !s.is_system
+                        && !pending.before.contains(&s.id)
+                        && !claimed.contains(&s.id)
+                        && !consumed.contains(&s.id)
+                })
+                .collect();
+            candidates.sort_by_key(|s| (s.position, s.id));
+            match candidates.first() {
+                Some(space) => {
+                    let space = space.id;
+                    consumed.insert(space);
+                    self.flight_recorder.record(
+                        "display.new_space_bound",
+                        format!("window {:?} -> created space {space:?}", pending.window),
+                    );
+                    out.push(Action::MoveWindowToSpace {
+                        window: pending.window,
+                        space,
+                    });
+                    out.push(Action::FocusSpace { space });
+                }
+                None => still_pending.push_back(pending),
+            }
+        }
+        self.pending_new_space_moves = still_pending;
+    }
 }
 
 impl Engine {
@@ -1334,6 +1438,7 @@ impl Engine {
         if !self.capabilities.destroy_space
             || !self.awaited_creations.is_empty()
             || !self.pending_creations.is_empty()
+            || !self.pending_new_space_moves.is_empty()
             || self.placement.is_some()
             || self.topology_destroy.is_some()
             || !self.pending_destroy.is_empty()
@@ -1563,6 +1668,7 @@ impl Engine {
                 }
                 lifecycle_actions.extend(self.destroy_empty_dynamic_workspaces(&moves));
                 self.fulfill_pending_workspace_actions(&mut lifecycle_actions);
+                self.fulfill_pending_new_space_moves(&mut lifecycle_actions);
                 for name in self.workspaces.ensure_persistent() {
                     if !self.awaited_creations.iter().any(|r| r.name == name)
                         && !self.pending_creations.iter().any(|r| r.name == name)
@@ -1663,6 +1769,134 @@ impl Engine {
     ) -> Result<Vec<Action>, EngineError> {
         self.require_window(window)?;
         Ok(vec![Action::MoveWindowToSpace { window, space }])
+    }
+
+    /// Send the focused (or given) window to the display physically adjacent in
+    /// `direction`. The target is chosen by display frame geometry, so it
+    /// follows the user's monitor arrangement ("east" = the monitor to the
+    /// right) rather than any fixed id. The window lands on that display's
+    /// focused Space (its visible desktop), or its lowest-positioned Space.
+    pub fn move_window_to_display(
+        &self,
+        window: Option<WindowId>,
+        direction: Direction,
+    ) -> Result<Vec<Action>, EngineError> {
+        let window = self.resolve_window(window)?;
+        let source = self
+            .observed
+            .windows
+            .get(&window)
+            .ok_or(EngineError::WindowNotFound(window))?;
+        let source_display = source
+            .display_id
+            .or_else(|| {
+                source
+                    .space_id
+                    .and_then(|sid| self.observed.spaces.get(&sid))
+                    .map(|space| space.display_id)
+            })
+            .ok_or(EngineError::WindowNotOnDisplay(window))?;
+        let target_display = self.adjacent_display(source_display, direction)?;
+        let target_space = self.user_space_on_display(target_display)?;
+        Ok(vec![Action::MoveWindowToSpace {
+            window,
+            space: target_space,
+        }])
+    }
+
+    /// A user Space on `display` to receive a window: its focused Space (the
+    /// visible desktop), else its lowest-positioned Space. Also the anchor a
+    /// CreateSpace uses to select the display (the id is assigned by macOS).
+    fn user_space_on_display(&self, display: DisplayId) -> Result<SpaceId, EngineError> {
+        self.observed
+            .spaces
+            .values()
+            .filter(|space| space.display_id == display && !space.is_system)
+            .min_by_key(|space| (!space.focused, space.position, space.id))
+            .map(|space| space.id)
+            .ok_or(EngineError::NoSpaceOnDisplay(display))
+    }
+
+    /// Create a fresh Space on the display adjacent in `direction` and send
+    /// the window there. Returns the CreateSpace now; the move (+ focus
+    /// follow) fires from the next snapshot once macOS reports the new Space
+    /// id (see `fulfill_pending_new_space_moves`). Replaces any earlier
+    /// intent for the same window so a rapid double-press moves it once, to
+    /// the latest display.
+    pub fn move_window_to_new_space(
+        &mut self,
+        window: Option<WindowId>,
+        direction: Direction,
+    ) -> Result<Vec<Action>, EngineError> {
+        let window = self.resolve_window(window)?;
+        let observed = &self.observed.windows[&window];
+        if observed.fullscreen == rovr_types::ObservedBool::Yes
+            || observed
+                .space_id
+                .and_then(|s| self.observed.spaces.get(&s))
+                .is_some_and(|s| s.is_fullscreen)
+        {
+            return Err(EngineError::NativeFullscreenMove);
+        }
+        let source_display = observed
+            .display_id
+            .or_else(|| {
+                observed
+                    .space_id
+                    .and_then(|sid| self.observed.spaces.get(&sid))
+                    .map(|space| space.display_id)
+            })
+            .ok_or(EngineError::WindowNotOnDisplay(window))?;
+        let target_display = self.adjacent_display(source_display, direction)?;
+        let anchor = self.user_space_on_display(target_display)?;
+        self.pending_new_space_moves
+            .retain(|pending| pending.window != window);
+        self.pending_new_space_moves.push_back(PendingNewSpaceMove {
+            window,
+            display: target_display,
+            before: self.observed.spaces.keys().copied().collect(),
+            deadline: std::time::Instant::now() + NEW_SPACE_MOVE_TTL,
+        });
+        self.flight_recorder.record(
+            "display.new_space_queued",
+            format!(
+                "window {window:?} -> new space on display {target_display:?} (anchor {anchor:?})"
+            ),
+        );
+        Ok(vec![Action::CreateSpace { anchor }])
+    }
+
+    /// The display nearest `from` in `direction`, by frame-center geometry.
+    fn adjacent_display(
+        &self,
+        from: DisplayId,
+        direction: Direction,
+    ) -> Result<DisplayId, EngineError> {
+        let source = self
+            .observed
+            .displays
+            .get(&from)
+            .ok_or(EngineError::NoDisplayInDirection { from, direction })?;
+        let source_center = source.frame.center();
+        self.observed
+            .displays
+            .values()
+            .filter(|display| display.id != from)
+            .filter_map(|display| {
+                let center = display.frame.center();
+                let dx = center.x - source_center.x;
+                let dy = center.y - source_center.y;
+                let in_direction = match direction {
+                    Direction::North => dy < 0.0,
+                    Direction::South => dy > 0.0,
+                    Direction::East => dx > 0.0,
+                    Direction::West => dx < 0.0,
+                };
+                in_direction.then_some((display.id, dx * dx + dy * dy))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+            .ok_or(EngineError::NoDisplayInDirection { from, direction })
     }
 
     /// Focus is inherently transient and must never be stored as desired state,
@@ -3985,6 +4219,244 @@ mod tests {
             display.focused = false;
         }
         assert_eq!(engine.focused_window(), Some(WindowId(99)));
+    }
+
+    /// `move-to-display` picks the adjacent display by frame geometry, so it
+    /// follows the user's monitor arrangement, and lands the window on that
+    /// display's focused Space.
+    #[test]
+    fn move_to_display_follows_frame_geometry() {
+        let mut engine = Engine::default();
+        let mut snap = snapshot(vec![]);
+        snap.displays = vec![
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 0,
+            },
+            DisplaySnapshot {
+                id: DisplayId(2),
+                frame: Rect {
+                    x: 1000.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: false,
+                is_main: false,
+                generation: 0,
+            },
+        ];
+        snap.spaces = vec![
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            },
+            SpaceSnapshot {
+                id: SpaceId(22),
+                display_id: DisplayId(2),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            },
+        ];
+        let mut win = window(1, 0.0, 0.0);
+        win.space_id = Some(SpaceId(11));
+        win.display_id = Some(DisplayId(1));
+        snap.windows = vec![win];
+        engine.apply_event(Event::Snapshot(snap));
+
+        // East -> the display to the right, on its focused Space.
+        assert_eq!(
+            engine
+                .move_window_to_display(Some(WindowId(1)), Direction::East)
+                .unwrap(),
+            vec![Action::MoveWindowToSpace {
+                window: WindowId(1),
+                space: SpaceId(22),
+            }]
+        );
+        // West -> nothing to the left of display 1.
+        assert!(matches!(
+            engine.move_window_to_display(Some(WindowId(1)), Direction::West),
+            Err(EngineError::NoDisplayInDirection { .. })
+        ));
+    }
+
+    /// Two side-by-side displays (1 left/active, 2 right) with one focused
+    /// Space each; no windows.
+    fn adjacent_displays_snap() -> PlatformSnapshot {
+        let mut snap = snapshot(vec![]);
+        snap.displays = vec![
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: true,
+                generation: 0,
+            },
+            DisplaySnapshot {
+                id: DisplayId(2),
+                frame: Rect {
+                    x: 1000.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: false,
+                is_main: false,
+                generation: 0,
+            },
+        ];
+        snap.spaces = vec![
+            SpaceSnapshot {
+                id: SpaceId(11),
+                display_id: DisplayId(1),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            },
+            SpaceSnapshot {
+                id: SpaceId(22),
+                display_id: DisplayId(2),
+                label: None,
+                focused: true,
+                generation: 0,
+                position: 0,
+                is_fullscreen: false,
+                is_system: false,
+            },
+        ];
+        snap
+    }
+
+    fn window_on(win: WindowId, space: SpaceId, display: DisplayId) -> WindowSnapshot {
+        let mut w = window(win.0, 0.0, 0.0);
+        w.space_id = Some(space);
+        w.display_id = Some(display);
+        w
+    }
+
+    /// `move-to-new-space` issues the creation now, then moves the window and
+    /// follows with focus once macOS reports the new Space on the arrow display.
+    #[test]
+    fn move_to_new_space_creates_then_moves_on_materialize() {
+        let mut engine = Engine::default();
+        let mut snap = adjacent_displays_snap();
+        snap.windows = vec![window_on(WindowId(1), SpaceId(11), DisplayId(1))];
+        engine.apply_event(Event::Snapshot(snap));
+
+        // Creation anchors on the arrow display's focused Space.
+        assert_eq!(
+            engine
+                .move_window_to_new_space(Some(WindowId(1)), Direction::East)
+                .unwrap(),
+            vec![Action::CreateSpace {
+                anchor: SpaceId(22)
+            }]
+        );
+
+        // macOS reports the new Space: the window moves there, focus follows.
+        let mut snap2 = adjacent_displays_snap();
+        snap2.windows = vec![window_on(WindowId(1), SpaceId(11), DisplayId(1))];
+        snap2.spaces.push(SpaceSnapshot {
+            id: SpaceId(23),
+            display_id: DisplayId(2),
+            label: None,
+            focused: false,
+            generation: 0,
+            position: 1,
+            is_fullscreen: false,
+            is_system: false,
+        });
+        let followup = engine.apply_event(Event::Snapshot(snap2));
+        assert!(
+            followup.contains(&Action::MoveWindowToSpace {
+                window: WindowId(1),
+                space: SpaceId(23),
+            }),
+            "window must move to the created Space, got: {followup:?}"
+        );
+        assert!(
+            followup.contains(&Action::FocusSpace { space: SpaceId(23) }),
+            "focus must follow to the created Space, got: {followup:?}"
+        );
+        assert!(
+            engine.pending_new_space_moves.is_empty(),
+            "fulfilled intent must not linger"
+        );
+    }
+
+    /// No display in the arrow direction errors; a window that closes before
+    /// its Space materializes drops the intent instead of moving a ghost.
+    #[test]
+    fn move_to_new_space_errors_and_drops_cleanly() {
+        let mut engine = Engine::default();
+        let mut snap = adjacent_displays_snap();
+        snap.windows = vec![window_on(WindowId(1), SpaceId(11), DisplayId(1))];
+        engine.apply_event(Event::Snapshot(snap));
+
+        assert!(matches!(
+            engine.move_window_to_new_space(Some(WindowId(1)), Direction::West),
+            Err(EngineError::NoDisplayInDirection { .. })
+        ));
+        engine
+            .move_window_to_new_space(Some(WindowId(1)), Direction::East)
+            .unwrap();
+
+        // Window closes before the Space appears: intent dropped, no move.
+        let mut snap2 = adjacent_displays_snap();
+        snap2.windows = vec![];
+        snap2.spaces.push(SpaceSnapshot {
+            id: SpaceId(23),
+            display_id: DisplayId(2),
+            label: None,
+            focused: false,
+            generation: 0,
+            position: 1,
+            is_fullscreen: false,
+            is_system: false,
+        });
+        let followup = engine.apply_event(Event::Snapshot(snap2));
+        assert!(
+            !followup.iter().any(|a| matches!(
+                a,
+                Action::MoveWindowToSpace {
+                    window: WindowId(1),
+                    ..
+                }
+            )),
+            "closed window must never be moved, got: {followup:?}"
+        );
+        assert!(engine.pending_new_space_moves.is_empty());
     }
 
     /// focus_space_step: alt+arrow navigation across a display's spaces,
