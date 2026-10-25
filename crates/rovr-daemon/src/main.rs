@@ -778,6 +778,8 @@ fn window_command_defaults_to_focus(command: &WindowCommand) -> bool {
         | WindowCommand::ToggleFloat { window: from }
         | WindowCommand::SwapDirection { window: from, .. }
         | WindowCommand::WarpDirection { window: from, .. }
+        | WindowCommand::MoveToDisplay { window: from, .. }
+        | WindowCommand::MoveToNewSpace { window: from, .. }
         | WindowCommand::Resize { window: from, .. } => from.is_none(),
         _ => false,
     }
@@ -794,6 +796,8 @@ fn window_command_needs_ax(command: &WindowCommand) -> bool {
         | WindowCommand::FocusDirection { .. }
         | WindowCommand::SetFrame { .. } => true,
         WindowCommand::MoveToWorkspace { window, .. } => window.is_none(),
+        WindowCommand::MoveToDisplay { window, .. } => window.is_none(),
+        WindowCommand::MoveToNewSpace { window, .. } => window.is_none(),
         _ => false,
     }
 }
@@ -1008,6 +1012,12 @@ impl Daemon {
                     }
                     WindowCommand::MoveToSpace { window, space } => {
                         self.engine.move_window_to_space(window, space)
+                    }
+                    WindowCommand::MoveToDisplay { window, direction } => {
+                        self.engine.move_window_to_display(window, direction)
+                    }
+                    WindowCommand::MoveToNewSpace { window, direction } => {
+                        self.engine.move_window_to_new_space(window, direction)
                     }
                     WindowCommand::MoveToWorkspace { window, workspace } => {
                         self.engine.move_window_to_workspace(window, &workspace)

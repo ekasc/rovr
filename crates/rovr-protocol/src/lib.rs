@@ -106,6 +106,21 @@ pub enum WindowCommand {
         window: Option<WindowId>,
         workspace: String,
     },
+    /// Send a window to the display physically adjacent in `direction`
+    /// (None = the focused window). The target display is chosen by frame
+    /// geometry, so it follows the user's monitor arrangement.
+    MoveToDisplay {
+        window: Option<WindowId>,
+        direction: Direction,
+    },
+    /// Create a fresh Space on the display adjacent in `direction` and send
+    /// the window there (None = the focused window). The Space id is assigned
+    /// by macOS, so the move lands one observation tick after the creation —
+    /// the engine holds the intent and fulfills it when the new Space appears.
+    MoveToNewSpace {
+        window: Option<WindowId>,
+        direction: Direction,
+    },
     /// Close a window (None = the focused one).
     Close {
         window: Option<WindowId>,

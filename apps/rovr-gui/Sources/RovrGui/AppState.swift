@@ -108,7 +108,7 @@ final class AppState: ObservableObject {
             guard let self else { return }
             let outcome: Result<[String: Any], Error>
             do {
-                let value = try self.client.json(["doctor"])
+                let value = try self.client.json(["doctor", "--json"])
                 if let dict = value as? [String: Any] {
                     outcome = .success(dict)
                 } else {

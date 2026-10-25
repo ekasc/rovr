@@ -233,5 +233,37 @@ Research written to `docs/RELIABILITY.md` (evidence: live failures, `../yabai`, 
 
 - [x] Root cause: `rovr_bridge_enumerate_window_candidates` filtered by CGWindow layer and size but not by app kind, so menu-bar extras and system agents entered observed state. Yabai gates observation on `NSApplicationActivationPolicyRegular` (`workspace.m`); Rovr did not.
 - [x] Fix: skip windows whose owning `NSRunningApplication` is not Regular. Verified live: window count **20 → 9**; the six accessory/system apps are gone; the 5 real windows (WezTerm, Activity Monitor, Brave, disktree, Escape) still observed with their Spaces. An app that is momentarily Accessory during launch is picked up on a later snapshot.
-- [~] Remaining phantoms are from *regular* apps (Brave `1470×75`, Brave/disktree/Escape `500×500+0+418`, all on no Space). Not filtered — dropping space-less windows risks hiding a legitimately transient one, and the engine already excludes them from tiling.
+- [~] Remaining phantoms are from *regular* apps (Brave `1470×75`, Brave/disktree/Escape `500×500+0+418`, all on no Space). Not filtered at enumeration — dropping space-less windows risks hiding a legitimately transient one. When the owning app has a readable AX window list, these are now demoted to unmanaged by the AX-list rule (see 2026-10-18); the engine excludes them from tiling either way.
 - Checks: `cargo build -p rovr-platform`, `cargo test -p rovr-platform` 30 passed, `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — clean.
+
+## Helium tab-close tiles the Space into two columns (2026-10-18)
+
+Closing a tab in Helium transiently split the Space into two equal columns. BSP briefly saw two windows, and the corrective retile then stuck behind a wedged AX worker.
+
+- [x] Root cause (flight recorder, `rovr debug events` seq 14314–14328): a tab close/hover exposes a browser-chrome CGWindow of Helium's pid (window `28996`, 1470×68, no AX element) that **passes** the 60×80 size filter. Refinement has no entry for it → `managed` stays Unknown → the SLS fallback reads the surface as managed → BSP tiles two columns (28829 at `0,0,735x890` and 28996 at `735,0,735x890`). The phantom's frame mutation then brute-forced AX by window id, timed out, and wedged the pid's worker; the corrective retile failed behind it, so the half-width state stuck.
+- [x] Fix: `rovr_bridge_refine_windows_for_pid` now reports whether the app's AX window list is authoritative (readable, non-empty, and mapped ≥1 window id). `demote_ax_absent_candidates` marks candidates of an authoritative pid that the list does not contain as `managed = No`, so they float and the SLS fallback skips them. Apps with no readable list (empty list, refinement timeout) are unchanged — their background windows must stay tileable.
+- [x] Tests: absent candidate of an authoritative app is demoted; listed candidate is kept; candidate of a non-authoritative app still resolves via SLS; the fallback does not re-promote a demoted surface.
+- Checks: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` — 280 passed. Not verified live: the transient requires a tab close in Helium; two read-only monitor runs did not catch one.
+
+## AX cache use-after-free crashes the daemon (2026-10-22)
+
+25 `rovrd` crash reports since 2026-10-15. The installed binary is the 2026-10-14 build — the first to contain the AX element cache from `600b61c`. All crashes are on `rovr-platform-worker`: `CFRelease`/`CFRetain` PAC traps, `_AXUIElementValidate` traps, and `AXObserverAdd/RemoveNotification` on dead elements.
+
+- [x] Root cause: `rovr_ax_cache_remove` / `rovr_ax_cache_drop_pid` copied the tail entry into the hole and decremented `g_ax_cache_count` without clearing the vacated tail slot. The next `rovr_ax_cache_put` reused that index and released the element a second time. Freed memory was then reallocated, so cached elements dangled and every later AX call on them trapped.
+- [x] Fix: zero the vacated tail slot in both removals; in `put`, retain the incoming element before releasing the evicted one (AX can return the same object for the same window).
+- [x] Evidence: symbolized the deployed commit and matched the stripped frame offsets — 10 crashes are inside `rovr_ax_cache_put` (`+0x90`, `+0x9c`, `+0xd0`, `+0xdc`); the rest are downstream (end-of-`refine` app release, AX attribute validation, observer add/remove).
+- [x] Verification: randomized refcount model of old vs new bookkeeping — the old version leaves a dead pointer within 9–34 ops and then double-releases it on all 8 seeds; the fixed version survives 20k ops per seed. `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` (281 passed), release build.
+- [x] Installed 2026-10-22 13:11:24 (pid 40832, signed, Accessibility grant intact, reconcile idle). `~/.local/bin/rovrd` now runs the fixed build.
+- [ ] Observation tail (measure after the fix lands): periodic observation p99 2.1 s, max 13.9 s; 70 snapshot timeouts; 346 `AX mutation unavailable` in `/tmp/rovr.log`.
+- [x] SA not injected, root cause identified: Dock (pid 36006, up since 2026-10-14 04:19) still maps the payload from that day, and `/tmp/rovr-501/sa.sock` was deleted by `tmp_cleaner` ~3 days later. See the self-healing SA section below. 9 of 14 capabilities unavailable until the new payload is installed.
+
+## Self-healing SA: no manual step after the 3-day socket expiry (2026-10-22)
+
+The SA dies ~3 days after every install and only `killall Dock` brings it back. Two independent causes, both required for a manual step:
+
+- [x] Included in the fix; evidence: `com.apple.tmp_cleaner` deletes `/tmp` entries whose atime/mtime/ctime are all >3 days old, daily at midnight. A bound Unix socket never updates those timestamps, so `/tmp/rovr-<uid>/sa.sock` is unlinked from under the live payload. The daemon socket already moved to `~/Library/Caches/rovr` for this exact reason; the SA socket did not.
+- [x] Included in the fix; evidence: reinjection cannot heal it: the loader `dlopen`s the canonical payload path, which Dock already has mapped. `dlopen` of an already-loaded path is a no-op, so a reinstalled payload never runs (`INJECTION_FAILED`, status 5) until Dock restarts.
+- [x] Fix 1: payload + client bind/connect `~/Library/Caches/rovr/sa.sock` (durable, 0700, same dir as the daemon socket).
+- [x] Fix 2: loader injects a content-addressed copy (`librovr_sa_payload.<sha16>.dylib`) so a new build is a new `dlopen` path and loads into the running Dock. Verified experimentally: a second copy of a loaded dylib runs its constructor.
+- [x] Verification: `cargo fmt --check`, clippy `-D warnings`, 23 suites / 282 tests. The loader copy path was exercised directly (non-root run): it produced `librovr_sa_payload.f99e4da6fe15d6dc.dylib` byte-identical to the source, idempotent on re-run, then failed at `task_for_pid` as expected. New unit test pins the socket to the daemon runtime dir and rejects `/tmp`.
+- [ ] Live proof needs the new daemon installed, then one `sudo rovr sa install` (no Dock restart expected). That is the last manual step; after it, reinjection is fully automatic.

@@ -87,7 +87,10 @@ const ROVR_CAP_SET_WINDOW_FRAME: u64 = 1 << 1;
 const ROVR_CAP_FOCUS_WINDOW: u64 = 1 << 2;
 const ROVR_CAP_OBSERVE_SPACES: u64 = 1 << 3;
 const ROVR_CAP_MOVE_WINDOW_TO_SPACE: u64 = 1 << 4;
-const ROVR_CAP_FOCUS_SPACE: u64 = 1 << 5;
+// Note: bit 5 (ROVR_CAP_FOCUS_SPACE in bridge.h) is deliberately unmirrored
+// here. The bridge's gesture focus is a DEGRADED fallback for when the SA's
+// `dock_spaces` model is unresolved, so `Capabilities::focus_space` is derived
+// from the SA attrib instead — the bit the focus code actually gates on.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -158,6 +161,7 @@ extern "C" {
         pid: i32,
         callback: AxWindowCallback,
         context: *mut c_void,
+        ax_list_authoritative: *mut u8,
     ) -> i32;
     fn rovr_bridge_enumerate_displays(callback: DisplayCallback, context: *mut c_void) -> i32;
     fn rovr_bridge_set_window_frame(window_id: u32, x: f64, y: f64, width: f64, height: f64)
@@ -207,8 +211,21 @@ struct AxRefinement {
 }
 
 enum AxWorkerResult {
-    Refinements(Vec<AxRefinement>),
+    Refinements {
+        /// The pid's AX window list was readable, non-empty, and mapped at
+        /// least one window id (see `demote_ax_absent_candidates`).
+        authoritative: bool,
+        values: Vec<AxRefinement>,
+    },
     Mutation(i32),
+}
+
+/// One snapshot's AX refinement pass: the refined windows, plus the pids whose
+/// AX window list is authoritative.
+#[derive(Default)]
+struct AxRefinements {
+    windows: Vec<AxRefinement>,
+    authoritative_pids: HashSet<i32>,
 }
 
 struct AxWorkerPool {
@@ -237,7 +254,7 @@ impl AxWorkerPool {
         })
     }
 
-    fn refine(&mut self, pids: &HashSet<i32>) -> Vec<AxRefinement> {
+    fn refine(&mut self, pids: &HashSet<i32>) -> AxRefinements {
         self.workers
             .retain(|pid, worker| pids.contains(pid) || !worker.is_idle());
         let deadline = Instant::now() + AX_JOB_TIMEOUT;
@@ -258,17 +275,22 @@ impl AxWorkerPool {
                     });
                 }
                 let mut values = Vec::new();
+                let mut authoritative: u8 = 0;
                 let status = unsafe {
                     rovr_bridge_refine_windows_for_pid(
                         pid,
                         collect,
                         &mut values as *mut _ as *mut c_void,
+                        &mut authoritative,
                     )
                 };
                 if status != 0 {
                     values.clear();
                 }
-                AxWorkerResult::Refinements(values)
+                AxWorkerResult::Refinements {
+                    authoritative: authoritative != 0,
+                    values,
+                }
             });
             match submission {
                 Ok(epoch) => submitted.push((pid, epoch)),
@@ -279,11 +301,17 @@ impl AxWorkerPool {
             }
         }
 
-        let mut refinements = Vec::new();
+        let mut refinements = AxRefinements::default();
         for (pid, epoch) in submitted {
             match self.worker(pid).wait_until(epoch, deadline) {
-                Ok(AxWorkerResult::Refinements(mut values)) => {
-                    refinements.append(&mut values);
+                Ok(AxWorkerResult::Refinements {
+                    authoritative,
+                    mut values,
+                }) => {
+                    if authoritative {
+                        refinements.authoritative_pids.insert(pid);
+                    }
+                    refinements.windows.append(&mut values);
                 }
                 Ok(AxWorkerResult::Mutation(_)) => {
                     unreachable!("worker epoch returned wrong job kind")
@@ -321,7 +349,7 @@ impl AxWorkerPool {
             .and_then(|epoch| worker.wait_until(epoch, Instant::now() + AX_JOB_TIMEOUT));
         match result {
             Ok(AxWorkerResult::Mutation(status)) => Ok(status),
-            Ok(AxWorkerResult::Refinements(_)) => {
+            Ok(AxWorkerResult::Refinements { .. }) => {
                 unreachable!("worker epoch returned wrong job kind")
             }
             Err(err) => {
@@ -752,19 +780,20 @@ impl MacPlatform {
             .map(|window| window.pid.0)
             .collect();
         let refinements = if pids.is_empty() {
-            Vec::new()
+            AxRefinements::default()
         } else {
             ax_workers
                 .lock()
                 .map_err(|_| PlatformError::Operation("AX worker pool poisoned".to_string()))?
                 .refine(&pids)
         };
-        let refinements: HashMap<u32, AxRefinement> = refinements
+        let refined: HashMap<u32, AxRefinement> = refinements
+            .windows
             .into_iter()
             .map(|refinement| (refinement.id, refinement))
             .collect();
         for window in &mut windows {
-            let Some(refinement) = refinements.get(&window.id.0) else {
+            let Some(refinement) = refined.get(&window.id.0) else {
                 continue;
             };
             window.focused = refinement.focused;
@@ -772,17 +801,17 @@ impl MacPlatform {
             window.fullscreen = observed_bool(refinement.fullscreen);
             window.managed = observed_bool(refinement.managed);
         }
+        // An app with a readable, non-empty AX window list that does not list a
+        // CGWindow candidate of its own pid is telling us that candidate is a
+        // surface (tab strip, tooltip, hover chrome), not a window. Demote it
+        // before the SLS fallback: otherwise the fallback reads the surface as
+        // managed and BSP tiles it next to the real window — the reported
+        // "closing a tab tiles into two columns".
+        demote_ax_absent_candidates(&mut windows, &refined, &refinements.authoritative_pids);
         // SLS fallback for background apps where AX returns Unknown — uses level/parent (yabai). Keeps tiling on multi-display without frontmost.
-        for window in &mut windows {
-            if window.managed == rovr_types::ObservedBool::Unknown {
-                let sls = unsafe { rovr_bridge_sls_managed_for_window(window.id.0) };
-                match sls {
-                    0 => window.managed = rovr_types::ObservedBool::No,
-                    1 => window.managed = rovr_types::ObservedBool::Yes,
-                    _ => {}
-                }
-            }
-        }
+        resolve_managed_via_sls(&mut windows, |window_id| unsafe {
+            rovr_bridge_sls_managed_for_window(window_id)
+        });
         let mut displays: Vec<DisplaySnapshot> = Vec::new();
         let display_status = unsafe {
             rovr_bridge_enumerate_displays(collect_display, &mut displays as *mut _ as *mut c_void)
@@ -861,7 +890,13 @@ impl Platform for MacPlatform {
             move_window_to_space: bridge_caps & ROVR_CAP_MOVE_WINDOW_TO_SPACE != 0,
             create_space: sa_attribs & OSAX_ATTRIB_ADD_SPACE != 0,
             destroy_space: sa_attribs & OSAX_ATTRIB_REM_SPACE != 0,
-            focus_space: bridge_caps & ROVR_CAP_FOCUS_SPACE != 0,
+            // Focus is ID-exact and rides on the same `dock_spaces` model that
+            // gates the SA path in `execute_focus_space`/`execute_focus_space_step`.
+            // The bridge gesture is a DEGRADED fallback for when that model is
+            // unresolved, so advertising focus from the bridge alone reported a
+            // switch that could not happen: `doctor` showed focus_space while
+            // alt-N did nothing.
+            focus_space: sa_attribs & OSAX_ATTRIB_FOCUS_SPACE != 0,
             reorder_space: sa_attribs & OSAX_ATTRIB_MOV_SPACE != 0,
             set_window_layer: sa_attribs & OSAX_ATTRIB_WINDOW_LAYER != 0,
             set_window_sticky: sa_attribs & OSAX_ATTRIB_WINDOW_STICKY != 0,
@@ -1217,6 +1252,39 @@ fn c_string<const N: usize>(buffer: &[c_char; N]) -> Option<String> {
     Some(value.to_string_lossy().into_owned())
 }
 
+/// Demote candidates of an authoritative pid that its AX window list does not
+/// contain: the CGWindow is a surface of that app, not a window. `managed = No`
+/// floats it and keeps it out of the SLS fallback in `resolve_managed_via_sls`,
+/// which only resolves Unknown. Apps with no readable AX window list are absent
+/// from `authoritative_pids` and keep the previous behavior (their background
+/// windows must stay tileable).
+fn demote_ax_absent_candidates(
+    windows: &mut [WindowSnapshot],
+    refined: &HashMap<u32, AxRefinement>,
+    authoritative_pids: &HashSet<i32>,
+) {
+    for window in windows {
+        if authoritative_pids.contains(&window.pid.0) && !refined.contains_key(&window.id.0) {
+            window.managed = rovr_types::ObservedBool::No;
+        }
+    }
+}
+
+/// SLS fallback (yabai level/parent check): resolve windows whose `managed` is
+/// still Unknown. Runs after `demote_ax_absent_candidates` so demoted surfaces
+/// are never re-promoted.
+fn resolve_managed_via_sls(windows: &mut [WindowSnapshot], sls_managed: impl Fn(u32) -> i32) {
+    for window in windows {
+        if window.managed == rovr_types::ObservedBool::Unknown {
+            match sls_managed(window.id.0) {
+                0 => window.managed = rovr_types::ObservedBool::No,
+                1 => window.managed = rovr_types::ObservedBool::Yes,
+                _ => {}
+            }
+        }
+    }
+}
+
 fn observed_bool(value: u8) -> rovr_types::ObservedBool {
     match value {
         0 => rovr_types::ObservedBool::No,
@@ -1320,5 +1388,95 @@ mod tests {
             now
         ));
         assert!(gesture_settle_needed(Some(now), now));
+    }
+
+    fn ax_candidate(id: u32, pid: i32, managed: rovr_types::ObservedBool) -> WindowSnapshot {
+        WindowSnapshot {
+            id: WindowId(id),
+            pid: ProcessId(pid),
+            app: "Helium".to_string(),
+            bundle_id: Some("net.imput.helium".to_string()),
+            title: String::new(),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1470.0,
+                height: 68.0,
+            },
+            space_id: Some(SpaceId(378)),
+            display_id: Some(DisplayId(1)),
+            focused: false,
+            minimized: rovr_types::ObservedBool::Unknown,
+            fullscreen: rovr_types::ObservedBool::Unknown,
+            managed,
+            generation: 0,
+        }
+    }
+
+    /// The reported bug: a tab close transiently exposes a browser-chrome
+    /// CGWindow (1470×68, no AX element) of Helium's pid. AX refinement lists
+    /// only the real window; the surface must float, not tile.
+    #[test]
+    fn ax_absent_candidate_of_authoritative_app_is_demoted() {
+        let mut windows = vec![
+            ax_candidate(28829, 24551, rovr_types::ObservedBool::Yes),
+            ax_candidate(28996, 24551, rovr_types::ObservedBool::Unknown),
+        ];
+        let refined = HashMap::from([(
+            28829,
+            AxRefinement {
+                id: 28829,
+                focused: true,
+                minimized: 0,
+                fullscreen: 0,
+                managed: 1,
+            },
+        )]);
+        demote_ax_absent_candidates(&mut windows, &refined, &HashSet::from([24551]));
+
+        assert_eq!(windows[0].managed, rovr_types::ObservedBool::Yes);
+        assert_eq!(windows[1].managed, rovr_types::ObservedBool::No);
+    }
+
+    /// An app with no readable AX window list (empty list, or refinement timed
+    /// out) is not authoritative: its background windows must stay Unknown, be
+    /// resolved by SLS, and remain tileable.
+    #[test]
+    fn ax_absent_candidate_of_non_authoritative_app_stays_tileable() {
+        let mut windows = vec![ax_candidate(28171, 777, rovr_types::ObservedBool::Unknown)];
+        demote_ax_absent_candidates(&mut windows, &HashMap::new(), &HashSet::new());
+        resolve_managed_via_sls(&mut windows, |_| 1);
+
+        assert_eq!(windows[0].managed, rovr_types::ObservedBool::Yes);
+    }
+
+    /// Demotion runs before the SLS fallback and must survive it: the fallback
+    /// only resolves Unknown, so a demoted surface is never re-promoted into
+    /// the BSP (which would re-create the two-column tile).
+    #[test]
+    fn sls_fallback_does_not_repromote_demoted_surface() {
+        let mut windows = vec![ax_candidate(
+            28996,
+            24551,
+            rovr_types::ObservedBool::Unknown,
+        )];
+        demote_ax_absent_candidates(&mut windows, &HashMap::new(), &HashSet::from([24551]));
+        resolve_managed_via_sls(&mut windows, |_| 1);
+
+        assert_eq!(windows[0].managed, rovr_types::ObservedBool::No);
+    }
+
+    /// Demotion is scoped to the pid whose list was read: another app's window
+    /// on the same snapshot is untouched even when unrefined.
+    #[test]
+    fn demotion_does_not_cross_pids() {
+        let mut windows = vec![
+            ax_candidate(28996, 24551, rovr_types::ObservedBool::Unknown),
+            ax_candidate(29000, 888, rovr_types::ObservedBool::Unknown),
+        ];
+        demote_ax_absent_candidates(&mut windows, &HashMap::new(), &HashSet::from([24551]));
+
+        assert_eq!(windows[0].managed, rovr_types::ObservedBool::No);
+        assert_eq!(windows[1].managed, rovr_types::ObservedBool::Unknown);
     }
 }
