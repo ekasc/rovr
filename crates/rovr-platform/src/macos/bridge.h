@@ -76,6 +76,7 @@ int rovr_bridge_focus_space(uint64_t space_id);
 int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta);
 uint64_t rovr_bridge_current_space_for_space(uint64_t space_id);
 uint32_t rovr_bridge_display_for_space(uint64_t space_id);
+int rovr_bridge_activate_display_for_space(uint64_t space_id); // make a cross-display Space's display key (yabai display_manager_focus_display equivalent)
 int rovr_bridge_toggle_fullscreen(uint32_t window_id); // AXFullScreen attribute toggle with focus+wait; fallback to button; waits for animation (yabai-adapted, MIT)
 int rovr_bridge_close_window(uint32_t window_id);
 int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);

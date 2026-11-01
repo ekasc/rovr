@@ -1575,6 +1575,28 @@ impl Daemon {
                 entry.current = Some(current);
             }
         }
+        // Display ids are CGDirectDisplayIDs: a monitor that sleeps or is
+        // reconnected gets a new one, and a recycled id must never inherit the
+        // previous display's switch history. Without this, `space focus-recent`
+        // can target a Space that belongs to the other monitor — a switch the
+        // focused display has no Space for.
+        let observed_spaces = &self.engine.observed.spaces;
+        let observed_displays = &self.engine.observed.displays;
+        history.retain(|display, _| observed_displays.contains_key(display));
+        for (display, state) in history.iter_mut() {
+            let display = *display;
+            let on_display = |space: SpaceId| {
+                observed_spaces
+                    .get(&space)
+                    .is_some_and(|space| space.display_id == display)
+            };
+            if state.current.is_some_and(|space| !on_display(space)) {
+                state.current = None;
+            }
+            if state.previous.is_some_and(|space| !on_display(space)) {
+                state.previous = None;
+            }
+        }
         changed
     }
 
@@ -1715,7 +1737,16 @@ impl Daemon {
             .borrow()
             .get(&display)
             .and_then(|state| state.previous)?;
-        if !self.engine.observed.spaces.contains_key(&previous) {
+        // The target must exist AND live on the display it is history for. A
+        // Space on another monitor has no Space to switch to here, and asking
+        // WindowServer for it leaves that monitor blank.
+        if !self
+            .engine
+            .observed
+            .spaces
+            .get(&previous)
+            .is_some_and(|space| space.display_id == display)
+        {
             return None;
         }
         let actions = self.engine.focus_space(previous).ok()?;
@@ -2987,6 +3018,100 @@ mod tests {
 
         let (_, target) = daemon.focus_recent_space().expect("display 1 history");
         assert_eq!(target, SpaceId(11));
+
+        // A previous Space that exists but belongs to the OTHER display has no
+        // Space to switch to on this one: reject instead of asking
+        // WindowServer for a cross-display switch.
+        daemon
+            .space_history
+            .borrow_mut()
+            .get_mut(&DisplayId(1))
+            .unwrap()
+            .previous = Some(SpaceId(22));
+        assert!(daemon.focus_recent_space().is_none());
+    }
+
+    /// Display ids are CGDirectDisplayIDs and are recycled when a monitor
+    /// sleeps or reconnects. A recycled id must not inherit the previous
+    /// display's switch history — `space focus-recent` would otherwise target
+    /// a Space that belongs to the other monitor.
+    #[test]
+    fn focus_recent_drops_history_for_recycled_display_ids() {
+        let mut daemon = test_daemon();
+        daemon.platform = Box::new(MockPlatform {
+            snapshot: PlatformSnapshot {
+                windows: vec![],
+                spaces: vec![
+                    SpaceSnapshot {
+                        id: SpaceId(11),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: true,
+                        generation: 1,
+                        position: 0,
+                        is_fullscreen: false,
+                        is_system: false,
+                    },
+                    SpaceSnapshot {
+                        id: SpaceId(12),
+                        display_id: DisplayId(1),
+                        label: None,
+                        focused: false,
+                        generation: 1,
+                        position: 1,
+                        is_fullscreen: false,
+                        is_system: false,
+                    },
+                ],
+                displays: vec![DisplaySnapshot {
+                    id: DisplayId(1),
+                    frame: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    label: None,
+                    focused: true,
+                    is_main: true,
+                    generation: 1,
+                }],
+                complete: true,
+            },
+            executed: vec![],
+            diagnostics: vec![],
+            published: Default::default(),
+            tracked: Default::default(),
+            sketchybar_sent: Default::default(),
+            sketchybar_ok: std::sync::Mutex::new(true),
+        });
+        daemon.refresh_observation();
+
+        daemon.space_history.borrow_mut().insert(
+            DisplayId(9),
+            SpaceHistory {
+                current: Some(SpaceId(11)),
+                previous: Some(SpaceId(12)),
+            },
+        );
+        daemon
+            .space_history
+            .borrow_mut()
+            .get_mut(&DisplayId(1))
+            .unwrap()
+            .previous = Some(SpaceId(99));
+        daemon.refresh_observation();
+
+        let history = daemon.space_history.borrow();
+        assert!(
+            !history.contains_key(&DisplayId(9)),
+            "history for a display that is no longer observed must be dropped"
+        );
+        assert_eq!(
+            history[&DisplayId(1)].previous,
+            None,
+            "a previous Space that no longer exists on this display must be dropped"
+        );
     }
 
     /// M4b: a successful Window mutation emits StateChanged so subscribers learn

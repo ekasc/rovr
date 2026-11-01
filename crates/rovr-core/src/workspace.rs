@@ -189,7 +189,19 @@ impl WorkspaceRegistry {
             .values()
             .filter(|s| !s.is_fullscreen && !s.is_system && !parked.contains(&s.id))
             .collect();
-        slots.sort_by_key(|s| (s.display_id, s.position, s.id));
+        // Display groups follow the physical arrangement (left→right, then
+        // top→bottom), which is stable and matches what the user sees.
+        // Grouping by DisplayId instead ties every workspace's backing to a
+        // CGDirectDisplayID: reconnect a display or reboot and the ids change,
+        // so the same desk would silently reshuffle which monitor each
+        // workspace lives on. Single display: one group, nothing changes.
+        slots.sort_by_key(|s| {
+            let arrangement = displays
+                .get(&s.display_id)
+                .map(|d| (d.frame.x.round() as i64, d.frame.y.round() as i64))
+                .unwrap_or((i64::MAX, i64::from(s.display_id.0)));
+            (arrangement, s.position, s.id)
+        });
         let main = displays.values().find(|d| d.is_main).map(|d| d.id);
         let mut moves = Vec::new();
         for name in self.ordered_names() {
@@ -242,6 +254,22 @@ mod tests {
             position: pos,
             is_fullscreen: false,
             is_system: false,
+        }
+    }
+
+    fn display_at(id: u32, x: f64, is_main: bool) -> rovr_types::DisplaySnapshot {
+        rovr_types::DisplaySnapshot {
+            id: DisplayId(id),
+            frame: rovr_types::Rect {
+                x,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: false,
+            is_main,
+            generation: 0,
         }
     }
 
@@ -443,6 +471,48 @@ mod tests {
         assert_eq!(reg.backing_for("1"), Some(SpaceId(11)));
         assert_eq!(reg.backing_for("2"), Some(SpaceId(12)));
         assert!(reg.0["2"].dynamic);
+    }
+
+    /// Multi-display: display groups follow the physical arrangement, not the
+    /// volatile CGDirectDisplayID. A display sitting to the LEFT of another
+    /// must claim the lower-ordinal workspaces even when its id is higher,
+    /// and reconnecting displays (ids change, arrangement does not) must not
+    /// reshuffle which monitor a workspace lives on.
+    #[test]
+    fn display_arrangement_decides_slot_group_order() {
+        let mut reg = registry_with(&[("1", true, None, 0), ("2", true, None, 1)]);
+        let mut spaces = HashMap::new();
+        spaces.insert(SpaceId(90), space(90, 7, 0)); // right display
+        spaces.insert(SpaceId(91), space(91, 3, 1)); // left display
+        let mut displays = HashMap::new();
+        displays.insert(DisplayId(7), display_at(7, 1920.0, true));
+        displays.insert(DisplayId(3), display_at(3, -1470.0, false));
+
+        reg.remap_after_snapshot(&spaces, &displays);
+
+        assert_eq!(
+            reg.backing_for("1"),
+            Some(SpaceId(91)),
+            "the leftmost display claims the lowest-ordinal workspace"
+        );
+        assert_eq!(reg.backing_for("2"), Some(SpaceId(90)));
+
+        // Same desk after a reconnect: ids changed, arrangement identical.
+        let mut spaces = HashMap::new();
+        spaces.insert(SpaceId(290), space(290, 11, 0)); // right display
+        spaces.insert(SpaceId(291), space(291, 12, 1)); // left display
+        let mut displays = HashMap::new();
+        displays.insert(DisplayId(11), display_at(11, 1920.0, true));
+        displays.insert(DisplayId(12), display_at(12, -1470.0, false));
+
+        reg.remap_after_snapshot(&spaces, &displays);
+
+        assert_eq!(
+            reg.backing_for("1"),
+            Some(SpaceId(291)),
+            "workspace->display binding must survive display-id churn"
+        );
+        assert_eq!(reg.backing_for("2"), Some(SpaceId(290)));
     }
 
     /// Stale dynamic bindings (persisted backing Space no longer observed)

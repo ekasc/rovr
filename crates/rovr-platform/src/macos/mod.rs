@@ -177,6 +177,7 @@ extern "C" {
     fn rovr_bridge_window_pid(window_id: u32) -> i32;
     fn rovr_bridge_current_space_for_space(space_id: u64) -> u64;
     fn rovr_bridge_display_for_space(space_id: u64) -> u32;
+    fn rovr_bridge_activate_display_for_space(space_id: u64) -> i32;
     fn rovr_bridge_space_is_fullscreen(space_id: u64) -> i32;
     fn rovr_bridge_space_is_system(space_id: u64) -> i32;
     fn rovr_bridge_is_display_animating(display_id: u32) -> i32;
@@ -533,7 +534,17 @@ impl MacPlatform {
             for attempt in 0..SA_FOCUS_ATTEMPTS {
                 match self.sa.focus_space(space.0) {
                     Ok(()) => {
+                        // Cross-display: the mutation alone leaves the target
+                        // display unarmed (committed Space, nothing rendered),
+                        // so the monitor stays black until something else
+                        // activates it. Arm it, exactly as the gesture path
+                        // below does before posting its swipes.
+                        unsafe { rovr_bridge_activate_display_for_space(space.0) };
                         self.last_focus_target.set(space.0);
+                        // Record the post so the gesture settle gate covers an
+                        // SA-driven switch too; without this a fallback gesture
+                        // posted right after could land mid-transition.
+                        self.last_focus_posted_at.set(Some(Instant::now()));
                         return Ok(());
                     }
                     Err(err) => last_error = Some(err),
@@ -619,6 +630,9 @@ impl MacPlatform {
             const INTERVAL: Duration = Duration::from_millis(100);
             for _ in 0..ATTEMPTS {
                 if self.sa.focus_space(target.0).is_ok() {
+                    // See execute_focus_space: a cross-display target needs its
+                    // display armed or the monitor is left blank.
+                    unsafe { rovr_bridge_activate_display_for_space(target.0) };
                     self.last_focus_target.set(target.0);
                     self.last_focus_posted_at.set(Some(Instant::now()));
                     return Ok(());

@@ -414,7 +414,9 @@ impl Engine {
                     .displays
                     .get(&s.display_id)
                     .map(|d| {
-                        name == "main" && d.focused
+                        // "main" is CGMainDisplayID, not the display that
+                        // happens to hold keyboard focus.
+                        name == "main" && d.is_main
                             || name.parse::<u32>().map(|n| n == d.id.0).unwrap_or(false)
                     })
                     .unwrap_or(false),
@@ -3094,6 +3096,72 @@ mod tests {
             engine.workspaces.backing_for("chat"),
             Some(SpaceId(20)),
             "the newly created space must be bound to the logical workspace"
+        );
+    }
+
+    /// Multi-display: a persistent workspace pinned to `display = "main"`
+    /// must recreate its Space on CGMainDisplayID, not on whichever display
+    /// happens to hold keyboard focus. Before this, "main" was matched against
+    /// the *focused* flag, so the recreated Space could land on the other
+    /// monitor.
+    #[test]
+    fn persistent_creation_anchor_uses_main_display_not_focused_display() {
+        let mut engine = Engine::new(Config {
+            workspaces: vec![rovr_config::WorkspaceConfig {
+                name: "code".into(),
+                layout: rovr_types::LayoutKind::Bsp,
+                display: Some("main".into()),
+                persistent: true,
+                plugin: None,
+            }],
+            ..Default::default()
+        });
+        engine.capabilities.create_space = true;
+        engine
+            .observed
+            .spaces
+            .insert(SpaceId(11), space_snap(11, 1, 0, true));
+        engine
+            .observed
+            .spaces
+            .insert(SpaceId(21), space_snap(21, 2, 1, false));
+        engine.observed.displays.insert(
+            DisplayId(1),
+            DisplaySnapshot {
+                id: DisplayId(1),
+                frame: rovr_types::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: true,
+                is_main: false,
+                generation: 0,
+            },
+        );
+        engine.observed.displays.insert(
+            DisplayId(2),
+            DisplaySnapshot {
+                id: DisplayId(2),
+                frame: rovr_types::Rect {
+                    x: 1000.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 800.0,
+                },
+                label: None,
+                focused: false,
+                is_main: true,
+                generation: 0,
+            },
+        );
+
+        assert_eq!(
+            engine.persistent_creation_anchor(),
+            Some(SpaceId(21)),
+            "display = \"main\" anchors on the main display even when another display is focused"
         );
     }
 
