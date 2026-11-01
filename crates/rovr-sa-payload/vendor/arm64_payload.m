@@ -5,6 +5,11 @@
     __asm__("mov x0, %0\n""mov x1, %1\n""mov x2, %2\n""mov x20, %3\n" : :"r"(v0), "r"(v1), "r"(v2), "r"(v3) :"x0", "x1", "x2", "x20"); ((void (*)())(func))();
 
 uint64_t get_dock_spaces_offset(NSOperatingSystemVersion os_version) {
+    if (os_build_is("26B5101f")) {
+        // macOS 27.2. Pattern (adrp/add/ldr of the dock.spaces global) sits at
+        // 0x2f930, i.e. BEFORE the 26A428-era window start.
+        return 0x2f000;
+    }
     if (os_version.majorVersion == 26 || os_version.majorVersion == 27) {
         return 0x30000;
     } else if (os_version.majorVersion == 15) {
@@ -55,6 +60,10 @@ uint64_t get_fix_animation_offset(NSOperatingSystemVersion os_version) {
 }
 
 uint64_t get_add_space_offset(NSOperatingSystemVersion os_version) {
+    if (os_build_is("26B5101f")) {
+        // macOS 27.2. addSpace entry at 0x18560c.
+        return 0x180000;
+    }
     if (os_version.majorVersion == 26) {
         return 0x250000;
     } else if (os_version.majorVersion == 27) {
@@ -73,6 +82,10 @@ uint64_t get_add_space_offset(NSOperatingSystemVersion os_version) {
 }
 
 uint64_t get_remove_space_offset(NSOperatingSystemVersion os_version) {
+    if (os_build_is("26B5101f")) {
+        // macOS 27.2. removeSpace entry at 0x12cbac.
+        return 0x120000;
+    }
     if (os_version.majorVersion == 26) {
         return 0x1e0000;
     } else if (os_version.majorVersion == 27) {
@@ -91,6 +104,10 @@ uint64_t get_remove_space_offset(NSOperatingSystemVersion os_version) {
 }
 
 uint64_t get_move_space_offset(NSOperatingSystemVersion os_version) {
+    if (os_build_is("26B5101f")) {
+        // macOS 27.2. moveSpace entry at 0xf0f8c.
+        return 0xe0000;
+    }
     if (os_version.majorVersion == 26) {
         return 0x1c0000;
     } else if (os_version.majorVersion == 27) {
@@ -218,6 +235,13 @@ const char *get_remove_space_pattern(NSOperatingSystemVersion os_version) {
 }
 
 const char *get_move_space_pattern(NSOperatingSystemVersion os_version) {
+    if (os_build_is("26B5101f")) {
+        // macOS 27.2: the function now opens a frame (`sub sp, sp, #0x20`)
+        // and stashes x2/x1/x0 in x26/x27/x28 before the store, so the tail
+        // ends `... FF 03 01 D1 FA 03 02 AA FC 03 01 AA F6 03 00 AA` instead of
+        // the 26A428 `... F6 03 14 AA`.
+        return "7F 23 03 D5 E3 03 1E AA ?? ?? ?? 97 FE 03 03 AA FD 7B ?? A9 FD ?? ?? 91 FF 03 01 D1 FA 03 02 AA FC 03 01 AA F6 03 00 AA";
+    }
     if (os_version.majorVersion == 26 || os_version.majorVersion == 27) {
         return "7F 23 03 D5 E3 03 1E AA ?? ?? ?? 97 FE 03 03 AA FD 7B ?? A9 FD ?? ?? 91 F6 03 14 AA";
     } else if (os_version.majorVersion == 15) {

@@ -11,7 +11,6 @@ Don't assume. Don't hide confusion.
 Before implementing:
 
 - Read the relevant code first.
-- Search `../yabai/` before guessing macOS/private API behavior.
 - If uncertainty materially affects correctness or architecture and cannot be resolved from the repo, ask.
 - Otherwise state the assumption and choose the most reversible option.
 - If a simpler approach exists, say so.

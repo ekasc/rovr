@@ -14,9 +14,16 @@
 
 #define ROVR_SA_VERSION "rovr-sa-2.0"
 
-// Rovr-owned 0700 runtime directory and socket namespace (never yabai's).
-#define SA_RUNTIME_DIR_FMT "/tmp/rovr-%d"
-#define SA_SOCKET_PATH_FMT "/tmp/rovr-%d/sa.sock"
+// Rovr-owned 0700 runtime directory (relative to the console user's home) and
+// socket namespace (never yabai's). Deliberately NOT under /tmp: macOS runs
+// com.apple.tmp_cleaner daily, deleting /tmp entries whose atime, mtime AND
+// ctime are all older than 3 days. A bound Unix socket never touches its path
+// again, so its timestamps freeze at bind time and the socket file is deleted
+// ~3 days after injection while the payload keeps running — the SA silently
+// becomes unreachable until Dock restarts. This is the same reason the daemon
+// socket lives in ~/Library/Caches/rovr.
+#define SA_RUNTIME_SUBDIR "Library/Caches/rovr"
+#define SA_SOCKET_NAME "sa.sock"
 
 #define OSAX_ATTRIB_DOCK_SPACES    (1 << 0)
 #define OSAX_ATTRIB_DPPM           (1 << 1)

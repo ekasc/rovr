@@ -21,6 +21,11 @@
 #import <dlfcn.h>
 #import <stdio.h>
 #import <unistd.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <fcntl.h>
+#import <limits.h>
+#import <string.h>
+#import <sys/stat.h>
 
 #ifdef __arm64__
 #include <ptrauth.h>
@@ -126,6 +131,76 @@ static pid_t get_dock_pid(void)
     return 0;
 }
 
+// Copy the validated payload to a content-addressed sibling
+// (`librovr_sa_payload.<sha16>.dylib`) and return the copy's path, or NULL if
+// the copy cannot be made (callers then inject the original path).
+static const char *content_addressed_payload_path(const char *src)
+{
+    int fd = open(src, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    unsigned char buffer[65536];
+    ssize_t n;
+    while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+        CC_SHA256_Update(&ctx, buffer, (CC_LONG)n);
+    }
+    int read_failed = n < 0;
+    close(fd);
+    if (read_failed) return NULL;
+
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+    char hex[17];
+    for (int i = 0; i < 8; ++i) {
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+
+    const char *slash = strrchr(src, '/');
+    if (slash == NULL) return NULL;
+    char dst[PATH_MAX];
+    int written = snprintf(dst, sizeof(dst), "%.*s/librovr_sa_payload.%s.dylib",
+                           (int)(slash - src), src, hex);
+    if (written < 0 || (size_t)written >= sizeof(dst)) return NULL;
+
+    struct stat st = {0};
+    if (lstat(dst, &st) == 0) {
+        return S_ISREG(st.st_mode) ? strdup(dst) : NULL;
+    }
+
+    int in = open(src, O_RDONLY | O_NOFOLLOW);
+    if (in < 0) return NULL;
+    int out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (out < 0) {
+        close(in);
+        return NULL;
+    }
+    bool ok = true;
+    while ((n = read(in, buffer, sizeof(buffer))) > 0) {
+        ssize_t offset = 0;
+        while (offset < n) {
+            ssize_t wrote = write(out, buffer + offset, (size_t)(n - offset));
+            if (wrote <= 0) {
+                ok = false;
+                break;
+            }
+            offset += wrote;
+        }
+        if (!ok) break;
+    }
+    if (n < 0) ok = false;
+    close(in);
+    if (ok && fsync(out) != 0) ok = false;
+    if (close(out) != 0) ok = false;
+    if (!ok) {
+        unlink(dst);
+        return NULL;
+    }
+    chmod(dst, 0644);
+    return strdup(dst);
+}
+
 int main(int argc, char **argv)
 {
     int result = 0;
@@ -141,6 +216,14 @@ int main(int argc, char **argv)
         return 1;
     }
     const char *payload_path = argv[1];
+    // Inject a content-addressed copy, not the canonical path. dlopen() of a
+    // path Dock already has mapped is a NO-OP, so after replacing the on-disk
+    // payload a reinjection never ran the new code: the SA stayed dead with
+    // INJECTION_FAILED until Dock was restarted by hand. A new build hashes to
+    // a new filename, which dyld really loads. (Verified: a second copy of an
+    // already-loaded dylib runs its constructor.)
+    const char *content_path = content_addressed_payload_path(payload_path);
+    if (content_path != NULL) payload_path = content_path;
     size_t path_len = strlen(payload_path);
     // Max path length is bounded by the reserved zero region in shell_code:
     // x86_64 writes the path at offset 90 into a 187-byte array, arm64 at

@@ -33,11 +33,29 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 #include "common.h"
+
+//
+// OS build identifier, e.g. "26B5101f". Dock's private internals shift between
+// builds of the SAME major version (verified: macOS 27.0 build 26A428 has
+// different scan windows than 27.2 build 26B5101f), so offsets and patterns
+// are gated on the build rather than on the major version alone.
+//
+// Parsed from `operatingSystemVersionString` ("Version 27.2 (Build 26B5101f)"),
+// which needs no new API or entitlement. Empty when unparseable, in which case
+// every build-gated branch falls through to the major-version default.
+//
+static char g_os_build[16] = "";
+
+static int os_build_is(const char *build)
+{
+    return g_os_build[0] != '\0' && strcmp(g_os_build, build) == 0;
+}
 
 #ifdef __x86_64__
 #include "../vendor/x64_payload.m"
@@ -248,6 +266,35 @@ static void init_instances()
 {
     NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
     if (!verify_os_version(os_version)) return;
+
+    // Capture the build identifier so the vendor tables below can gate on it.
+    // `operatingSystemVersionString` is "Version 27.2 (Build 26B5101f)".
+    //
+    // The extraction MUST use a range. The non-range getCString: copies the
+    // ENTIRE string into a 16-byte buffer, which truncated the gate to
+    // "Version 27.2 (" and made every build-gated offset a silent no-op: the
+    // payload fell back to the major-version-27 windows and kept resolving
+    // nothing on 27.2.
+    {
+        NSString *build = nil;
+        NSString *vs = [[NSProcessInfo processInfo] operatingSystemVersionString];
+        if (vs != nil) {
+            NSRange open = [vs rangeOfString:@"(Build "];
+            if (open.location != NSNotFound) {
+                NSUInteger start = open.location + open.length;
+                NSRange rest = NSMakeRange(start, [vs length] - start);
+                NSRange close = [vs rangeOfString:@")" options:0 range:rest];
+                if (close.location != NSNotFound && close.location > start) {
+                    build = [vs substringWithRange:NSMakeRange(start, close.location - start)];
+                }
+            }
+        }
+        if (build != nil && [build length] < sizeof(g_os_build)) {
+            [build getCString:g_os_build
+                   maxLength:sizeof(g_os_build)
+                    encoding:NSUTF8StringEncoding];
+        }
+    }
 
     uint64_t baseaddr = static_base_address() + image_slide();
 
@@ -531,9 +578,26 @@ static bool do_space_focus(char *message)
     {
         CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
         if (!dest_display) return false;
-        id source_space = macOSSequoia
-                        ? ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceForDisplayUUID:), dest_display)
-                        : ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceforDisplayUUID:), dest_display);
+        // The "current space for this display" accessor has been spelled three
+        // different ways across macOS: 26.x resolves `currentSpaceForDisplayUUID:`,
+        // older builds `currentSpaceforDisplayUUID:`, and 27.2 renamed it to
+        // `currentSpaceForDisplay:`. Asking the object beats guessing by
+        // version: an unresolvable selector leaves `source_space` nil, which
+        // silently disables every focus while the command still reports
+        // success (the exact 27.2 symptom).
+        SEL current_space_sel = nil;
+        if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplayUUID:)]) {
+            current_space_sel = @selector(currentSpaceForDisplayUUID:);
+        } else if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplay:)]) {
+            current_space_sel = @selector(currentSpaceForDisplay:);
+        } else if ([dock_spaces respondsToSelector:@selector(currentSpaceforDisplayUUID:)]) {
+            current_space_sel = @selector(currentSpaceforDisplayUUID:);
+        }
+        id source_space = nil;
+        if (current_space_sel != nil) {
+            source_space = ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(
+                dock_spaces, current_space_sel, dest_display);
+        }
         uint64_t source_space_id = get_space_id(source_space);
 
         if (source_space_id == dest_space_id) {
@@ -782,7 +846,10 @@ static void do_handshake(int sockfd)
     if (dp_desktop_picture_manager != nil) attrib |= OSAX_ATTRIB_DPPM;
     if (add_space_fp)                      attrib |= OSAX_ATTRIB_ADD_SPACE;
     if (remove_space_fp)                   attrib |= OSAX_ATTRIB_REM_SPACE;
-    if (move_space_fp)                     attrib |= OSAX_ATTRIB_MOV_SPACE;
+    // do_space_move() bails unless dppm resolved too, so the capability must
+    // not claim reorder works on move_space alone: reporting it would promise
+    // an operation that silently does nothing.
+    if (move_space_fp && dp_desktop_picture_manager != nil) attrib |= OSAX_ATTRIB_MOV_SPACE;
     if (dock_spaces != nil)                attrib |= OSAX_ATTRIB_FOCUS_SPACE;
     attrib |= OSAX_ATTRIB_WINDOW_OPACITY | OSAX_ATTRIB_WINDOW_LAYER |
               OSAX_ATTRIB_WINDOW_STICKY | OSAX_ATTRIB_WINDOW_SHADOW |
@@ -941,8 +1008,13 @@ static bool ensure_runtime_dir(char *runtime_dir)
 {
     struct stat st = {0};
     if (lstat(runtime_dir, &st) == 0) {
-        return S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode) &&
-               st.st_uid == getuid() && (st.st_mode & 0077) == 0;
+        if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != getuid()) {
+            return false;
+        }
+        // The daemon creates this directory 0700. If an older build left it
+        // looser, tighten it before binding an owner-only socket inside.
+        if ((st.st_mode & 0077) == 0) return true;
+        return chmod(runtime_dir, 0700) == 0;
     }
     if (mkdir(runtime_dir, 0700) != 0) return false;
     return chmod(runtime_dir, 0700) == 0;
@@ -983,14 +1055,20 @@ void load_payload(void)
 {
     NSLog(@"[rovr-sa] loaded payload..");
 
-    // Rovr keys the socket on UID (stable under launchd even when $USER is
-    // unset or differs); $USER is not consulted at all.
+    // Durable per-user runtime dir, matching the daemon's socket home. The
+    // payload runs inside Dock, so getuid()/getpwuid() resolve the console
+    // session user. /tmp would be cleaned after 3 days (see common.h).
     uid_t uid = getuid();
+    const struct passwd *pw = getpwuid(uid);
+    if (pw == NULL || pw->pw_dir == NULL || pw->pw_dir[0] == '\0') {
+        NSLog(@"[rovr-sa] no home directory for uid %d; not listening..", (int) uid);
+        return;
+    }
 
     char runtime_dir[255];
     char socket_file[255];
-    snprintf(runtime_dir, sizeof(runtime_dir), SA_RUNTIME_DIR_FMT, uid);
-    snprintf(socket_file, sizeof(socket_file), SA_SOCKET_PATH_FMT, uid);
+    snprintf(runtime_dir, sizeof(runtime_dir), "%s/" SA_RUNTIME_SUBDIR, pw->pw_dir);
+    snprintf(socket_file, sizeof(socket_file), "%s/" SA_SOCKET_NAME, runtime_dir);
 
     if (start_daemon(runtime_dir, socket_file)) {
         NSLog(@"[rovr-sa] now listening on %s..", socket_file);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define ROVR_APP_MAX 256
 #define ROVR_TITLE_MAX 512
@@ -12,6 +13,10 @@
 #define ROVR_CAP_OBSERVE_SPACES (1ULL << 3)
 #define ROVR_CAP_MOVE_WINDOW_TO_SPACE (1ULL << 4)
 #define ROVR_CAP_FOCUS_SPACE (1ULL << 5)
+
+// Writes the uid's home directory into `buffer` (NUL-terminated). Returns 1 on
+// success, 0 if the uid has no home or the buffer is too small.
+int rovr_bridge_home_dir_for_uid(uint32_t uid, char *buffer, size_t size);
 
 typedef struct rovr_bridge_window {
     uint32_t id;
@@ -65,7 +70,11 @@ typedef void (*rovr_space_callback)(const rovr_bridge_space *space, void *contex
 int rovr_bridge_init(void);
 uint64_t rovr_bridge_capabilities(void);
 int rovr_bridge_enumerate_window_candidates(rovr_window_callback callback, void *context);
-int rovr_bridge_refine_windows_for_pid(int32_t pid, rovr_ax_window_callback callback, void *context);
+// `ax_list_authoritative` (may be NULL) receives 1 when the app's AX window
+// list was readable, non-empty, and yielded at least one window id. The list is
+// then trustworthy: a CGWindow of this pid that it does not contain is a
+// surface (tab strip, tooltip), not a window.
+int rovr_bridge_refine_windows_for_pid(int32_t pid, rovr_ax_window_callback callback, void *context, uint8_t *ax_list_authoritative);
 int rovr_bridge_enumerate_displays(rovr_display_callback callback, void *context);
 int rovr_bridge_set_window_frame(uint32_t window_id, double x, double y, double width, double height);
 int rovr_bridge_focus_window(uint32_t window_id);

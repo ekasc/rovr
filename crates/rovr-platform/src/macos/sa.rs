@@ -27,10 +27,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Rovr-owned SA socket namespace. Uses UID (not $USER) so the daemon
-/// and CLI agree even when $USER is unset or differs; `$USER` fallback is
-/// kept only for error messaging.
-pub const SA_SOCKET_PATH_FMT: &str = "/tmp/rovr-{}/sa.sock";
+/// Rovr-owned SA socket name. It lives in the per-user runtime directory next
+/// to the daemon socket (`~/Library/Caches/rovr`), NOT in `/tmp`: macOS runs
+/// `com.apple.tmp_cleaner` daily and deletes `/tmp` entries whose atime, mtime
+/// and ctime are all older than 3 days. A bound Unix socket never touches its
+/// path again, so its timestamps freeze at bind time and the socket file was
+/// deleted ~3 days after injection — the SA silently died and only a Dock
+/// restart (which reloads the payload) brought it back.
+pub const SA_SOCKET_NAME: &str = "sa.sock";
 /// Expected payload version prefix. Bump the minor on wire-compatible
 /// extensions; bump the major on breaking changes. `probe()` preserves raw
 /// mismatched versions for status, while capabilities reject them.
@@ -67,6 +71,11 @@ pub const OSAX_ATTRIB_WINDOW_SCALE: u32 = 0x400;
 extern "C" {
     fn getuid() -> u32;
     fn getpeereid(socket: i32, euid: *mut u32, egid: *mut u32) -> i32;
+    fn rovr_bridge_home_dir_for_uid(
+        uid: u32,
+        buffer: *mut std::os::raw::c_char,
+        size: usize,
+    ) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -130,16 +139,24 @@ impl Default for SaClient {
 }
 
 impl SaClient {
-    pub fn socket_path_for_uid(uid: &str) -> PathBuf {
-        PathBuf::from(SA_SOCKET_PATH_FMT.replace("{}", uid))
+    /// SA socket path for a specific uid's home. `sa install`/`uninstall` run
+    /// as root, but the payload lives in the console user's session, so those
+    /// paths must resolve the console user's home rather than root's `$HOME`.
+    pub fn socket_path_for_uid(uid: u32) -> Option<PathBuf> {
+        let mut buffer = [0 as std::os::raw::c_char; 1024];
+        let ok = unsafe { rovr_bridge_home_dir_for_uid(uid, buffer.as_mut_ptr(), buffer.len()) };
+        if ok == 0 {
+            return None;
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+            .to_str()
+            .ok()?;
+        Some(crate::daemon_runtime_dir_for(Some(home)).join(SA_SOCKET_NAME))
     }
 
+    /// Socket path for the calling user (daemon and non-root CLI use).
     pub fn default_socket_path() -> PathBuf {
-        // The payload keys its socket on getuid(); the client must use the
-        // SAME value. ($USER is not consulted: macOS does not set a UID env
-        // var, so a username fallback would never match the payload.)
-        let uid = unsafe { libc_getuid() };
-        Self::socket_path_for_uid(&uid.to_string())
+        crate::daemon_runtime_dir().join(SA_SOCKET_NAME)
     }
 
     pub fn new() -> Self {
@@ -353,6 +370,35 @@ mod tests {
 
     fn socket(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rovr-sa-{name}-{}.sock", std::process::id()))
+    }
+
+    /// The SA socket must share the daemon's durable runtime directory. A
+    /// /tmp socket is deleted by com.apple.tmp_cleaner three days after bind
+    /// (a bound socket never refreshes its timestamps), which is what made the
+    /// SA die silently and require a manual Dock restart.
+    #[test]
+    fn sa_socket_is_durable_and_matches_daemon_layout() {
+        let path = SaClient::default_socket_path();
+        assert!(
+            !path.starts_with("/tmp"),
+            "SA socket must not live in /tmp: {path:?}"
+        );
+        assert_eq!(
+            path.parent(),
+            Some(crate::daemon_runtime_dir().as_path()),
+            "SA socket must sit next to the daemon socket"
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(SA_SOCKET_NAME)
+        );
+
+        let own_uid = unsafe { libc_getuid() };
+        let by_uid = SaClient::socket_path_for_uid(own_uid).expect("own uid has a home");
+        assert!(
+            by_uid.ends_with("Library/Caches/rovr/sa.sock"),
+            "per-uid path must use the durable layout: {by_uid:?}"
+        );
     }
 
     #[test]

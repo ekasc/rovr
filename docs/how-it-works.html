@@ -228,13 +228,13 @@ footer{color:var(--faint);font-size:14px;padding:26px 0 60px}
 <tr><td><code>rovr-platform</code></td><td><code>crates/rovr-platform/src/{lib,mock,bounded_worker,macos/mod,macos/sa,macos/reinject}.rs</code></td><td><code>Platform</code> trait, mock backend, bounded observation worker, macOS bridge, SA client, reinject state machine.</td></tr>
 <tr><td><code>rovr-daemon</code></td><td><code>crates/rovr-daemon/src/main.rs</code></td><td>Single owner state loop, Unix socket server, subscribers, doctor data. No hotkey manager and no AppKit run loop.</td></tr>
 <tr><td><code>rovr-cli</code></td><td><code>crates/rovr-cli/src/main.rs</code></td><td>Thin IPC client. Maps clap subcommands to protocol commands. Also owns <code>sa install</code>, <code>status</code>, <code>uninstall</code> flows.</td></tr>
-<tr><td><code>rovr-sa-payload</code></td><td><code>crates/rovr-sa-payload</code></td><td>ObjC dylib injected into Dock. Socket <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code>, handshake <code>rovr-sa-2.0</code>, opcodes for space lifecycle and cosmetics.</td></tr>
+<tr><td><code>rovr-sa-payload</code></td><td><code>crates/rovr-sa-payload</code></td><td>ObjC dylib injected into Dock. Socket <code>$HOME/Library/Caches/rovr/sa.sock</code>, handshake <code>rovr-sa-2.0</code>, opcodes for space lifecycle and cosmetics.</td></tr>
 <tr><td><code>rovr-sa-loader</code></td><td><code>crates/rovr-sa-loader</code></td><td>Root injector adapted from yabai loader.m with attribution. arm64e build with PAC ABI patch.</td></tr>
 <tr><td><code>rovr-sa-helper</code></td><td><code>crates/rovr-sa-helper</code></td><td>Minimal root LaunchDaemon at <code>/var/run/rovr-sa-helper.sock</code>. Exactly <code>inject</code> plus <code>status</code>. No pid, path, or command fields.</td></tr>
 <tr><td>menu bar app</td><td><code>apps/rovr-menu-bar</code></td><td>Optional native Swift status and debug UI. No changes in the current pass.</td></tr>
 </tbody>
 </table>
-<p>Shared roots: <code>Cargo.toml</code> sets workspace version <code>0.1.0</code>, edition 2021, Rust 1.78. Default config lives at <code>~/.config/rovr/rovr.toml</code> with <code>config/rovr.example.toml</code> as the reference. The daemon socket lives at <code>$HOME/Library/Caches/rovr/daemon.sock</code>; the Dock payload socket keeps <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code> keyed by real <code>getuid</code>, never the <code>$UID</code> env var.</p>
+<p>Shared roots: <code>Cargo.toml</code> sets workspace version <code>0.1.0</code>, edition 2021, Rust 1.78. Default config lives at <code>~/.config/rovr/rovr.toml</code> with <code>config/rovr.example.toml</code> as the reference. The daemon socket lives at <code>$HOME/Library/Caches/rovr/daemon.sock</code>; the Dock payload socket lives beside it at <code>$HOME/Library/Caches/rovr/sa.sock</code> (resolved from the console user's home, never the <code>$UID</code> env var).</p>
 </section>
 <section class="card" id="atoms">
 <h2>4. Atom layer: ids, rects, snapshots</h2>
@@ -559,7 +559,7 @@ rovr sa status | sa install | sa uninstall</code></pre>
 <h2>13. Scripting addition stack</h2>
 <p class="sub">Private Space lifecycle and cosmetics live here. The design keeps privilege small and observable.</p>
 <div class="kv">
-<div class="cell"><b>rovr-sa-payload: the code in Dock</b>ObjC dylib on <code>/tmp/rovr-&lt;uid&gt;/sa.sock</code> with <code>rovr-sa-2.0</code> handshake and honest capability bits. SkyLight cosmetics direct. Space lifecycle via vendored yabai MIT pattern tables with attribution. Scan bounds guarded. arm64e build with loader caps patched <code>0x81 to 0x80</code> per yabai issue 2686.</div>
+<div class="cell"><b>rovr-sa-payload: the code in Dock</b>ObjC dylib on <code>$HOME/Library/Caches/rovr/sa.sock</code> with <code>rovr-sa-2.0</code> handshake and honest capability bits. SkyLight cosmetics direct. Space lifecycle via vendored yabai MIT pattern tables with attribution. Scan bounds guarded. arm64e build with loader caps patched <code>0x81 to 0x80</code> per yabai issue 2686.</div>
 <div class="cell"><b>rovr-sa-loader: the injector</b>Root only. Adapted from yabai loader.m with attribution. Stable signing with a cert anchored designated requirement keeps the Accessibility grant across rebuilds. Embedded Info.plist in <code>__TEXT,__info_plist</code> lets TCC attribute launchd spawned rovrd.</div>
 </div>
 <h3>Helper: the smallest possible root service</h3>
@@ -587,7 +587,7 @@ rovr sa status | sa install | sa uninstall</code></pre>
 <p class="sub">Rovr assumes it will be surprised and keeps the evidence.</p>
 <ul class="tight">
 <li><code>FlightRecorder</code> in <code>core/src/flight_recorder.rs</code>: bounded ring, default 2048 records, each with sequence, unix ms, kind, and detail. Records events, actions, remap moves, creations, destroys, and platform errors. <code>rovr debug events</code> reads it.</li>
-<li><code>rovr doctor</code>: protocol version, capabilities, SA socket plus version plus attribs, reinject phase plus generation plus attempts plus retry, wedge ms, generation, counts, config path, layout, gap, interval.</li>
+<li><code>rovr doctor</code>: a grouped human-readable report — daemon counts, config, health, platform capabilities, and a summary of what needs attention. The raw payload (protocol version, capabilities, SA socket plus version plus attribs, reinject phase plus generation plus attempts plus retry, wedge ms, generation, counts, config path, layout, gap, interval) is available with <code>rovr doctor --json</code> for scripts and the GUI.</li>
 <li>Recovery triggers that force scoped or full re-observation: wake, Dock restart, display change, space change, suspicious mutation failure. Every OS wait has a deadline. No infinite polling.</li>
 <li>Persistence in <code>core/src/persistence.rs</code>: layouts, workspace owned trees, scratchpads, workspaces. Atomic replace with fsync on file and directory survives crash and power loss mid save.</li>
 <li>Hotkeys: owned by skhd. The daemon registers nothing and has no AppKit run loop.</li>

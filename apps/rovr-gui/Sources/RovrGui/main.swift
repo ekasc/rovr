@@ -42,7 +42,7 @@ if CommandLine.arguments.contains("--self-check") {
     print("rovr binary: \(binary.isEmpty ? "NOT FOUND" : binary)")
     let client = RovrClient(binary: binary)
     do {
-        let doctor = try client.json(["doctor"]) as? [String: Any] ?? [:]
+        let doctor = try client.json(["doctor", "--json"]) as? [String: Any] ?? [:]
         print("daemon: ok  generation=\(doctor.int("generation") ?? 0)"
             + " windows=\(doctor.int("windows") ?? 0)"
             + " spaces=\(doctor.int("spaces") ?? 0)"

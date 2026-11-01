@@ -89,14 +89,14 @@ extern "C" {
 /// and state paths, so it cannot desync the daemon from its CLI the way
 /// `$TMPDIR` or `$UID` can (see [`unix_uid`]).
 ///
-/// The SA socket keeps its own `/tmp/rovr-<uid>/sa.sock` namespace on purpose:
-/// it is bound by the payload dylib running inside Dock, so relocating it would
-/// require rebuilding and reinstalling that payload.
+/// The SA socket uses the same directory and the same reasoning (see
+/// [`macos::sa::SA_SOCKET_NAME`]); the payload binds it inside Dock using the
+/// console user's home.
 pub fn daemon_runtime_dir() -> std::path::PathBuf {
     daemon_runtime_dir_for(std::env::var("HOME").ok().as_deref())
 }
 
-fn daemon_runtime_dir_for(home: Option<&str>) -> std::path::PathBuf {
+pub(crate) fn daemon_runtime_dir_for(home: Option<&str>) -> std::path::PathBuf {
     match home {
         Some(home) if !home.is_empty() => {
             std::path::PathBuf::from(home).join("Library/Caches/rovr")
