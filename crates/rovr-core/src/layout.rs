@@ -96,10 +96,20 @@ fn target_workspace_for_window(
     observed: &ObservedState,
     workspaces: &WorkspaceRegistry,
 ) -> Option<SpaceId> {
+    // Workspaces are per display, so a rule's target name resolves against the
+    // display the window is on (falling back to the active/main display): the
+    // rule must not teleport a window to the other monitor.
+    let display = w
+        .space_id
+        .and_then(|space| observed.spaces.get(&space))
+        .map(|space| space.display_id)
+        .or(w.display_id)
+        .or_else(|| observed.displays.values().find(|d| d.focused).map(|d| d.id))
+        .or_else(|| observed.displays.values().find(|d| d.is_main).map(|d| d.id))?;
     for rule in rules {
         if let Some(target) = &rule.target_workspace {
             if window_matches_rule(w, rule, observed, workspaces) {
-                if let Some(sid) = workspaces.backing_for(target) {
+                if let Some(sid) = workspaces.backing_for(display, target) {
                     return Some(sid);
                 }
             }
@@ -1158,12 +1168,12 @@ mod tests {
         let rules = config.compile_rules().unwrap();
         let mut workspaces = crate::workspace::WorkspaceRegistry::default();
         workspaces.0.insert(
-            "chat".into(),
+            crate::workspace::workspace_key(DisplayId(1), "chat"),
             crate::workspace::WorkspaceState {
                 name: "chat".into(),
+                display: DisplayId(1),
                 persistent: true,
                 backing: Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) }),
-                desired_display: None,
                 ordinal: 0,
                 last_position: None,
                 dynamic: false,
@@ -1229,12 +1239,12 @@ mod tests {
         let rules = config.compile_rules().unwrap();
         let mut workspaces = crate::workspace::WorkspaceRegistry::default();
         workspaces.0.insert(
-            "chat".into(),
+            crate::workspace::workspace_key(DisplayId(1), "chat"),
             crate::workspace::WorkspaceState {
                 name: "chat".into(),
+                display: DisplayId(1),
                 persistent: true,
                 backing: Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) }),
-                desired_display: None,
                 ordinal: 0,
                 last_position: None,
                 dynamic: false,

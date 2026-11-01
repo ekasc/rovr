@@ -29,6 +29,12 @@ enabled = true
 duration_ms = 160
 curve = "ease_out_quint"
 
+# Workspaces are per display: every display keeps its own set of names, so
+# `rovr workspace focus 2` (alt-2) means "workspace 2 on the display that has
+# keyboard focus" and never jumps to the other monitor.
+#
+# `display` pins a workspace to one display ("main" = CGMainDisplayID, or a
+# numeric display id). Omitting it declares the name on EVERY display.
 [[workspace]]
 name = "code"
 layout = "bsp"
@@ -39,6 +45,12 @@ persistent = true
 name = "chat"
 layout = "stack"
 display = "2"
+persistent = true
+
+# Exists as workspace "1" on every connected display.
+[[workspace]]
+name = "1"
+layout = "bsp"
 persistent = true
 
 [[rule]]

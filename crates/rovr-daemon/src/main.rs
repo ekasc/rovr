@@ -1139,6 +1139,14 @@ impl Daemon {
                 }
             }
             Command::Workspace(command) => {
+                // Both workspace commands resolve their target against the
+                // display that has keyboard focus at DISPATCH time. Resolving
+                // against the last periodic observation mapped `alt-N` to
+                // whichever display the daemon last saw focused: focus a window
+                // on the other monitor, press a number immediately, and it
+                // acted on the previous screen. Observe now, exactly as
+                // focus-defaulting window commands already do.
+                self.refresh_observation();
                 // Focus-only fast path: focusing a Space mutates no window
                 // geometry, so the synchronous verify snapshot (plus its
                 // followup reconcile snapshot) only adds ~200 ms of latency
@@ -1176,10 +1184,7 @@ impl Daemon {
                                                 snap.spaces.iter().map(|s| s.id).collect();
                                             let followup =
                                                 self.engine.apply_event(Event::Snapshot(snap));
-                                            let focus_target = self
-                                                .engine
-                                                .workspaces
-                                                .backing_for(name);
+                                            let focus_target = self.engine.workspace_backing(name);
                                             tracing::info!(
                                                 workspace = %name,
                                                 observed_spaces = ?observed_spaces,
@@ -1197,7 +1202,7 @@ impl Daemon {
                             } else {
                                 self.execute_tracked(actions)
                             };
-                            let target_space = self.engine.workspaces.backing_for(name);
+                            let target_space = self.engine.workspace_backing(name);
                             if exec.is_ok() {
                                 if let Some(space) = target_space {
                                     self.engine.note_space_focus_dispatched(space);
@@ -1527,6 +1532,10 @@ impl Daemon {
         match self.platform.snapshot() {
             Ok(snapshot) => {
                 LAST_OBSERVATION_MS.store(uptime_ms(), std::sync::atomic::Ordering::Relaxed);
+                // Which display has keyboard focus is decided by the frontmost
+                // application's focused window, not by the menu bar.
+                let frontmost = self.platform.frontmost_pid();
+                self.engine.note_frontmost_pid(frontmost);
                 let actions = self.engine.apply_event(Event::Snapshot(snapshot));
                 let mut reconcile_ok = true;
                 if !actions.is_empty() {
@@ -1610,32 +1619,12 @@ impl Daemon {
         changed
     }
 
+    /// The display that has keyboard focus. ONE definition lives in the engine
+    /// (frontmost application's focused window, then the menu-bar display), so
+    /// `space focus-recent` and the status surface agree with `alt-N` instead
+    /// of each resolving the focus display differently.
     fn active_display(&self) -> Option<DisplayId> {
-        self.engine
-            .observed
-            .displays
-            .values()
-            .filter(|display| display.focused)
-            .map(|display| display.id)
-            .min()
-            .or_else(|| {
-                self.engine
-                    .observed
-                    .displays
-                    .values()
-                    .find(|display| display.is_main)
-                    .map(|display| display.id)
-            })
-            .or_else(|| self.engine.observed.displays.keys().copied().min())
-            .or_else(|| {
-                self.engine
-                    .observed
-                    .spaces
-                    .values()
-                    .filter(|space| space.focused)
-                    .map(|space| space.display_id)
-                    .min()
-            })
+        self.engine.active_display_id()
     }
 
     fn current_space(&self) -> Option<SpaceId> {
@@ -1982,6 +1971,130 @@ mod tests {
         WindowId, WindowSnapshot,
     };
     use std::sync::mpsc::sync_channel;
+
+    /// Platform whose snapshots change between calls, modelling the user
+    /// clicking a window on the other monitor between two key presses.
+    struct SequencedPlatform {
+        snapshots: Arc<std::sync::Mutex<std::collections::VecDeque<PlatformSnapshot>>>,
+        executed: Arc<std::sync::Mutex<Vec<Action>>>,
+    }
+
+    impl Platform for SequencedPlatform {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn snapshot(&mut self) -> Result<PlatformSnapshot, PlatformError> {
+            let mut queue = self.snapshots.lock().unwrap();
+            if queue.len() > 1 {
+                Ok(queue.pop_front().unwrap())
+            } else {
+                Ok(queue.front().cloned().unwrap())
+            }
+        }
+
+        fn execute(&mut self, action: &Action) -> Result<(), PlatformError> {
+            self.executed.lock().unwrap().push(action.clone());
+            Ok(())
+        }
+    }
+
+    fn two_display_snapshot(focused: DisplayId) -> PlatformSnapshot {
+        let space = |id: u64, display: u32, position: u32, is_focused: bool| SpaceSnapshot {
+            id: SpaceId(id),
+            display_id: DisplayId(display),
+            label: None,
+            focused: is_focused,
+            generation: 1,
+            position,
+            is_fullscreen: false,
+            is_system: false,
+        };
+        let display = |id: u32, x: f64, is_main: bool| DisplaySnapshot {
+            id: DisplayId(id),
+            frame: Rect {
+                x,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            },
+            label: None,
+            focused: DisplayId(id) == focused,
+            is_main,
+            generation: 1,
+        };
+        PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![
+                space(11, 1, 0, focused == DisplayId(1)),
+                space(12, 1, 1, false),
+                space(21, 2, 2, focused == DisplayId(2)),
+                space(22, 2, 3, false),
+            ],
+            displays: vec![display(1, -1470.0, false), display(2, 0.0, true)],
+            complete: true,
+        }
+    }
+
+    /// `alt-2` must act on the display focused NOW, not the one the daemon last
+    /// observed. Regression: focusing a window on the other monitor and pressing
+    /// a number immediately switched the previous screen.
+    #[test]
+    fn workspace_focus_resolves_against_fresh_observation() {
+        let mut daemon = test_daemon();
+        daemon.engine = Engine::new(Config {
+            workspaces: vec![
+                rovr_config::WorkspaceConfig {
+                    name: "1".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+                rovr_config::WorkspaceConfig {
+                    name: "2".into(),
+                    layout: rovr_types::LayoutKind::Bsp,
+                    display: None,
+                    persistent: true,
+                    plugin: None,
+                },
+            ],
+            ..Config::default()
+        });
+        daemon.config = daemon.engine.config.clone();
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        daemon.platform = Box::new(SequencedPlatform {
+            snapshots: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                vec![
+                    // What the daemon has cached: display 1 focused.
+                    two_display_snapshot(DisplayId(1)),
+                    // What is true when the key is pressed: display 2 focused.
+                    two_display_snapshot(DisplayId(2)),
+                ],
+            ))),
+            executed: executed.clone(),
+        });
+        daemon.refresh_observation();
+
+        let result = daemon.handle(Request::new(
+            1,
+            Command::Workspace(WorkspaceCommand::Focus { name: "2".into() }),
+        ));
+        assert!(matches!(
+            result.response.outcome,
+            ResponseOutcome::Ok { .. }
+        ));
+
+        let executed = executed.lock().unwrap().clone();
+        assert!(
+            executed.contains(&Action::FocusSpace { space: SpaceId(22) }),
+            "alt-2 must focus display 2's workspace 2, got {executed:?}"
+        );
+        assert!(
+            !executed.contains(&Action::FocusSpace { space: SpaceId(12) }),
+            "display 1's workspace 2 must not be touched: {executed:?}"
+        );
+    }
 
     #[test]
     fn refresh_wake_coalesces_until_acknowledged() {
@@ -2417,7 +2530,10 @@ mod tests {
         assert_eq!(healed, 0);
         assert!(destroyed.lock().unwrap().is_empty());
         assert_eq!(snapshot.lock().unwrap().spaces.len(), 3);
-        assert_eq!(daemon.engine.workspaces.backing_for("1"), Some(SpaceId(11)));
+        assert_eq!(
+            daemon.engine.workspaces.backing_for(DisplayId(1), "1"),
+            Some(SpaceId(11))
+        );
     }
 
     /// i3-style alt-N must dispatch the CreateSpace, observe the new Space,
@@ -2639,7 +2755,7 @@ mod tests {
             "gated capability must not produce CreateSpace"
         );
         assert_eq!(
-            daemon.engine.workspaces.backing_for("code"),
+            daemon.engine.workspaces.backing_for(DisplayId(1), "code"),
             Some(SpaceId(11))
         );
 

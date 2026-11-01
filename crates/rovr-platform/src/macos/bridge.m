@@ -2082,6 +2082,17 @@ int32_t rovr_bridge_dock_pid(void) {
     }
 }
 
+// Keyboard-focus owning application. `SLSCopyActiveMenuBarDisplayIdentifier`
+// follows the menu bar, which does NOT move when focus moves to a window on
+// another display (same app, two monitors), so it cannot answer "which display
+// has my focus". The frontmost application's focused window can.
+int32_t rovr_bridge_frontmost_pid(void) {
+    @autoreleasepool {
+        NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        return front ? front.processIdentifier : -1;
+    }
+}
+
 int rovr_bridge_needs_refresh(void) {
     return atomic_exchange(&g_needs_refresh, 0);
 }
@@ -2378,48 +2389,12 @@ uint32_t rovr_bridge_display_for_space(uint64_t space_id) {
     return rovr_display_for_space(space_id);
 }
 
-// Arm the display a Space lives on after a cross-display focus. Setting a
-// display's current Space is not enough: only the display with the active
-// menu bar is armed, so a Space switched on any other display is committed
-// but never rendered, leaving that monitor black until something else
-// activates it. yabai's space_manager_focus_space calls
-// display_manager_focus_display() for exactly this case (MIT, Åsmund
-// Vikane); the gesture path below already mirrors it, the SA fast path did
-// not. No-op when the Space already lives on the active display, which is
-// every single-display switch.
-int rovr_bridge_activate_display_for_space(uint64_t space_id) {
-    if (!g_sls_main_connection || !g_sls_copy_managed_display_for_space || space_id == 0) return 1;
-
-    uint32_t did = rovr_display_for_space(space_id);
-    if (did == 0) return 2;
-
-    uint32_t active_display = rovr_active_display_id();
-    if (active_display == 0) active_display = CGMainDisplayID();
-    if (did == active_display) return 0;
-
-    int cid = g_sls_main_connection();
-    CFStringRef uuid = g_sls_copy_managed_display_for_space(cid, space_id);
-    if (!uuid) return 2;
-
-    CGRect bounds = CGDisplayBounds(did);
-    CGPoint cursor = CGPointZero;
-    CGEventRef cursor_event = CGEventCreate(NULL);
-    if (cursor_event) {
-        cursor = CGEventGetLocation(cursor_event);
-        CFRelease(cursor_event);
-    }
-    BOOL cursor_on_target =
-        cursor.x >= CGRectGetMinX(bounds) && cursor.x < CGRectGetMaxX(bounds) &&
-        cursor.y >= CGRectGetMinY(bounds) && cursor.y < CGRectGetMaxY(bounds);
-    if (!cursor_on_target) {
-        CGWarpMouseCursorPosition(
-            CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds)));
-    }
-    if (g_sls_set_active_menu_bar_display_identifier) {
-        g_sls_set_active_menu_bar_display_identifier(cid, uuid, uuid);
-    }
-    CFRelease(uuid);
-    return 0;
+// Which display currently owns the menu bar (keyboard focus). Logged by the
+// focus path so a cross-display switch can be diagnosed from the daemon log
+// instead of guessed at.
+uint32_t rovr_bridge_active_display_id(void) {
+    uint32_t did = rovr_active_display_id();
+    return did != 0 ? did : CGMainDisplayID();
 }
 
 int rovr_bridge_space_is_fullscreen(uint64_t space_id) {

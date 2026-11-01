@@ -145,6 +145,16 @@ pub trait Platform: Send {
     fn is_animating(&self) -> bool {
         false
     }
+    /// PID of the frontmost (keyboard-focus owning) application.
+    ///
+    /// This, not the menu-bar display, is what says which monitor has keyboard
+    /// focus: focusing a window on another display — especially another window
+    /// of the same app — moves AX focus without moving the menu bar, so
+    /// resolving `alt-N` against the menu-bar display sent the switch to the
+    /// previous screen. Default None (mock / non-macOS).
+    fn frontmost_pid(&self) -> Option<rovr_types::ProcessId> {
+        None
+    }
     /// Publish the canonical public snapshot to external consumers.
     ///
     /// On macOS this posts `com.rovr.state.changed` to
