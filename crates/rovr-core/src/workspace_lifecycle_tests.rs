@@ -1,6 +1,11 @@
 use super::*;
 use rovr_types::{DisplaySnapshot, ObservedBool, PlatformSnapshot, ProcessId, Rect};
 
+/// Registry key for a workspace on the fixtures' display 1.
+fn wkey(name: &str) -> String {
+    crate::workspace::workspace_key(DisplayId(1), name)
+}
+
 fn window_on(id: u32, space: u64) -> WindowSnapshot {
     WindowSnapshot {
         id: WindowId(id),
@@ -93,7 +98,7 @@ fn creates(actions: &[Action]) -> usize {
 fn assert_mapping(engine: &Engine, pairs: &[(&str, u64)]) {
     for &(name, id) in pairs {
         assert_eq!(
-            engine.workspaces.backing_for(name),
+            engine.workspaces.backing_for(DisplayId(1), name),
             Some(SpaceId(id)),
             "workspace {name}"
         );
@@ -139,7 +144,13 @@ fn delayed_focus_creation_is_single_flight_and_inserts_before_five() {
         vec![window_on(1, 22)],
     )));
     assert!(actions.contains(&Action::FocusSpace { space: SpaceId(44) }));
-    assert_eq!(engine.workspaces.ordered_names(), vec!["1", "2", "4", "5"]);
+    let names: Vec<String> = engine
+        .workspaces
+        .keys_for_display(DisplayId(1))
+        .iter()
+        .map(|key| engine.workspaces.0[key].name.clone())
+        .collect();
+    assert_eq!(names, vec!["1", "2", "4", "5"]);
     assert_mapping(&engine, &[("1", 11), ("2", 22), ("4", 44), ("5", 55)]);
 }
 #[test]
@@ -239,10 +250,10 @@ fn fullscreen_substitutes_origin_without_shifting_sparse_hotkeys_or_collecting_r
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     let actions = engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement {
             fullscreen_space: SpaceId(99),
             restore_space: SpaceId(11),
@@ -264,14 +275,14 @@ fn fullscreen_substitutes_origin_without_shifting_sparse_hotkeys_or_collecting_r
         engine.move_window_to_workspace(Some(WindowId(1)), "4"),
         Err(EngineError::NativeFullscreenMove)
     ));
-    assert!(!engine.workspaces.0.contains_key("4"));
+    assert!(!engine.workspaces.0.contains_key(&wkey("4")));
     engine.apply_event(Event::Snapshot(topology(
         &[11, 22, 55],
         11,
         vec![window_on(1, 11)],
     )));
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::Normal { space: SpaceId(11) })
     );
 }
@@ -283,11 +294,11 @@ fn closing_fullscreen_window_releases_restore_for_normal_gc() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     engine.apply_event(Event::Snapshot(topology(&[11, 22, 55, 99], 22, vec![])));
     assert!(!matches!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement { .. })
     ));
     engine.dynamic_grace.clear();
@@ -297,7 +308,7 @@ fn closing_fullscreen_window_releases_restore_for_normal_gc() {
             || engine.pending_destroy.contains_key(&SpaceId(11))
     );
     engine.apply_event(Event::Snapshot(topology(&[22, 55], 22, vec![])));
-    assert!(!engine.workspaces.0.contains_key("1"));
+    assert!(!engine.workspaces.0.contains_key(&wkey("1")));
 }
 #[test]
 fn empty_dynamic_workspace_survives_focus_then_is_collected_after_leaving() {
@@ -331,7 +342,7 @@ fn empty_dynamic_workspace_survives_focus_then_is_collected_after_leaving() {
         22,
         vec![window_on(1, 22)],
     )));
-    assert!(!engine.workspaces.0.contains_key("4"));
+    assert!(!engine.workspaces.0.contains_key(&wkey("4")));
 }
 
 #[test]
@@ -391,7 +402,7 @@ fn incomplete_snapshot_cannot_complete_creation_or_destroy_workspace() {
     incomplete.complete = false;
     assert!(engine.apply_event(Event::Snapshot(incomplete)).is_empty());
     assert_eq!(engine.awaited_creations.len(), 1);
-    assert_eq!(engine.workspaces.backing_for("4"), None);
+    assert_eq!(engine.workspaces.backing_for(DisplayId(1), "4"), None);
     assert_mapping(&engine, &[("1", 11), ("2", 22), ("5", 55)]);
     assert_eq!(
         creates(&engine.apply_event(Event::Snapshot(topology(
@@ -466,7 +477,7 @@ fn fullscreen_exit_restores_parked_native_space_to_original_slot() {
     }));
     assert_mapping(&engine, &[("1", 11), ("2", 22), ("5", 55)]);
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::Normal { space: SpaceId(11) })
     );
     assert!(engine.placement.is_some());
@@ -479,11 +490,133 @@ fn fullscreen_exit_restores_parked_native_space_to_original_slot() {
     assert_mapping(&engine, &[("1", 11), ("2", 22), ("5", 55)]);
 }
 
+/// The behaviour this whole model exists for: `alt-N` is display-local. The
+/// spawn must anchor on the display that has keyboard focus, never on the
+/// other monitor, and the two displays must resolve the same name to different
+/// Spaces.
+/// An unconfirmed CreateSpace used to hold the single-flight reservation
+/// forever. Every later spawn, empty-Space sweep and topology repair is gated
+/// on that queue draining, so one platform miss silently disabled `alt-N` for
+/// the rest of the session. After the grace window the slot must be released.
 #[test]
-fn last_unfocused_desktop_on_second_display_does_not_pin_logical_workspace_one() {
+fn unconfirmed_creation_releases_the_single_flight_slot() {
+    let mut engine = sparse();
+    assert_eq!(creates(&engine.focus_workspace("4").unwrap()), 1);
+    assert_eq!(engine.awaited_creations.len(), 1);
+
+    // The platform never delivered the Space and the grace window expired.
+    for awaited in engine.awaited_creations.iter_mut() {
+        awaited.observation = super::CreationObservation::Uncertain {
+            since: std::time::Instant::now() - super::CREATION_UNCERTAIN_GRACE,
+        };
+    }
+    let actions = engine.apply_event(Event::Snapshot(topology(
+        &[11, 22, 55],
+        22,
+        vec![window_on(1, 22)],
+    )));
+    assert_eq!(
+        creates(&actions),
+        0,
+        "no retry against an unchanged snapshot"
+    );
+    assert!(
+        engine.awaited_creations.is_empty(),
+        "the reservation must be released, not retained forever"
+    );
+
+    // The next alt-N retries instead of doing nothing.
+    assert_eq!(creates(&engine.focus_workspace("4").unwrap()), 1);
+}
+
+#[test]
+fn focus_workspace_acts_on_the_focused_display_only() {
+    let mut snapshot = topology(&[22, 11], 22, vec![]);
+    // Space 11 lives on display 2; display 1 is the focused one.
+    snapshot.spaces[1].display_id = DisplayId(2);
+    let mut second_display = snapshot.displays[0].clone();
+    second_display.id = DisplayId(2);
+    second_display.is_main = false;
+    second_display.focused = false;
+    snapshot.displays.push(second_display);
+
+    // alt-2 with display 1 focused: create display 1's workspace 2 there.
+    // Only "1" is configured; "2" is a dynamic spawn.
+    let mut engine = configured(&["1"]);
+    engine.apply_event(Event::Snapshot(snapshot.clone()));
+    assert_eq!(
+        engine.workspaces.backing_for(DisplayId(1), "2"),
+        None,
+        "display 1 has one Space, claimed by workspace 1"
+    );
+    assert_eq!(
+        engine.focus_workspace("2").unwrap(),
+        vec![Action::CreateSpace {
+            anchor: SpaceId(22)
+        }],
+        "alt-2 on display 1 must spawn on display 1"
+    );
+
+    // Same key with display 2 focused: a different anchor, never display 1.
+    let mut engine = configured(&["1"]);
+    let mut flipped = snapshot.clone();
+    for display in &mut flipped.displays {
+        display.focused = display.id == DisplayId(2);
+    }
+    engine.apply_event(Event::Snapshot(flipped));
+    assert_eq!(
+        engine.focus_workspace("2").unwrap(),
+        vec![Action::CreateSpace {
+            anchor: SpaceId(11)
+        }],
+        "alt-2 on display 2 must spawn on display 2"
+    );
+}
+
+/// The menu-bar display does NOT follow focus between two windows on different
+/// monitors, so resolving `alt-N` against it targeted the previous screen.
+/// The frontmost application's focused window decides instead; the menu bar is
+/// only the fallback when the frontmost app is unknown.
+#[test]
+fn workspace_focus_uses_the_frontmost_window_not_the_menu_bar() {
+    let mut snapshot = topology(&[22, 11], 22, vec![]);
+    snapshot.spaces[1].display_id = DisplayId(2);
+    let mut second_display = snapshot.displays[0].clone();
+    second_display.id = DisplayId(2);
+    second_display.is_main = false;
+    second_display.focused = false;
+    snapshot.displays.push(second_display);
+    // Frontmost app (pid 9) owns the focused window on display 2, while the
+    // menu bar still reports display 1.
+    let mut window = window_on(7, 11);
+    window.pid = ProcessId(9);
+    window.display_id = Some(DisplayId(2));
+    window.focused = true;
+    snapshot.windows.push(window);
+
+    let mut engine = configured(&["1"]);
+    engine.apply_event(Event::Snapshot(snapshot.clone()));
+    engine.note_frontmost_pid(Some(ProcessId(9)));
+    assert_eq!(
+        engine.focus_workspace("1").unwrap(),
+        vec![Action::FocusSpace { space: SpaceId(11) }],
+        "alt-1 must act on the frontmost window's display, not the menu bar's"
+    );
+
+    // Unknown frontmost app: fall back to the menu-bar display (display 1).
+    engine.note_frontmost_pid(None);
+    assert_eq!(
+        engine.focus_workspace("1").unwrap(),
+        vec![Action::FocusSpace { space: SpaceId(22) }],
+        "without a frontmost app the menu-bar display is still the fallback"
+    );
+}
+
+#[test]
+fn second_display_gets_its_own_strip_and_never_pins_the_first_displays() {
+    // The point of per-display workspaces: a lone desktop on a second display
+    // must not consume or rename workspace 1 on the first display.
     let mut engine = configured(&["1", "2"]);
-    engine.workspaces.0.get_mut("1").unwrap().desired_display = Some("2".into());
-    engine.workspaces.0.get_mut("2").unwrap().desired_display = Some("1".into());
     let mut snapshot = topology(&[22, 11], 22, vec![window_on(1, 22)]);
     snapshot.spaces[1].display_id = DisplayId(2);
     let mut second_display = snapshot.displays[0].clone();
@@ -491,15 +624,35 @@ fn last_unfocused_desktop_on_second_display_does_not_pin_logical_workspace_one()
     second_display.is_main = false;
     second_display.focused = false;
     snapshot.displays.push(second_display);
+
     engine.apply_event(Event::Snapshot(snapshot.clone()));
-    assert_mapping(&engine, &[("1", 11), ("2", 22)]);
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
-    engine.workspaces.0.get_mut("1").unwrap().dynamic = true;
-    let actions = engine.apply_event(Event::Snapshot(snapshot));
-    assert!(!actions.contains(&Action::DestroySpace { space: SpaceId(11) }));
-    assert!(!engine.workspaces.0.contains_key("1"));
-    assert!(engine.observed.spaces.contains_key(&SpaceId(11)));
-    assert_mapping(&engine, &[("2", 22)]);
+
+    // Each display owns its own "1"; the surplus "2" is unbound on both
+    // because each display has exactly one Space here.
+    assert_eq!(
+        engine.workspaces.backing_for(DisplayId(1), "1"),
+        Some(SpaceId(22)),
+        "display 1's workspace 1 keeps its own Space"
+    );
+    assert_eq!(
+        engine.workspaces.backing_for(DisplayId(2), "1"),
+        Some(SpaceId(11)),
+        "display 2's workspace 1 is a different workspace"
+    );
+    assert_eq!(engine.workspaces.backing_for(DisplayId(1), "2"), None);
+    assert_eq!(engine.workspaces.backing_for(DisplayId(2), "2"), None);
+
+    // A second observation must not reshuffle the two strips into one.
+    engine.apply_event(Event::Snapshot(snapshot));
+    assert_eq!(
+        engine.workspaces.backing_for(DisplayId(1), "1"),
+        Some(SpaceId(22))
+    );
+    assert_eq!(
+        engine.workspaces.backing_for(DisplayId(2), "1"),
+        Some(SpaceId(11)),
+        "display 2's strip survives the other display's reconcile untouched"
+    );
 }
 
 #[test]
@@ -554,7 +707,7 @@ fn genuine_creation_failure_releases_single_flight_for_retry() {
         "failed reservation must be released"
     );
     assert!(
-        engine.workspaces.0.contains_key("4"),
+        engine.workspaces.0.contains_key(&wkey("4")),
         "workspace intent survives the failure"
     );
     // Deterministic recovery: the next Alt+N retries exactly once...
@@ -616,7 +769,7 @@ fn topology_reset_requeues_inflight_creation_without_shuffling() {
         vec![window_on(1, 102)],
     )));
     assert_mapping(&engine, &[("1", 101), ("2", 102), ("5", 103)]);
-    assert_eq!(engine.workspaces.backing_for("4"), None);
+    assert_eq!(engine.workspaces.backing_for(DisplayId(1), "4"), None);
     assert_eq!(
         creates(&actions),
         1,
@@ -656,11 +809,11 @@ fn manual_space_adoption_extends_numbering_positionally() {
         "a grace-period manual Space must not be collected: {actions:?}"
     );
     assert_eq!(
-        engine.workspaces.backing_for("6"),
+        engine.workspaces.backing_for(DisplayId(1), "6"),
         Some(SpaceId(66)),
         "an appended Space extends numbering (1,2,5 + D => 6), not first-gap 3"
     );
-    assert!(engine.workspaces.backing_for("3").is_none());
+    assert!(engine.workspaces.backing_for(DisplayId(1), "3").is_none());
     assert_mapping(&engine, &[("1", 11), ("2", 22), ("5", 55), ("6", 66)]);
     // The positional mapping is stable across snapshots.
     let actions = engine.apply_event(Event::Snapshot(topology(
@@ -680,7 +833,7 @@ fn fullscreen_entry_survives_empty_restore_gap() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     // The window leaves A one tick before the fullscreen Space/window
     // correlation is observable: A is empty and the window is missing.
     let actions = engine.apply_event(Event::Snapshot(topology(&[11, 22, 55], 22, vec![])));
@@ -691,7 +844,7 @@ fn fullscreen_entry_survives_empty_restore_gap() {
     // The late correlation still enters substitution without shifting hotkeys.
     let actions = engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement {
             fullscreen_space: SpaceId(99),
             restore_space: SpaceId(11),
@@ -710,7 +863,7 @@ fn fullscreen_entry_bridges_spaceless_window_observation() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     // Transient variant: the window is still enumerated but reports no Space.
     let mut homeless = window_on(1, 11);
     homeless.space_id = None;
@@ -720,13 +873,13 @@ fn fullscreen_entry_bridges_spaceless_window_observation() {
         "restore Space must survive a spaceless observation: {actions:?}"
     );
     assert!(matches!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::Normal { .. })
     ));
     let actions = engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     assert!(
         matches!(
-            engine.workspaces.0["1"].backing,
+            engine.workspaces.0[&wkey("1")].backing,
             Some(WorkspaceBacking::FullscreenReplacement { .. })
         ),
         "entry must fire once the correlation appears"
@@ -742,16 +895,16 @@ fn fullscreen_exit_before_window_returns_keeps_restore() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     assert!(matches!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement { .. })
     ));
     // F vanishes a tick before the window is observed back on A.
     let actions = engine.apply_event(Event::Snapshot(topology(&[11, 22, 55], 22, vec![])));
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::Normal { space: SpaceId(11) })
     );
     assert!(
@@ -776,7 +929,7 @@ fn incomplete_snapshot_freezes_fullscreen_lifecycle() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     // A partial observation during the transition must change nothing.
     let mut partial = topology(&[11, 22, 55], 22, vec![]);
@@ -784,7 +937,7 @@ fn incomplete_snapshot_freezes_fullscreen_lifecycle() {
     assert!(engine.apply_event(Event::Snapshot(partial)).is_empty());
     assert!(
         matches!(
-            engine.workspaces.0["1"].backing,
+            engine.workspaces.0[&wkey("1")].backing,
             Some(WorkspaceBacking::FullscreenReplacement { .. })
         ),
         "partial snapshots must not enter, exit, or collect"
@@ -840,7 +993,7 @@ fn lost_backing_parks_layout_under_logical_name_until_slot_returns() {
     // External deletion removes the third slot; "3" has no replacement, so
     // its tree parks under the logical name and recreation is requested.
     let actions = engine.apply_event(Event::Snapshot(topology(&[11, 22], 11, vec![])));
-    assert_eq!(engine.workspaces.backing_for("3"), None);
+    assert_eq!(engine.workspaces.backing_for(DisplayId(1), "3"), None);
     assert_eq!(creates(&actions), 1);
     assert!(
         !engine.layouts.contains_key(&SpaceId(33)),
@@ -961,7 +1114,10 @@ fn stale_placement_must_not_permanently_block_window_movement() {
         vec![window_on(1, 22)],
     )));
     assert!(engine.placement.is_none(), "stale placement must clear");
-    let target = engine.workspaces.backing_for("5").expect("5 backed");
+    let target = engine
+        .workspaces
+        .backing_for(DisplayId(1), "5")
+        .expect("5 backed");
     assert!(
         actions.contains(&Action::MoveWindowToSpace {
             window: WindowId(1),
@@ -1026,16 +1182,16 @@ fn reload_preserves_fullscreen_restore_protection() {
         11,
         vec![window_on(1, 11)],
     )));
-    engine.workspaces.0.get_mut("1").unwrap().persistent = false;
+    engine.workspaces.0.get_mut(&wkey("1")).unwrap().persistent = false;
     engine.apply_event(Event::Snapshot(fullscreen_snapshot(99)));
     assert!(matches!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement { .. })
     ));
     // Alt+Shift+R with equivalent config must not disturb the substitution.
     engine.reload_config(engine.config.clone());
     assert!(matches!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::FullscreenReplacement {
             fullscreen_space: SpaceId(99),
             ..
@@ -1050,7 +1206,7 @@ fn reload_preserves_fullscreen_restore_protection() {
     // Fullscreen exit afterwards still restores the protected Space.
     let actions = engine.apply_event(Event::Snapshot(topology(&[11, 22, 55], 22, vec![])));
     assert_eq!(
-        engine.workspaces.0["1"].backing,
+        engine.workspaces.0[&wkey("1")].backing,
         Some(WorkspaceBacking::Normal { space: SpaceId(11) })
     );
     assert!(!actions.contains(&Action::DestroySpace { space: SpaceId(11) }));
@@ -1077,7 +1233,7 @@ fn reload_config_cleans_only_removed_workspace_state() {
         .insert(WindowId(9));
     // Same-config reload: healthy BSP state and runtime registry survive.
     engine.reload_config(engine.config.clone());
-    assert!(engine.workspaces.0.contains_key("tmp"));
+    assert!(engine.workspaces.0.contains_key(&wkey("tmp")));
     assert!(engine.layouts.contains_key(&SpaceId(11)));
     assert!(engine.layouts.contains_key(&SpaceId(33)));
     // Reload that actually removes "tmp": its SpaceId tree is cleaned, live
@@ -1093,7 +1249,7 @@ fn reload_config_cleans_only_removed_workspace_state() {
         workspaces: vec![ws("1"), ws("2")],
         ..Default::default()
     });
-    assert!(!engine.workspaces.0.contains_key("tmp"));
+    assert!(!engine.workspaces.0.contains_key(&wkey("tmp")));
     assert!(
         !engine.layouts.contains_key(&SpaceId(33)),
         "removed workspace must not leak its SpaceId tree"

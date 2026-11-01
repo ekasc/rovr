@@ -80,6 +80,7 @@ extern CGError SLSSetWindowTransform(int cid, uint32_t wid, CGAffineTransform t)
 extern void SLSManagedDisplaySetCurrentSpace(int cid, CFStringRef display_ref, uint64_t sid);
 extern uint64_t SLSManagedDisplayGetCurrentSpace(int cid, CFStringRef display_ref);
 extern CFStringRef SLSCopyManagedDisplayForSpace(int cid, uint64_t sid);
+extern CFArrayRef SLSCopyManagedDisplaySpaces(int cid);
 extern void SLSShowSpaces(int cid, CFArrayRef space_list);
 extern void SLSHideSpaces(int cid, CFArrayRef space_list);
 extern CGError SLSSetWindowSubLevel(int cid, uint32_t wid, int level);
@@ -549,22 +550,73 @@ static void do_space_destroy(char *message)
     CFRelease(display_uuid);
 }
 
-static void do_space_create(char *message)
+// Returns false when the add could not be attempted, so the caller reports a
+// real refusal. A silent no-op here made Rovr wait out its creation deadline
+// for a Space Dock never added, and one such wait wedged every later spawn.
+static bool do_space_create(char *message)
 {
-    if (dock_spaces == nil || add_space_fp == 0) return;
+    if (dock_spaces == nil || add_space_fp == 0) return false;
 
     uint64_t space_id;
     unpack(space_id);
 
-    CFStringRef __block display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), space_id);
+    CFStringRef display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), space_id);
+    if (display_uuid == NULL) return false;
+    __block bool added = false;
     dispatch_sync(dispatch_get_main_queue(), ^{
+        id display_space = display_space_for_display_uuid(display_uuid);
+        if (display_space == nil) return;
         id new_space = macOSSequoia
                      ? [[objc_getClass("ManagedSpace") alloc] init]
                      : [[objc_getClass("Dock.ManagedSpace") alloc] init];
-        id display_space = display_space_for_display_uuid(display_uuid);
         asm__call_add_space(new_space, display_space, add_space_fp);
-        CFRelease(display_uuid);
+        added = true;
     });
+    CFRelease(display_uuid);
+    return added;
+}
+
+// `SLSShowSpaces` defines the session's visible Space set, not a per-display
+// one. A list holding only the destination Space makes every OTHER display's
+// current Space invisible, and those monitors stay black until something
+// re-shows them — the cross-display switch that blanked the display it was
+// not switching to. Show the destination plus every other display's current
+// Space. Single display: the union is just the destination, exactly the
+// previous behaviour.
+static void show_visible_set_for_space(uint64_t dest_space_id, CFStringRef dest_display_uuid)
+{
+    int cid = SLSMainConnectionID();
+    NSMutableArray *visible = [[NSMutableArray alloc] initWithCapacity:4];
+    NSNumber *dest_number = [[NSNumber alloc] initWithUnsignedLongLong:dest_space_id];
+    [visible addObject:dest_number];
+    [dest_number release];
+
+    CFArrayRef displays = SLSCopyManagedDisplaySpaces(cid);
+    if (displays != NULL) {
+        CFIndex count = CFArrayGetCount(displays);
+        for (CFIndex i = 0; i < count; i++) {
+            CFDictionaryRef display = (CFDictionaryRef)CFArrayGetValueAtIndex(displays, i);
+            CFStringRef uuid = (CFStringRef)CFDictionaryGetValue(display, CFSTR("Display Identifier"));
+            if (uuid == NULL) continue;
+            // The destination display's own current Space is hidden explicitly
+            // by the caller; including it here would keep the old Space on
+            // screen next to the new one.
+            if (dest_display_uuid != NULL &&
+                CFStringCompare(uuid, dest_display_uuid, kCFCompareEqualTo) == kCFCompareEqualTo) {
+                continue;
+            }
+            uint64_t current = SLSManagedDisplayGetCurrentSpace(cid, uuid);
+            if (current == 0 || current == dest_space_id) continue;
+            if ([visible containsObject:[NSNumber numberWithUnsignedLongLong:current]]) continue;
+            NSNumber *number = [[NSNumber alloc] initWithUnsignedLongLong:current];
+            [visible addObject:number];
+            [number release];
+        }
+        CFRelease(displays);
+    }
+
+    SLSShowSpaces(cid, (__bridge CFArrayRef)visible);
+    [visible release];
 }
 
 static bool do_space_focus(char *message)
@@ -578,45 +630,57 @@ static bool do_space_focus(char *message)
     {
         CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
         if (!dest_display) return false;
-        // The "current space for this display" accessor has been spelled three
-        // different ways across macOS: 26.x resolves `currentSpaceForDisplayUUID:`,
-        // older builds `currentSpaceforDisplayUUID:`, and 27.2 renamed it to
-        // `currentSpaceForDisplay:`. Asking the object beats guessing by
-        // version: an unresolvable selector leaves `source_space` nil, which
-        // silently disables every focus while the command still reports
-        // success (the exact 27.2 symptom).
-        SEL current_space_sel = nil;
-        if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplayUUID:)]) {
-            current_space_sel = @selector(currentSpaceForDisplayUUID:);
-        } else if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplay:)]) {
-            current_space_sel = @selector(currentSpaceForDisplay:);
-        } else if ([dock_spaces respondsToSelector:@selector(currentSpaceforDisplayUUID:)]) {
-            current_space_sel = @selector(currentSpaceforDisplayUUID:);
+        // The Space being replaced must come from the DESTINATION display.
+        // Dock's `currentSpaceForDisplay*` accessor is asked only as a
+        // fallback: on macOS 27.2 that family was renamed, and if the surviving
+        // selector answers for the ACTIVE display instead of the one asked
+        // about, this resolved the other monitor's Space and the following
+        // SLSHideSpaces blanked that monitor — then the next switch repaired it
+        // because by then that display was the active one. The SkyLight
+        // accessor is display-exact and is already used by destroy/create.
+        uint64_t source_space_id = SLSManagedDisplayGetCurrentSpace(SLSMainConnectionID(), dest_display);
+        if (source_space_id == 0) {
+            SEL current_space_sel = nil;
+            if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplayUUID:)]) {
+                current_space_sel = @selector(currentSpaceForDisplayUUID:);
+            } else if ([dock_spaces respondsToSelector:@selector(currentSpaceForDisplay:)]) {
+                current_space_sel = @selector(currentSpaceForDisplay:);
+            } else if ([dock_spaces respondsToSelector:@selector(currentSpaceforDisplayUUID:)]) {
+                current_space_sel = @selector(currentSpaceforDisplayUUID:);
+            }
+            if (current_space_sel != nil) {
+                id source_space = ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(
+                    dock_spaces, current_space_sel, dest_display);
+                source_space_id = get_space_id(source_space);
+            }
         }
-        id source_space = nil;
-        if (current_space_sel != nil) {
-            source_space = ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(
-                dock_spaces, current_space_sel, dest_display);
-        }
-        uint64_t source_space_id = get_space_id(source_space);
+
+        NSLog(@"[rovr-sa] focus dest=%llu source=%llu display=%@",
+              dest_space_id, source_space_id, dest_display);
 
         if (source_space_id == dest_space_id) {
+            // Already current on its own display. Still repair the visible
+            // set: an earlier cross-display switch may have left another
+            // monitor with no visible Space, and re-focusing a workspace is
+            // the natural moment to recover it.
+            show_visible_set_for_space(dest_space_id, dest_display);
             accepted = true;
         } else {
             id dest_space = space_for_display_with_id(dest_display, dest_space_id);
-            if (dest_space != nil) {
-                id display_space = display_space_for_space_with_id(source_space_id);
-                if (display_space != nil) {
-                    NSArray *ns_source_space = @[ @(source_space_id) ];
-                    NSArray *ns_dest_space = @[ @(dest_space_id) ];
-                    SLSShowSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_dest_space);
-                    SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
-                    SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
-                    set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
-                    accepted = true;
-                    [ns_dest_space release];
-                    [ns_source_space release];
-                }
+            // Cache update must target the DESTINATION display, never whichever
+            // display happens to own the replaced Space.
+            id display_space = display_space_for_display_uuid(dest_display);
+            if (dest_space != nil && display_space != nil) {
+                NSArray *ns_source_space = @[ @(source_space_id) ];
+                show_visible_set_for_space(dest_space_id, dest_display);
+                SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
+                SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
+                set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
+                accepted = true;
+                [ns_source_space release];
+            } else {
+                NSLog(@"[rovr-sa] focus refused: dest_space=%p display_space=%p",
+                      dest_space, display_space);
             }
         }
 
@@ -845,7 +909,16 @@ static void do_handshake(int sockfd)
     if (dock_spaces != nil)                attrib |= OSAX_ATTRIB_DOCK_SPACES;
     if (dp_desktop_picture_manager != nil) attrib |= OSAX_ATTRIB_DPPM;
     if (add_space_fp)                      attrib |= OSAX_ATTRIB_ADD_SPACE;
-    if (remove_space_fp)                   attrib |= OSAX_ATTRIB_REM_SPACE;
+    // Dock's removeSpace is NOT advertised on macOS 27: the resolved pointer
+    // faults inside Dock's space model (crash report: EXC_BAD_ACCESS at
+    // 0x38 on the main thread, right after the first DestroySpace of a
+    // session), and a Dock restart resets every Space on every display —
+    // black screens, both displays switching, and the workspace strip
+    // remapping under the user. An empty Space costs nothing; a crashed Dock
+    // costs the whole session. Explicit `rovr space destroy` reports
+    // "unsupported" instead of crashing.
+    NSOperatingSystemVersion host_version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (remove_space_fp && host_version.majorVersion < 27) attrib |= OSAX_ATTRIB_REM_SPACE;
     // do_space_move() bails unless dppm resolved too, so the capability must
     // not claim reorder works on move_space alone: reporting it would promise
     // an operation that silently does nothing.
@@ -911,7 +984,8 @@ static uint8_t handle_message(int sockfd, char *message, size_t length)
             break;
         case SA_OPCODE_SPACE_CREATE:
             if (dock_spaces == nil || add_space_fp == 0) return SA_STATUS_UNSUPPORTED;
-            do_space_create(message); break;
+            if (!do_space_create(message)) return SA_STATUS_INVALID;
+            break;
         case SA_OPCODE_SPACE_DESTROY:
             if (dock_spaces == nil || remove_space_fp == 0) return SA_STATUS_UNSUPPORTED;
             do_space_destroy(message); break;

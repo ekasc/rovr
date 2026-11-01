@@ -181,13 +181,14 @@ extern "C" {
     fn rovr_bridge_window_pid(window_id: u32) -> i32;
     fn rovr_bridge_current_space_for_space(space_id: u64) -> u64;
     fn rovr_bridge_display_for_space(space_id: u64) -> u32;
-    fn rovr_bridge_activate_display_for_space(space_id: u64) -> i32;
+    fn rovr_bridge_active_display_id() -> u32;
     fn rovr_bridge_space_is_fullscreen(space_id: u64) -> i32;
     fn rovr_bridge_space_is_system(space_id: u64) -> i32;
     fn rovr_bridge_is_display_animating(display_id: u32) -> i32;
     fn rovr_bridge_any_display_animating() -> i32;
     fn rovr_bridge_sls_managed_for_window(window_id: u32) -> i32;
     fn rovr_bridge_dock_pid() -> i32;
+    fn rovr_bridge_frontmost_pid() -> i32;
     fn rovr_bridge_post_state_changed(state_json: *const c_char);
     fn rovr_bridge_track_focused_window(window_id: u32);
     fn rovr_bridge_sketchybar_trigger(message: *const c_char, length: u32) -> std::ffi::c_int;
@@ -545,6 +546,13 @@ impl MacPlatform {
     }
 
     fn execute_focus_space(&self, space: &SpaceId) -> Result<(), PlatformError> {
+        // One line per switch, with the three facts needed to diagnose a
+        // cross-display mistake from the daemon log: where the target Space
+        // lives, which display currently owns the menu bar, and which Space the
+        // target display is on right now.
+        let target_display = unsafe { rovr_bridge_display_for_space(space.0) };
+        let active_display = unsafe { rovr_bridge_active_display_id() };
+        let source_space = unsafe { rovr_bridge_current_space_for_space(space.0) };
         // A logical workspace focus is ID-exact. When the SA is available,
         // never fall back to positional gestures after a transient failure:
         // deletion compacts Mission Control positions, so that fallback can
@@ -562,17 +570,20 @@ impl MacPlatform {
             for attempt in 0..SA_FOCUS_ATTEMPTS {
                 match self.sa.focus_space(space.0) {
                     Ok(()) => {
-                        // Cross-display: the mutation alone leaves the target
-                        // display unarmed (committed Space, nothing rendered),
-                        // so the monitor stays black until something else
-                        // activates it. Arm it, exactly as the gesture path
-                        // below does before posting its swipes.
-                        unsafe { rovr_bridge_activate_display_for_space(space.0) };
                         self.last_focus_target.set(space.0);
                         // Record the post so the gesture settle gate covers an
                         // SA-driven switch too; without this a fallback gesture
                         // posted right after could land mid-transition.
                         self.last_focus_posted_at.set(Some(Instant::now()));
+                        tracing::info!(
+                            path = "sa",
+                            space = space.0,
+                            target_display,
+                            active_display,
+                            source_space,
+                            attempts = attempt + 1,
+                            "space focus"
+                        );
                         return Ok(());
                     }
                     Err(err) => last_error = Some(err),
@@ -587,8 +598,12 @@ impl MacPlatform {
             // gets a working switch instead of a silent no-op: the bridge
             // posts a swipe via the WindowServer, which goes through
             // Mission Control directly and reaches even brand-new Spaces.
-            tracing::debug!(
+            tracing::warn!(
+                path = "gesture-fallback",
                 space = space.0,
+                target_display,
+                active_display,
+                source_space,
                 error = ?last_error,
                 "SA focus exhausted; falling back to gesture"
             );
@@ -626,13 +641,17 @@ impl MacPlatform {
         let t_pre_post = Instant::now();
         let status = unsafe { rovr_bridge_focus_space(space.0) };
         let post_ms = t_pre_post.elapsed().as_millis() as u64;
-        tracing::debug!(
+        tracing::info!(
+            path = "gesture",
             space = space.0,
+            target_display,
+            active_display,
+            source_space,
             settled_ms,
             post_ms,
             status,
             total_ms = t_start.elapsed().as_millis() as u64,
-            "focus_space timing"
+            "space focus"
         );
         if status == 0 {
             self.last_focus_target.set(space.0);
@@ -658,9 +677,6 @@ impl MacPlatform {
             const INTERVAL: Duration = Duration::from_millis(100);
             for _ in 0..ATTEMPTS {
                 if self.sa.focus_space(target.0).is_ok() {
-                    // See execute_focus_space: a cross-display target needs its
-                    // display armed or the monitor is left blank.
-                    unsafe { rovr_bridge_activate_display_for_space(target.0) };
                     self.last_focus_target.set(target.0);
                     self.last_focus_posted_at.set(Some(Instant::now()));
                     return Ok(());
@@ -1134,6 +1150,11 @@ impl Platform for MacPlatform {
 
     fn is_animating(&self) -> bool {
         unsafe { rovr_bridge_any_display_animating() != 0 }
+    }
+
+    fn frontmost_pid(&self) -> Option<ProcessId> {
+        let pid = unsafe { rovr_bridge_frontmost_pid() };
+        (pid > 0).then_some(ProcessId(pid))
     }
 
     fn snapshot_wedged_ms(&self) -> Option<u64> {

@@ -350,12 +350,11 @@ struct WorkspaceArgs {
 
 #[derive(Debug, Subcommand)]
 enum WorkspaceSubcommand {
-    Focus {
-        name: String,
-    },
+    #[command(about = "Focus a named workspace on the focused display")]
+    Focus { name: String },
     #[command(
         name = "move-window",
-        about = "Move window to named workspace (defaults to the focused window)"
+        about = "Move window to a named workspace on its own display (defaults to the focused window)"
     )]
     MoveWindow {
         workspace: String,

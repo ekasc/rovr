@@ -2,7 +2,8 @@ use std::collections::{HashMap, VecDeque};
 
 use rovr_config::Config;
 use rovr_types::{
-    Direction, DisplayId, PlatformSnapshot, Rect, SpaceId, SpaceSnapshot, WindowId, WindowSnapshot,
+    Direction, DisplayId, PlatformSnapshot, ProcessId, Rect, SpaceId, SpaceSnapshot, WindowId,
+    WindowSnapshot,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -134,6 +135,15 @@ pub struct Engine {
     /// Runtime-only; dedupes the scripting-addition call so it is not repeated
     /// every reconcile cycle.
     shadow_applied: HashMap<WindowId, bool>,
+    /// Display set the config templates were last expanded against. Config
+    /// sync is additive when this changes (a display was plugged/unplugged)
+    /// and authoritative only on a real config load/reload.
+    synced_displays: Option<Vec<DisplayId>>,
+    /// Frontmost application, refreshed by the daemon on every observation.
+    /// Its focused window decides which display has keyboard focus; the
+    /// menu-bar display does not follow focus between two windows on different
+    /// monitors.
+    frontmost_pid: Option<ProcessId>,
 }
 
 struct SpacePlacement {
@@ -154,12 +164,19 @@ enum CreationObservation {
         deadline: std::time::Instant,
     },
     /// The call may have succeeded. Keep the reservation, report uncertainty,
-    /// and never retry a non-idempotent CreateSpace against an unchanged snapshot.
-    Uncertain,
+    /// and never retry a non-idempotent CreateSpace against an unchanged
+    /// snapshot — but only for `CREATION_UNCERTAIN_GRACE`. A Space the platform
+    /// never delivered must not hold the single-flight slot forever.
+    Uncertain {
+        since: std::time::Instant,
+    },
 }
 
 struct PendingCreationRequest {
+    /// Registry key (`<display>:<name>`).
     name: String,
+    /// Display that owns the workspace; the Space is created there.
+    display: DisplayId,
 }
 
 /// One `move-to-new-space` intent: `window` rides to the first Space macOS
@@ -174,6 +191,13 @@ struct PendingNewSpaceMove {
 /// How long a `move-to-new-space` intent waits for its Space to materialize
 /// before it is dropped (mirrors the dynamic workspace creation deadline).
 const NEW_SPACE_MOVE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Extra time an UNCONFIRMED CreateSpace keeps its single-flight reservation
+/// after the creation deadline, for a Space macOS delivers late. After this the
+/// reservation is released so the next `alt-N` retries instead of silently
+/// doing nothing (every later spawn, sweep and topology repair is gated on
+/// this queue draining).
+const CREATION_UNCERTAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a window's last observed Space stays authoritative after the
 /// window stops being observed there. Covers a small number of missed
@@ -204,7 +228,10 @@ fn load_plugins_from_disk(registry: &mut PluginRegistry) {
 
 impl Engine {
     pub fn new(config: Config) -> Self {
-        let workspaces = WorkspaceRegistry::from_config(&config.workspaces);
+        // Workspaces are per display, and no display is observed yet: config
+        // templates are instantiated by `sync_config` on the first complete
+        // snapshot (and on every reload / hot-plug after it).
+        let workspaces = WorkspaceRegistry::default();
         let rules = config.compile_rules().unwrap_or_default();
         let mut plugins = PluginRegistry::new();
         load_plugins_from_disk(&mut plugins);
@@ -372,8 +399,14 @@ impl Engine {
         self.scratchpads = ScratchpadState(persisted.scratchpads);
         self.workspaces = crate::workspace::WorkspaceRegistry(persisted.workspaces, false);
         self.restored_workspace_layouts = persisted.workspace_layouts;
-        // After load, ensure workspaces still reflect current config (preserve backing where name matches)
-        self.workspaces.ensure_from_config(&self.config.workspaces);
+        // Persisted entries are keyed by display, and no display is observed
+        // yet at load time: pruning here would discard the whole registry.
+        // The first complete observation runs the additive sync instead, which
+        // adds configured names and drops entries whose display is gone.
+        if !self.observed.displays.is_empty() {
+            self.workspaces
+                .sync_config(&self.config.workspaces, &self.observed.displays, true);
+        }
         Ok(())
     }
 
@@ -417,57 +450,95 @@ impl Engine {
         }
     }
 
-    /// Anchor for recreating the lowest-ordinal missing PERSISTENT workspace
-    /// (blocker 4): one CreateSpace per snapshot cycle, deterministically.
-    /// Returns None when nothing is missing or creation is unsupported.
-    fn persistent_creation_anchor(&self) -> Option<SpaceId> {
-        if !self.capabilities.create_space {
-            return None;
-        }
-        let first_missing = self.workspaces.ensure_persistent().into_iter().next()?;
-        // Prefer an anchor on the workspace's desired display, else focused.
-        let desired_display = self
-            .workspaces
-            .0
-            .get(&first_missing)
-            .and_then(|w| w.desired_display.clone());
-        let anchor = self
+    /// The display that currently holds keyboard focus — the menu-bar display,
+    /// which is the one every `alt-N` / `move-to-workspace` acts on. Falls back
+    /// to the focused Space's display so the engine still resolves before the
+    /// first display-focused observation lands.
+    pub fn active_display_id(&self) -> Option<DisplayId> {
+        // The display with keyboard focus holds the frontmost application's
+        // focused window. The menu-bar display is only a fallback: focusing a
+        // window on the other monitor (typically another window of the same
+        // app) moves AX focus without moving the menu bar, so resolving `alt-N`
+        // against it sent the switch to the previous screen.
+        self.frontmost_pid
+            .and_then(|pid| {
+                let mut candidates: Vec<&WindowSnapshot> = self
+                    .observed
+                    .windows
+                    .values()
+                    .filter(|w| w.pid == pid && w.focused && w.display_id.is_some())
+                    .collect();
+                candidates.sort_by_key(|w| w.id);
+                candidates.first().and_then(|w| w.display_id)
+            })
+            .or_else(|| {
+                self.observed
+                    .displays
+                    .values()
+                    .find(|display| display.focused)
+                    .map(|display| display.id)
+            })
+            .or_else(|| {
+                self.observed
+                    .spaces
+                    .values()
+                    .find(|space| space.focused)
+                    .map(|space| space.display_id)
+            })
+            .or_else(|| {
+                self.observed
+                    .displays
+                    .values()
+                    .find(|display| display.is_main)
+                    .map(|display| display.id)
+            })
+    }
+
+    /// Record the frontmost application for this observation. Called by the
+    /// daemon after every snapshot; `None` means unknown (falls back to the
+    /// menu-bar display).
+    pub fn note_frontmost_pid(&mut self, pid: Option<ProcessId>) {
+        self.frontmost_pid = pid;
+    }
+
+    /// The Space a new dynamic workspace's backing should be created on: the
+    /// display the workspace was requested for, else the focused Space.
+    fn creation_anchor_for(&self, display: Option<DisplayId>) -> Result<SpaceId, EngineError> {
+        // Deterministic: the focused Space on the target display, else its
+        // lowest-position Space. HashMap order would anchor the new Space
+        // anywhere on the display and make creation non-reproducible.
+        let mut on_display: Vec<&rovr_types::SpaceSnapshot> = self
             .observed
             .spaces
             .values()
-            .find(|s| match &desired_display {
-                Some(name) => self
-                    .observed
-                    .displays
-                    .get(&s.display_id)
-                    .map(|d| {
-                        // "main" is CGMainDisplayID, not the display that
-                        // happens to hold keyboard focus.
-                        name == "main" && d.is_main
-                            || name.parse::<u32>().map(|n| n == d.id.0).unwrap_or(false)
-                    })
-                    .unwrap_or(false),
-                None => false,
-            })
-            .or_else(|| self.observed.spaces.values().find(|s| s.focused))
-            .or_else(|| self.observed.spaces.values().next())
-            .map(|s| s.id)?;
-        Some(anchor)
-    }
-
-    /// The Space a new dynamic workspace's backing should be created on:
-    /// the focused Space (its display), else any observed Space.
-    fn creation_anchor(&self) -> Result<SpaceId, EngineError> {
-        self.observed
-            .spaces
-            .values()
-            .find(|s| s.focused)
-            .or_else(|| self.observed.spaces.values().next())
-            .map(|s| s.id)
-            .ok_or(EngineError::NoFocusedSpace)
+            .filter(|space| display.map_or(true, |display| space.display_id == display))
+            .collect();
+        on_display.sort_by_key(|space| (space.position, space.id));
+        if let Some(space) = on_display
+            .iter()
+            .find(|space| space.focused)
+            .or_else(|| on_display.first())
+        {
+            return Ok(space.id);
+        }
+        Err(EngineError::NoFocusedSpace)
     }
 
     fn try_start_next_pending_creation(&mut self) -> Option<Action> {
+        // Persistent recreation is capability-gated: without create_space the
+        // request stays queued and fires when the capability appears (install /
+        // reinjection). A user-requested dynamic spawn is not gated — alt-N on
+        // a platform that cannot create should surface the platform error once,
+        // not silently do nothing.
+        if !self.capabilities.create_space
+            && self
+                .pending_creations
+                .front()
+                .and_then(|req| self.workspaces.0.get(&req.name))
+                .is_some_and(|state| state.persistent)
+        {
+            return None;
+        }
         // Creation serializes against destruction and placement: every
         // destructive topology mutation must be observed before another
         // topology mutation is issued, and a pending new Space must be
@@ -483,25 +554,18 @@ impl Engine {
             return None;
         }
         let req = self.pending_creations.front()?;
-        let anchor = if self
-            .workspaces
-            .0
-            .get(&req.name)
-            .is_some_and(|w| w.persistent)
-        {
-            self.persistent_creation_anchor()
-        } else {
-            self.creation_anchor().ok()
-        }?;
+        // A workspace is created on the display that owns it: `alt-N` on the
+        // external display must never spawn a Space on the built-in.
+        let anchor = self.creation_anchor_for(Some(req.display)).ok()?;
         let req = self.pending_creations.pop_front()?;
         if !self.workspaces.0.contains_key(&req.name)
-            || self.workspaces.backing_for(&req.name).is_some()
+            || self.workspaces.0[&req.name].active_space().is_some()
         {
             return self.try_start_next_pending_creation();
         }
         self.awaited_creations.push_back(AwaitedCreation {
             name: req.name,
-            display: self.observed.spaces.get(&anchor).map(|s| s.display_id),
+            display: Some(req.display),
             before: self.observed.spaces.keys().copied().collect(),
             observation: CreationObservation::Awaiting {
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
@@ -510,14 +574,18 @@ impl Engine {
         Some(Action::CreateSpace { anchor })
     }
 
-    fn request_workspace_creation(&mut self, name: &str) -> Result<Vec<Action>, EngineError> {
-        self.creation_anchor()?;
-        self.ensure_dynamic_workspace(name);
-        if !self.awaited_creations.iter().any(|r| r.name == name)
-            && !self.pending_creations.iter().any(|r| r.name == name)
+    fn request_workspace_creation(
+        &mut self,
+        display: DisplayId,
+        name: &str,
+    ) -> Result<Vec<Action>, EngineError> {
+        let key = self.ensure_dynamic_workspace(display, name);
+        self.creation_anchor_for(Some(display))?;
+        if !self.awaited_creations.iter().any(|r| r.name == key)
+            && !self.pending_creations.iter().any(|r| r.name == key)
         {
             self.pending_creations
-                .push_back(PendingCreationRequest { name: name.into() });
+                .push_back(PendingCreationRequest { name: key, display });
         }
         Ok(self.try_start_next_pending_creation().into_iter().collect())
     }
@@ -643,29 +711,25 @@ impl Engine {
         }
     }
 
-    /// Register `name` as an i3-style dynamic (non-persistent) workspace if it
-    /// is unknown. Returns false when a PERSISTENT workspace of that name has
-    /// no backing — its recreation belongs to the snapshot lifecycle, and a
-    /// manual CreateSpace would fight it.
-    fn ensure_dynamic_workspace(&mut self, name: &str) -> bool {
-        match self.workspaces.0.get(name) {
-            Some(_) => true,
-            None => {
-                let ordinal = self
-                    .workspaces
-                    .0
-                    .values()
-                    .map(|w| w.ordinal.saturating_add(1))
-                    .max()
-                    .unwrap_or(0);
-                let mut state =
-                    crate::workspace::WorkspaceState::new(name.to_string(), None, false);
-                state.ordinal = ordinal;
-                state.dynamic = true;
-                self.workspaces.0.insert(name.to_string(), state);
-                true
-            }
+    /// Register `name` on `display` as an i3-style dynamic (non-persistent)
+    /// workspace if it is unknown there. Returns its registry key. A workspace
+    /// of the same name on another display is a different workspace.
+    fn ensure_dynamic_workspace(&mut self, display: DisplayId, name: &str) -> String {
+        let key = self.workspaces.key_for(display, name);
+        if !self.workspaces.0.contains_key(&key) {
+            let ordinal = self
+                .workspaces
+                .0
+                .values()
+                .map(|w| w.ordinal.saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            let mut state = crate::workspace::WorkspaceState::new(name.to_string(), display, false);
+            state.ordinal = ordinal;
+            state.dynamic = true;
+            self.workspaces.0.insert(key.clone(), state);
         }
+        key
     }
 
     /// Bind each awaited dynamic spawn to the Space macOS created for it: an
@@ -677,12 +741,51 @@ impl Engine {
             return;
         }
         let mut still_awaited: VecDeque<AwaitedCreation> = VecDeque::new();
+        let now = std::time::Instant::now();
         // Deterministic: sort candidates by position, id so same-display creations don't swap.
         for mut awaited in std::mem::take(&mut self.awaited_creations) {
-            if matches!(awaited.observation, CreationObservation::Awaiting { deadline } if std::time::Instant::now() >= deadline)
+            if matches!(awaited.observation, CreationObservation::Awaiting { deadline } if now >= deadline)
             {
-                self.flight_recorder.record("workspace.creation_unconfirmed", format!("workspace {}: creation deadline elapsed; retaining single-flight reservation", awaited.name));
-                awaited.observation = CreationObservation::Uncertain;
+                self.flight_recorder.record(
+                    "workspace.creation_unconfirmed",
+                    format!(
+                        "workspace {}: creation deadline elapsed; holding one grace window for a late Space",
+                        awaited.name
+                    ),
+                );
+                awaited.observation = CreationObservation::Uncertain { since: now };
+            }
+            // A creation the platform never delivered must not wedge the
+            // single-flight slot forever: every later spawn, empty-Space
+            // sweep and topology repair is gated on this queue draining. Give
+            // a genuinely slow Space one grace window, then release so the
+            // next alt-N retries instead of doing nothing.
+            if matches!(
+                awaited.observation,
+                CreationObservation::Uncertain { since }
+                    if now.duration_since(since) >= CREATION_UNCERTAIN_GRACE
+            ) {
+                self.flight_recorder.record(
+                    "workspace.creation_released",
+                    format!(
+                        "workspace {}: reservation released after grace; next focus retries",
+                        awaited.name
+                    ),
+                );
+                // Forget the never-materialized DYNAMIC workspace too. Left in
+                // the registry with no backing, it would claim the next remap
+                // slot positionally and push a healthy workspace out of its
+                // own Space (which then requests another creation — the mess
+                // this release exists to end).
+                let unbacked_dynamic = self
+                    .workspaces
+                    .0
+                    .get(&awaited.name)
+                    .is_some_and(|state| state.dynamic && state.active_space().is_none());
+                if unbacked_dynamic {
+                    self.remove_workspace(&awaited.name);
+                }
+                continue;
             }
             let AwaitedCreation {
                 name,
@@ -750,15 +853,24 @@ impl Engine {
     }
 
     fn reserve_logical_order(&mut self) {
-        let order: Vec<_> = self
-            .workspaces
-            .ordered_names()
-            .iter()
-            .filter_map(|name| match self.workspaces.0[name].backing {
-                Some(WorkspaceBacking::Normal { space }) => Some(space),
-                _ => None,
-            })
-            .collect();
+        // Space order is per display; each display's workspaces are reserved
+        // in their own name order.
+        let mut displays: Vec<DisplayId> = self.observed.displays.keys().copied().collect();
+        displays.sort_by_key(|id| {
+            self.observed
+                .displays
+                .get(id)
+                .map(|d| (d.frame.x.round() as i64, d.frame.y.round() as i64))
+                .unwrap_or((i64::MAX, i64::from(id.0)))
+        });
+        let mut order = Vec::new();
+        for display in displays {
+            for key in self.workspaces.keys_for_display(display) {
+                if let Some(WorkspaceBacking::Normal { space }) = self.workspaces.0[&key].backing {
+                    order.push(space);
+                }
+            }
+        }
         let now = std::time::Instant::now();
         self.placement = Some(SpacePlacement {
             order,
@@ -965,9 +1077,17 @@ impl Engine {
             .map(|r| r.name.clone())
             .chain(self.awaited_creations.iter().map(|r| r.name.clone()))
             .collect();
+        // Reinsert by KEY, never by the user-facing name: two displays can own
+        // a workspace of the same name, and re-keying would fabricate a
+        // duplicate that displaces another display's binding.
         let held: Vec<_> = pending
             .iter()
-            .filter_map(|name| self.workspaces.0.remove(name))
+            .filter_map(|name| {
+                self.workspaces
+                    .0
+                    .remove(name)
+                    .map(|state| (name.clone(), state))
+            })
             .collect();
         let spaces = self
             .observed
@@ -979,8 +1099,8 @@ impl Engine {
         let moves = self
             .workspaces
             .remap_after_snapshot(&spaces, &self.observed.displays);
-        for ws in held {
-            self.workspaces.0.insert(ws.name.clone(), ws);
+        for (key, state) in held {
+            self.workspaces.0.insert(key, state);
         }
         moves
     }
@@ -1037,29 +1157,33 @@ impl Engine {
             // the first gap (3). Reusing a gap would shuffle the existing
             // binding (C would move from 5 to 3) on the next positional
             // remap; extending preserves it.
+            // Adoption is display-local: a Space parked on the external
+            // display extends the external display's strip, never the
+            // built-in display's numbering.
+            let display = self.observed.spaces[&id].display_id;
             let name = {
                 let mut next = self
                     .workspaces
-                    .0
-                    .keys()
-                    .filter_map(|n| n.parse::<u32>().ok())
+                    .keys_for_display(display)
+                    .iter()
+                    .filter_map(|key| self.workspaces.0[key].name.parse::<u32>().ok())
                     .max()
                     .unwrap_or(0)
                     .saturating_add(1)
                     .max(1);
-                while self.workspaces.0.contains_key(&next.to_string()) {
+                while self.workspaces.get(display, &next.to_string()).is_some() {
                     next = next.saturating_add(1);
                     if next == u32::MAX {
                         break;
                     }
                 }
-                if self.workspaces.0.contains_key(&next.to_string()) {
+                if self.workspaces.get(display, &next.to_string()).is_some() {
                     continue; // numeric namespace exhausted; leave the Space in grace
                 }
                 next.to_string()
             };
-            self.ensure_dynamic_workspace(&name);
-            self.workspaces.0.get_mut(&name).unwrap().backing =
+            let key = self.ensure_dynamic_workspace(display, &name);
+            self.workspaces.0.get_mut(&key).unwrap().backing =
                 Some(WorkspaceBacking::Normal { space: id });
             self.external_spaces.remove(&id);
         }
@@ -1198,7 +1322,7 @@ impl Engine {
             return;
         }
         if let Some((name, attempts)) = self.pending_workspace_focus.front().cloned() {
-            match self.workspaces.backing_for(&name) {
+            match self.workspaces.backing_for_key(&name) {
                 Some(space) => {
                     if attempts == 0 {
                         self.pending_workspace_focus.pop_front();
@@ -1227,7 +1351,7 @@ impl Engine {
             }
         }
         if let Some((window, name)) = self.pending_workspace_move.front().cloned() {
-            match self.workspaces.backing_for(&name) {
+            match self.workspaces.backing_for_key(&name) {
                 Some(space) => {
                     self.pending_workspace_move.pop_front();
 
@@ -1394,7 +1518,8 @@ impl Engine {
             .iter()
             .map(|(n, w)| (n.clone(), w.active_space()))
             .collect();
-        self.workspaces.ensure_from_config(&self.config.workspaces);
+        self.workspaces
+            .sync_config(&self.config.workspaces, &self.observed.displays, true);
         // Native mutations outlive config reload. Preserve their reservations.
         self.remap_slots();
         let live: std::collections::HashSet<SpaceId> = self
@@ -1553,9 +1678,14 @@ impl Engine {
                             self.awaited_creations.drain(..).collect();
                         for req in awaiting.into_iter().rev() {
                             names.push(req.name.clone());
+                            let Some(display) = req.display else {
+                                continue;
+                            };
                             if !self.pending_creations.iter().any(|r| r.name == req.name) {
-                                self.pending_creations
-                                    .push_front(PendingCreationRequest { name: req.name });
+                                self.pending_creations.push_front(PendingCreationRequest {
+                                    name: req.name,
+                                    display,
+                                });
                             }
                         }
                         names.reverse();
@@ -1571,6 +1701,20 @@ impl Engine {
                 self.apply_snapshot(snapshot);
                 if !complete {
                     return Vec::new();
+                }
+                // Instantiate config templates against the displays that are
+                // actually here: every display gets its own 1..9, and a
+                // hot-plugged display arrives with the configured strip. Only
+                // when the display set actually changes — this is additive, so
+                // persisted/dynamic workspaces are never evicted here.
+                let mut display_set: Vec<DisplayId> =
+                    self.observed.displays.keys().copied().collect();
+                display_set.sort();
+                if self.synced_displays.as_ref() != Some(&display_set) {
+                    let config_workspaces = self.config.workspaces.clone();
+                    self.workspaces
+                        .sync_config(&config_workspaces, &self.observed.displays, false);
+                    self.synced_displays = Some(display_set);
                 }
                 self.reconcile_fullscreen(&previous_windows);
                 // Multi-tick memory is refreshed only after fullscreen
@@ -1618,21 +1762,27 @@ impl Engine {
                     self.remove_workspace(&name);
                 }
                 if !reset {
-                    for name in self.workspaces.ordered_names() {
-                        if self.workspaces.0[&name].persistent
-                            && self.workspaces.0[&name]
-                                .active_space()
-                                .is_some_and(|id| !self.observed.spaces.contains_key(&id))
-                        {
-                            // The backing Space is gone: park the workspace's
-                            // tree under its logical name so the recreation
-                            // below reattaches it instead of stranding a
-                            // SpaceId-keyed orphan.
-                            self.clear_stale_backing(&name);
-                            if !self.pending_creations.iter().any(|r| r.name == name) {
-                                self.pending_creations
-                                    .push_back(PendingCreationRequest { name });
-                            }
+                    for key in self.workspaces.0.keys().cloned().collect::<Vec<_>>() {
+                        let Some(state) = self.workspaces.0.get(&key) else {
+                            continue;
+                        };
+                        if !state.persistent {
+                            continue;
+                        }
+                        let display = state.display;
+                        let vanished = state
+                            .active_space()
+                            .is_some_and(|id| !self.observed.spaces.contains_key(&id));
+                        if !vanished {
+                            continue;
+                        }
+                        // The backing Space is gone: park the workspace's tree
+                        // under its logical key so recreation reattaches it
+                        // instead of stranding a SpaceId-keyed orphan.
+                        self.clear_stale_backing(&key);
+                        if !self.pending_creations.iter().any(|r| r.name == key) {
+                            self.pending_creations
+                                .push_back(PendingCreationRequest { name: key, display });
                         }
                     }
                 }
@@ -1646,7 +1796,7 @@ impl Engine {
                 self.apply_remap_moves(&moves);
                 let restored = std::mem::take(&mut self.restored_workspace_layouts);
                 for (name, layout) in restored {
-                    if let Some(space) = self.workspaces.backing_for(&name) {
+                    if let Some(space) = self.workspaces.backing_for_key(&name) {
                         self.layouts.insert(space, layout);
                     } else {
                         self.restored_workspace_layouts.insert(name, layout);
@@ -1671,12 +1821,20 @@ impl Engine {
                 lifecycle_actions.extend(self.destroy_empty_dynamic_workspaces(&moves));
                 self.fulfill_pending_workspace_actions(&mut lifecycle_actions);
                 self.fulfill_pending_new_space_moves(&mut lifecycle_actions);
-                for name in self.workspaces.ensure_persistent() {
-                    if !self.awaited_creations.iter().any(|r| r.name == name)
-                        && !self.pending_creations.iter().any(|r| r.name == name)
+                let mut displays: Vec<DisplayId> = self.observed.displays.keys().copied().collect();
+                displays.sort();
+                let mut missing: Vec<(DisplayId, String)> = Vec::new();
+                for display in displays {
+                    for key in self.workspaces.ensure_persistent(display) {
+                        missing.push((display, key));
+                    }
+                }
+                for (display, key) in missing {
+                    if !self.awaited_creations.iter().any(|r| r.name == key)
+                        && !self.pending_creations.iter().any(|r| r.name == key)
                     {
                         self.pending_creations
-                            .push_back(PendingCreationRequest { name });
+                            .push_back(PendingCreationRequest { name: key, display });
                     }
                 }
                 if let Some(next) = self.try_start_next_pending_creation() {
@@ -2158,26 +2316,31 @@ impl Engine {
     /// Without this, the stale id would always fail `require_space`, the
     /// hotkey would error silently, and alt-N would appear to do nothing.
     pub fn focus_workspace(&mut self, name: &str) -> Result<Vec<Action>, EngineError> {
+        // Per-display strips: `alt-2` means "this display's workspace 2".
+        let display = self
+            .active_display_id()
+            .ok_or(EngineError::NoFocusedSpace)?;
+        let key = self.workspaces.key_for(display, name);
         if let Some(space) = self
             .workspaces
-            .backing_for(name)
+            .backing_for(display, name)
             .filter(|s| self.observed.spaces.contains_key(s))
         {
             if self.placement.is_some() {
-                if !self.pending_workspace_focus.iter().any(|(n, _)| n == name) {
-                    self.pending_workspace_focus.push_back((name.into(), 0));
+                if !self.pending_workspace_focus.iter().any(|(n, _)| *n == key) {
+                    self.pending_workspace_focus.push_back((key.clone(), 0));
                 }
                 return Ok(vec![]);
             }
             return Ok(vec![Action::FocusSpace { space }]);
         }
-        if self.workspaces.0.contains_key(name) {
-            self.clear_stale_backing(name);
+        if self.workspaces.0.contains_key(&key) {
+            self.clear_stale_backing(&key);
         }
-        if !self.pending_workspace_focus.iter().any(|(n, _)| n == name) {
-            self.pending_workspace_focus.push_back((name.into(), 0));
+        if !self.pending_workspace_focus.iter().any(|(n, _)| *n == key) {
+            self.pending_workspace_focus.push_back((key.clone(), 0));
         }
-        self.request_workspace_creation(name)
+        self.request_workspace_creation(display, name)
     }
 
     pub fn move_window_to_workspace(
@@ -2195,9 +2358,21 @@ impl Engine {
         {
             return Err(EngineError::NativeFullscreenMove);
         }
+        // `move-to-workspace 2` means "workspace 2 on the display the window is
+        // already on": moving a window must not teleport it to another monitor.
+        let display = self
+            .observed
+            .windows
+            .get(&window)
+            .and_then(|w| w.space_id)
+            .and_then(|s| self.observed.spaces.get(&s))
+            .map(|s| s.display_id)
+            .or_else(|| self.active_display_id())
+            .ok_or(EngineError::NoFocusedSpace)?;
+        let key = self.workspaces.key_for(display, name);
         if let Some(space) = self
             .workspaces
-            .backing_for(name)
+            .backing_for(display, name)
             .filter(|s| self.observed.spaces.contains_key(s))
         {
             if self.observed.spaces[&space].is_fullscreen {
@@ -2207,9 +2382,9 @@ impl Engine {
                 if !self
                     .pending_workspace_move
                     .iter()
-                    .any(|(w, n)| *w == window && n == name)
+                    .any(|(w, n)| *w == window && *n == key)
                 {
-                    self.pending_workspace_move.push_back((window, name.into()));
+                    self.pending_workspace_move.push_back((window, key.clone()));
                     self.flight_recorder.record(
                         "workspace.move_queued",
                         format!("window {window:?} -> {name}: held until placement settles"),
@@ -2218,26 +2393,34 @@ impl Engine {
                 return Ok(vec![]);
             }
             self.dynamic_grace.insert(
-                name.into(),
+                key,
                 std::time::Instant::now() + self.dynamic_grace_duration(),
             );
             return Ok(vec![Action::MoveWindowToSpace { window, space }]);
         }
-        if self.workspaces.0.contains_key(name) {
-            self.clear_stale_backing(name);
+        if self.workspaces.0.contains_key(&key) {
+            self.clear_stale_backing(&key);
         }
         if !self
             .pending_workspace_move
             .iter()
-            .any(|(w, n)| *w == window && n == name)
+            .any(|(w, n)| *w == window && *n == key)
         {
-            self.pending_workspace_move.push_back((window, name.into()));
+            self.pending_workspace_move.push_back((window, key));
         }
-        self.request_workspace_creation(name)
+        self.request_workspace_creation(display, name)
     }
 
     pub fn workspace_for_space(&self, space: SpaceId) -> Option<&str> {
         self.workspaces.name_for_space(space)
+    }
+
+    /// Backing Space of the named workspace on the currently focused display.
+    /// This is the resolution `focus_workspace` itself uses, exposed so the
+    /// daemon can record the switch without duplicating the display rule.
+    pub fn workspace_backing(&self, name: &str) -> Option<SpaceId> {
+        let display = self.active_display_id()?;
+        self.workspaces.backing_for(display, name)
     }
 
     /// The currently focused window, if observation saw one.
@@ -2625,6 +2808,11 @@ mod tests {
     use crate::layout::apply_layout;
     use crate::layout_state::{Axis, Orientation};
     use rovr_types::LayoutKind;
+
+    /// Registry key for a workspace on the single test display.
+    fn wkey(name: &str) -> String {
+        crate::workspace::workspace_key(DisplayId(1), name)
+    }
 
     fn snapshot(windows: Vec<WindowSnapshot>) -> PlatformSnapshot {
         PlatformSnapshot {
@@ -3147,10 +3335,10 @@ mod tests {
         };
         engine.apply_event(Event::Snapshot(snap));
         // Bind "code" to space 11 (no workspaces configured by default).
-        let mut ws = crate::workspace::WorkspaceState::new("code".into(), None, true);
+        let mut ws = crate::workspace::WorkspaceState::new("code".into(), DisplayId(1), true);
         ws.ordinal = 0;
         ws.backing = Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) });
-        engine.workspaces.0.insert("code".into(), ws);
+        engine.workspaces.0.insert(wkey("code"), ws);
 
         // Build a non-trivial tree: 4 leaves, custom root ratio, rotated.
         for id in [1u32, 2, 3, 4] {
@@ -3184,7 +3372,7 @@ mod tests {
 
         // The tree moved WITH the logical workspace to the new backing.
         assert_eq!(
-            engine.workspaces.backing_for("code"),
+            engine.workspaces.backing_for(DisplayId(1), "code"),
             Some(SpaceId(101)),
             "code must be remapped onto the new backing space"
         );
@@ -3220,7 +3408,7 @@ mod tests {
             complete: true,
         };
         engine.apply_event(Event::Snapshot(snap));
-        engine.workspaces.0.get_mut("code").unwrap().backing =
+        engine.workspaces.0.get_mut(&wkey("code")).unwrap().backing =
             Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(11) });
         for id in [1u32, 2, 3] {
             engine
@@ -3240,18 +3428,20 @@ mod tests {
         let mut restored = Engine::new(engine.config.clone());
         restored.load_state(&path).unwrap();
         assert_eq!(
-            restored.workspaces.backing_for("code"),
+            restored.workspaces.backing_for(DisplayId(1), "code"),
             None,
             "native handles are learned from observation, never persistence"
         );
-        assert!(restored.restored_workspace_layouts.contains_key("code"));
+        assert!(restored
+            .restored_workspace_layouts
+            .contains_key(&wkey("code")));
         let area = Rect {
             x: 0.0,
             y: 0.0,
             width: 1000.0,
             height: 800.0,
         };
-        let expected = restored.restored_workspace_layouts["code"]
+        let expected = restored.restored_workspace_layouts[&wkey("code")]
             .bsp
             .placements(area, 8.0);
 
@@ -3309,8 +3499,11 @@ mod tests {
             vec![Action::CreateSpace { anchor: SpaceId(11) }],
             "missing persistent workspace with nothing claimable must request exactly one CreateSpace"
         );
-        assert_eq!(engine.workspaces.backing_for("code"), Some(SpaceId(11)));
-        assert_eq!(engine.workspaces.backing_for("chat"), None);
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "code"),
+            Some(SpaceId(11))
+        );
+        assert_eq!(engine.workspaces.backing_for(DisplayId(1), "chat"), None);
 
         // Cycle 2: macOS created Space 20 (id only known by OBSERVING).
         let snap2 = PlatformSnapshot {
@@ -3327,7 +3520,7 @@ mod tests {
             "creation must stop once every persistent workspace is backed"
         );
         assert_eq!(
-            engine.workspaces.backing_for("chat"),
+            engine.workspaces.backing_for(DisplayId(1), "chat"),
             Some(SpaceId(20)),
             "the newly created space must be bound to the logical workspace"
         );
@@ -3392,10 +3585,56 @@ mod tests {
             },
         );
 
+        // A workspace pinned to `main` belongs to CGMainDisplayID, not to the
+        // display that happens to hold keyboard focus.
+        let actions = engine.apply_event(Event::Snapshot(PlatformSnapshot {
+            windows: vec![],
+            spaces: vec![space_snap(11, 1, 0, true), space_snap(21, 2, 1, false)],
+            displays: vec![
+                DisplaySnapshot {
+                    id: DisplayId(1),
+                    frame: rovr_types::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1000.0,
+                        height: 800.0,
+                    },
+                    label: None,
+                    focused: true,
+                    is_main: false,
+                    generation: 0,
+                },
+                DisplaySnapshot {
+                    id: DisplayId(2),
+                    frame: rovr_types::Rect {
+                        x: 1000.0,
+                        y: 0.0,
+                        width: 1000.0,
+                        height: 800.0,
+                    },
+                    label: None,
+                    focused: false,
+                    is_main: true,
+                    generation: 0,
+                },
+            ],
+            complete: true,
+        }));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::CreateSpace { .. })),
+            "the main display already has a Space to claim"
+        );
         assert_eq!(
-            engine.persistent_creation_anchor(),
+            engine.workspaces.backing_for(DisplayId(2), "code"),
             Some(SpaceId(21)),
-            "display = \"main\" anchors on the main display even when another display is focused"
+            "pinned to main, so it claims the main display's Space"
+        );
+        assert!(
+            engine.workspaces.get(DisplayId(1), "code").is_none(),
+            "and is never instantiated on the focused display"
         );
     }
 
@@ -3430,7 +3669,7 @@ mod tests {
             }],
             "unknown workspace must register + request CreateSpace, not error"
         );
-        assert!(engine.workspaces.backing_for("2").is_none());
+        assert!(engine.workspaces.backing_for(DisplayId(1), "2").is_none());
 
         // macOS created Space 20; the next snapshot binds it to "2" and the
         // queued focus fires once (the bound Space is not yet reported as
@@ -3442,7 +3681,10 @@ mod tests {
             complete: true,
         };
         let actions2 = engine.apply_event(Event::Snapshot(snap2));
-        assert_eq!(engine.workspaces.backing_for("2"), Some(SpaceId(20)));
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "2"),
+            Some(SpaceId(20))
+        );
         assert_eq!(
             actions2
                 .iter()
@@ -3550,10 +3792,11 @@ mod tests {
         let _ = engine.apply_event(Event::Snapshot(snap));
         // Simulate a persisted dynamic workspace with a stale backing id.
         let stale = SpaceId(1778);
-        let mut stale_state = crate::workspace::WorkspaceState::new("2".into(), None, false);
+        let mut stale_state =
+            crate::workspace::WorkspaceState::new("2".into(), DisplayId(1), false);
         stale_state.dynamic = true;
         stale_state.backing = Some(crate::workspace::WorkspaceBacking::Normal { space: stale });
-        engine.workspaces.0.insert("2".into(), stale_state);
+        engine.workspaces.0.insert(wkey("2"), stale_state);
         engine.layouts.insert(stale, Default::default());
 
         let actions = engine
@@ -3563,13 +3806,13 @@ mod tests {
             matches!(actions.as_slice(), &[Action::CreateSpace { .. }]),
             "stale dynamic binding must fall through to the spawn path; got {actions:?}"
         );
-        assert_eq!(engine.workspaces.backing_for("2"), None);
+        assert_eq!(engine.workspaces.backing_for(DisplayId(1), "2"), None);
         assert!(
             !engine.layouts.contains_key(&stale),
             "stale SpaceId layout must be dropped"
         );
         assert!(
-            engine.restored_workspace_layouts.contains_key("2"),
+            engine.restored_workspace_layouts.contains_key(&wkey("2")),
             "stale tree parks under the logical name so the respawn reattaches it"
         );
     }
@@ -3600,12 +3843,16 @@ mod tests {
         };
         let _ = engine.apply_event(Event::Snapshot(initial));
         for (name, id, ordinal) in [("2", 12, 1), ("3", 13, 2), ("4", 14, 3)] {
-            let mut workspace = crate::workspace::WorkspaceState::new(name.into(), None, false);
+            let mut workspace =
+                crate::workspace::WorkspaceState::new(name.into(), DisplayId(1), false);
             workspace.dynamic = true;
             workspace.ordinal = ordinal;
             workspace.backing =
                 Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(id) });
-            engine.workspaces.0.insert(name.into(), workspace);
+            engine.workspaces.0.insert(
+                crate::workspace::workspace_key(DisplayId(1), name),
+                workspace,
+            );
         }
 
         // The user deletes workspace 3. Workspace 4 keeps its SpaceId while
@@ -3621,8 +3868,11 @@ mod tests {
             complete: true,
         };
         let _ = engine.apply_event(Event::Snapshot(after_delete));
-        assert_eq!(engine.workspaces.backing_for("3"), None);
-        assert_eq!(engine.workspaces.backing_for("4"), Some(SpaceId(14)));
+        assert_eq!(engine.workspaces.backing_for(DisplayId(1), "3"), None);
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "4"),
+            Some(SpaceId(14))
+        );
 
         assert_eq!(
             engine.focus_workspace("3").unwrap(),
@@ -3653,8 +3903,14 @@ mod tests {
             },],
             "replacement must be reordered and observed before focus"
         );
-        assert_eq!(engine.workspaces.backing_for("3"), Some(SpaceId(20)));
-        assert_eq!(engine.workspaces.backing_for("4"), Some(SpaceId(14)));
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "3"),
+            Some(SpaceId(20))
+        );
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "4"),
+            Some(SpaceId(14))
+        );
     }
 
     /// A bad mapping created by an older daemon must heal on the next hotkey
@@ -3682,11 +3938,11 @@ mod tests {
             complete: true,
         };
         let _ = engine.apply_event(Event::Snapshot(snapshot));
-        let mut workspace = crate::workspace::WorkspaceState::new("2".into(), None, false);
+        let mut workspace = crate::workspace::WorkspaceState::new("2".into(), DisplayId(1), false);
         workspace.dynamic = true;
         workspace.ordinal = 1;
         workspace.backing = Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(20) });
-        engine.workspaces.0.insert("2".into(), workspace);
+        engine.workspaces.0.insert(wkey("2"), workspace);
 
         assert_eq!(
             engine.focus_workspace("2").unwrap(),
@@ -3724,7 +3980,10 @@ mod tests {
             complete: true,
         };
         engine.apply_event(Event::Snapshot(snap2));
-        assert_eq!(engine.workspaces.backing_for("2"), Some(SpaceId(20)));
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "2"),
+            Some(SpaceId(20))
+        );
 
         // User switches back to desktop 1 (space 20 now empty + unfocused).
         // Simulate the post-spawn grace having elapsed.
@@ -3741,7 +4000,7 @@ mod tests {
             "empty unfocused dynamic workspace must be destroyed"
         );
         assert!(
-            engine.workspaces.0.contains_key("2"),
+            engine.workspaces.0.contains_key(&wkey("2")),
             "workspace kept pending until Space gone"
         );
         assert!(
@@ -3756,7 +4015,7 @@ mod tests {
         };
         engine.apply_event(Event::Snapshot(gone));
         assert!(
-            !engine.workspaces.0.contains_key("2"),
+            !engine.workspaces.0.contains_key(&wkey("2")),
             "forgotten after destruction confirmed"
         );
 
@@ -3795,11 +4054,11 @@ mod tests {
                 .any(|a| matches!(a, Action::DestroySpace { .. })),
             "occupied dynamic, pending dynamic, and configured workspaces must survive"
         );
-        assert!(engine.workspaces.0.contains_key("keep"));
-        assert!(engine.workspaces.0.contains_key("2"));
+        assert!(engine.workspaces.0.contains_key(&wkey("keep")));
+        assert!(engine.workspaces.0.contains_key(&wkey("2")));
 
         // Empty but FOCUSED dynamic also survives.
-        engine.workspaces.0.get_mut("keep").unwrap().backing =
+        engine.workspaces.0.get_mut(&wkey("keep")).unwrap().backing =
             Some(crate::workspace::WorkspaceBacking::Normal { space: SpaceId(22) });
         let focused_empty = PlatformSnapshot {
             windows: vec![],
@@ -3876,7 +4135,10 @@ mod tests {
         for until in engine.external_spaces.values_mut() {
             *until = std::time::Instant::now();
         }
-        assert_eq!(engine.workspaces.backing_for("1"), Some(SpaceId(11)));
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "1"),
+            Some(SpaceId(11))
+        );
         assert_eq!(
             engine.next_topology_heal_action(),
             Some(Action::DestroySpace { space: SpaceId(14) }),
@@ -3936,8 +4198,11 @@ mod tests {
         };
         let _ = engine.apply_event(Event::Snapshot(snap1));
         // "chat" has ordinal 0 -> it claims the single existing space.
-        assert_eq!(engine.workspaces.backing_for("chat"), Some(SpaceId(11)));
-        assert_eq!(engine.workspaces.backing_for("code"), None);
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "chat"),
+            Some(SpaceId(11))
+        );
+        assert_eq!(engine.workspaces.backing_for(DisplayId(1), "code"), None);
 
         let snap2 = PlatformSnapshot {
             windows: vec![],
@@ -3947,7 +4212,7 @@ mod tests {
         };
         let _ = engine.apply_event(Event::Snapshot(snap2));
         assert_eq!(
-            engine.workspaces.backing_for("code"),
+            engine.workspaces.backing_for(DisplayId(1), "code"),
             Some(SpaceId(20)),
             "the created space goes to the lowest-ordinal still-missing workspace"
         );
@@ -3982,8 +4247,14 @@ mod tests {
 
         // Healthy session: code→11@position0, chat→12@position1.
         let _ = engine.apply_event(Event::Snapshot(spaces_at(11, 0, 12, 1)));
-        assert_eq!(engine.workspaces.backing_for("code"), Some(SpaceId(11)));
-        assert_eq!(engine.workspaces.backing_for("chat"), Some(SpaceId(12)));
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "code"),
+            Some(SpaceId(11))
+        );
+        assert_eq!(
+            engine.workspaces.backing_for(DisplayId(1), "chat"),
+            Some(SpaceId(12))
+        );
 
         // User drags chat ahead of code in Mission Control: positions swap.
         // With drag handling, alt-N follows visual position, so code
@@ -3992,8 +4263,8 @@ mod tests {
         let _ = engine.apply_event(Event::Snapshot(spaces_at(12, 0, 11, 1)));
         assert_eq!(
             (
-                engine.workspaces.backing_for("code"),
-                engine.workspaces.backing_for("chat")
+                engine.workspaces.backing_for(DisplayId(1), "code"),
+                engine.workspaces.backing_for(DisplayId(1), "chat")
             ),
             (Some(SpaceId(12)), Some(SpaceId(11))),
             "drag must make alt-N follow visual position"
@@ -4008,8 +4279,8 @@ mod tests {
         let _ = engine.apply_event(Event::Snapshot(spaces_at(12, 0, 11, 1)));
         assert_eq!(
             (
-                engine.workspaces.backing_for("code"),
-                engine.workspaces.backing_for("chat")
+                engine.workspaces.backing_for(DisplayId(1), "code"),
+                engine.workspaces.backing_for(DisplayId(1), "chat")
             ),
             (Some(SpaceId(12)), Some(SpaceId(11))),
             "reload must keep dragged mapping"

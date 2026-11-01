@@ -85,7 +85,7 @@ int rovr_bridge_focus_space(uint64_t space_id);
 int rovr_bridge_focus_space_step(uint64_t target_space_id, int32_t delta);
 uint64_t rovr_bridge_current_space_for_space(uint64_t space_id);
 uint32_t rovr_bridge_display_for_space(uint64_t space_id);
-int rovr_bridge_activate_display_for_space(uint64_t space_id); // make a cross-display Space's display key (yabai display_manager_focus_display equivalent)
+uint32_t rovr_bridge_active_display_id(void); // display that currently owns the menu bar (keyboard focus)
 int rovr_bridge_toggle_fullscreen(uint32_t window_id); // AXFullScreen attribute toggle with focus+wait; fallback to button; waits for animation (yabai-adapted, MIT)
 int rovr_bridge_close_window(uint32_t window_id);
 int rovr_bridge_set_window_minimized(uint32_t window_id, int minimized);
@@ -96,6 +96,7 @@ int rovr_bridge_space_is_system(uint64_t space_id); // type==2 system space (yab
 int rovr_bridge_is_display_animating(uint32_t display_id); // SLSManagedDisplayIsAnimating, 1 if animating
 int rovr_bridge_sls_managed_for_window(uint32_t window_id); // SLS fallback for background apps where AX returns Unknown (yabai level/parent check, MIT)
 int32_t rovr_bridge_dock_pid(void);
+int32_t rovr_bridge_frontmost_pid(void); // keyboard-focus owning app (-1 when unknown)
 
 // AX event trampoline registration (rovr-platform calls this once at init;
 // the callback is invoked on the main thread for created/focused events).
